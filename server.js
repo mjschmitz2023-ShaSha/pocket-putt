@@ -12,7 +12,7 @@ const crypto = require('crypto');
 const WebSocket = require('ws');
 const Shared = require('./shared.js');
 
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT || 8977;
 const ROOT = __dirname;
 const TICK_MS = 1000 / 60;
 // Overridable via env for fast automated testing of the 19-hole progression.
