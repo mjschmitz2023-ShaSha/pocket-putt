@@ -15,7 +15,16 @@ const LOGICAL_W = 800, LOGICAL_H = 500;
 const BALL_RADIUS = 7;
 const FRICTION_GRASS = 1.15;
 const FRICTION_SAND = 8.0;
-const STOP_THRESHOLD = 6;
+const STOP_THRESHOLD = 18;
+// Cup "divot": within this radius a slow-enough ball gets pulled toward the cup, so
+// near-misses that would have trickled past the lip tend to drop in instead.
+const CUP_GRAVITY_RADIUS = 34;
+const CUP_GRAVITY_PULL = 1000;
+const CUP_CAPTURE_MAX_SPEED = 300;
+// Below this speed extra rolling resistance kicks in so the ball settles quickly
+// instead of crawling across the green forever.
+const LOW_SPEED_CUTOFF = 60;
+const LOW_SPEED_DRAG = 3.5;
 const WALL_RESTITUTION = 0.8;
 const BUMPER_RESTITUTION = 1.05;
 const PENDULUM_RESTITUTION = 0.95;
@@ -367,9 +376,26 @@ function stepBallPhysics(ball, hole, dt) {
     if (inSand && !inSandLastStep) events.enteredSand = true;
     inSandLastStep = inSand;
 
+    // Cup divot: slow balls near the cup get tugged toward it, fast ones fly over.
+    const dcx = hole.cup.x - ball.x, dcy = hole.cup.y - ball.y;
+    const dCup0 = Math.hypot(dcx, dcy);
+    const speedNow = Math.hypot(ball.vx, ball.vy);
+    if (dCup0 < CUP_GRAVITY_RADIUS && dCup0 > 0.001 && speedNow < CUP_CAPTURE_MAX_SPEED) {
+      const pull = CUP_GRAVITY_PULL * (1 - dCup0 / CUP_GRAVITY_RADIUS);
+      ball.vx += (dcx / dCup0) * pull * subDt;
+      ball.vy += (dcy / dCup0) * pull * subDt;
+    }
+
     const decay = Math.exp(-friction * subDt);
     ball.vx *= decay;
     ball.vy *= decay;
+    // Rolling resistance at crawl speeds (outside the divot) so the ball settles fast
+    // instead of trickling on forever.
+    if (dCup0 >= CUP_GRAVITY_RADIUS && Math.hypot(ball.vx, ball.vy) < LOW_SPEED_CUTOFF) {
+      const extra = Math.exp(-LOW_SPEED_DRAG * subDt);
+      ball.vx *= extra;
+      ball.vy *= extra;
+    }
     ball.x += ball.vx * subDt;
     ball.y += ball.vy * subDt;
 
@@ -421,6 +447,47 @@ function resetHoleObstacles(hole) {
   for (const g of hole.gates) g.phase = 0;
 }
 
+// Equal-mass elastic collision between two balls. Separates the overlap and exchanges the
+// velocity component along the contact normal. Returns true when an impulse was applied
+// (i.e. a real hit, not just resting contact) so the caller can play a clack sound.
+function resolveBallBallCollision(a, b) {
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const dist = Math.hypot(dx, dy);
+  const minDist = BALL_RADIUS * 2;
+  if (dist >= minDist || dist < 0.0001) return false;
+  const nx = dx / dist, ny = dy / dist;
+  const overlap = (minDist - dist) / 2;
+  a.x -= nx * overlap;
+  a.y -= ny * overlap;
+  b.x += nx * overlap;
+  b.y += ny * overlap;
+  const rel = (b.vx - a.vx) * nx + (b.vy - a.vy) * ny;
+  if (rel < 0) {
+    const j = -(1 + 0.92) * rel / 2;
+    a.vx -= j * nx;
+    a.vy -= j * ny;
+    b.vx += j * nx;
+    b.vy += j * ny;
+    return true;
+  }
+  return false;
+}
+
+// Multiplayer tee-off spots: players line up perpendicular to the tee->cup play line with
+// ample spacing, clamped inside the course walls.
+function teePositionFor(index, count, hole) {
+  const dx = hole.cup.x - hole.tee.x, dy = hole.cup.y - hole.tee.y;
+  const len = Math.hypot(dx, dy) || 1;
+  const px = -dy / len, py = dx / len;
+  const spacing = 32;
+  const offset = (index - (count - 1) / 2) * spacing;
+  const margin = BALL_RADIUS * 2;
+  return {
+    x: Math.min(Math.max(hole.tee.x + px * offset, BOUND.left + margin), BOUND.right - margin),
+    y: Math.min(Math.max(hole.tee.y + py * offset, BOUND.top + margin), BOUND.bottom - margin),
+  };
+}
+
 // Given a raw drag vector (pull-back from the ball), returns the launch velocity. Shared so
 // the server can independently (and authoritatively) recompute it from a client's raw drag
 // rather than ever trusting a client-sent speed.
@@ -433,6 +500,7 @@ function computeLaunchVelocity(pointerVec) {
 
 return {
   LOGICAL_W, LOGICAL_H, BALL_RADIUS, FRICTION_GRASS, FRICTION_SAND, STOP_THRESHOLD,
+  CUP_GRAVITY_RADIUS,
   WALL_RESTITUTION, BUMPER_RESTITUTION, PENDULUM_RESTITUTION, GATE_RESTITUTION,
   MAX_DRAG_DIST, MIN_DRAG_DIST, POWER_MULTIPLIER, MAX_LAUNCH_SPEED, BOOST_MAX_SPEED, BOUND,
   wall, sandRect, waterRect, boostRect, pendulum, getPendulumSegment, slidingGate,
@@ -440,6 +508,7 @@ return {
   BOUNDARY_WALLS, HOLES,
   resolveWallCollision, getWindmillBlades,
   createBallState, stepBallPhysics, advanceHoleObstacles, resetHoleObstacles, computeLaunchVelocity,
+  resolveBallBallCollision, teePositionFor,
 };
 
 });

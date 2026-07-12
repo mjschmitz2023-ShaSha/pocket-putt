@@ -3,6 +3,7 @@
 // can run authoritatively on the multiplayer host — see MULTIPLAYER below.
 const {
   LOGICAL_W, LOGICAL_H, BALL_RADIUS, FRICTION_GRASS, FRICTION_SAND, STOP_THRESHOLD,
+  CUP_GRAVITY_RADIUS,
   WALL_RESTITUTION, BUMPER_RESTITUTION, PENDULUM_RESTITUTION, GATE_RESTITUTION,
   MAX_DRAG_DIST, MIN_DRAG_DIST, POWER_MULTIPLIER, MAX_LAUNCH_SPEED, BOOST_MAX_SPEED, BOUND,
   BOUNDARY_WALLS, HOLES, pointInZone, zoneBounds, resolveWallCollision, getWindmillBlades,
@@ -229,9 +230,13 @@ function updateBallPhysics(dt) {
     if (Game.trail.length > 14) Game.trail.shift();
   }
   if (speed < STOP_THRESHOLD) {
-    Game.ball.vx = 0;
-    Game.ball.vy = 0;
-    Game.state = 'AIMING';
+    // Inside the cup divot, let gravity keep working instead of freezing the ball on the lip.
+    const nearCup = Math.hypot(Game.ball.x - hole.cup.x, Game.ball.y - hole.cup.y) < CUP_GRAVITY_RADIUS;
+    if (!nearCup) {
+      Game.ball.vx = 0;
+      Game.ball.vy = 0;
+      Game.state = 'AIMING';
+    }
   }
 }
 
@@ -656,7 +661,27 @@ function drawMultiplayerBall(b, isSelf) {
     ctx.arc(0, 0, BALL_RADIUS + 4, 0, Math.PI * 2);
     ctx.fill();
   }
-  ctx.fillStyle = `hsl(${b.hue}, 90%, 60%)`;
+  if (b.isHost) {
+    // The host's exclusive rainbow ball: hue tracks speed — cool violet at rest, blazing
+    // red at full send — with a matching glow so it reads across the room.
+    const speed = Math.hypot(b.vx, b.vy);
+    const speedHue = 270 - Math.min(speed / BOOST_MAX_SPEED, 1) * 270;
+    const glowR = BALL_RADIUS + 6;
+    const glow = ctx.createRadialGradient(0, 0, BALL_RADIUS * 0.5, 0, 0, glowR);
+    glow.addColorStop(0, `hsla(${speedHue}, 100%, 65%, 0.6)`);
+    glow.addColorStop(1, `hsla(${speedHue}, 100%, 65%, 0)`);
+    ctx.fillStyle = glow;
+    ctx.beginPath();
+    ctx.arc(0, 0, glowR, 0, Math.PI * 2);
+    ctx.fill();
+    const bodyGrad = ctx.createLinearGradient(-BALL_RADIUS, -BALL_RADIUS, BALL_RADIUS, BALL_RADIUS);
+    for (let i = 0; i <= 6; i++) {
+      bodyGrad.addColorStop(i / 6, `hsl(${(speedHue + i * 30) % 360}, 100%, 60%)`);
+    }
+    ctx.fillStyle = bodyGrad;
+  } else {
+    ctx.fillStyle = `hsl(${b.hue}, 90%, 60%)`;
+  }
   ctx.beginPath();
   ctx.arc(0, 0, BALL_RADIUS, 0, Math.PI * 2);
   ctx.fill();
@@ -717,13 +742,22 @@ function updateHUD() {
   hudStrokes.textContent = `Strokes: ${Game.strokes}`;
   hudTotal.textContent = `Total: ${Game.totalStrokes}`;
 }
+const hudTextCache = new Map();
+// Snapshots arrive at network rate; only touch the DOM when the text actually changed,
+// otherwise Safari repaints the HUD every message for nothing.
+function setHudText(el, text) {
+  if (hudTextCache.get(el) !== text) {
+    hudTextCache.set(el, text);
+    el.textContent = text;
+  }
+}
 function mpUpdateHUD(msg) {
   const hole = HOLES[msg.holeIndex];
   const me = Game.players.get(mpPlayerId);
-  hudHole.textContent = `Hole ${msg.holeIndex + 1}/${HOLES.length} — ${hole.name}`;
-  hudPar.textContent = `Par ${hole.par}`;
-  hudStrokes.textContent = `Strokes: ${me ? me.strokes : 0}`;
-  hudTotal.textContent = `Time: ${(msg.elapsedMs / 1000).toFixed(1)}s`;
+  setHudText(hudHole, `Hole ${msg.holeIndex + 1}/${HOLES.length} — ${hole.name}`);
+  setHudText(hudPar, `Par ${hole.par}`);
+  setHudText(hudStrokes, `Strokes: ${me ? me.strokes : 0}`);
+  // Timer text is driven per-frame by mpInterpolateBalls' extrapolated clock instead.
 }
 function ratingText(diff, strokes) {
   if (strokes === 1) return 'HOLE IN ONE!';
@@ -875,19 +909,12 @@ document.getElementById('btn-replay').addEventListener('click', () => { soundCli
 // ---- Main loop ----
 function update(dt) {
   const hole = HOLES[Game.currentHoleIndex];
-  // In multiplayer, obstacle angles/phases come from the server's snapshots (authoritative
-  // timeline shared by everyone in the heat) rather than being advanced by each client's
-  // own clock, so two players' windmills never drift out of sync with each other.
-  if (!MULTIPLAYER) advanceHoleObstacles(hole, dt);
-  if (MULTIPLAYER) {
-    // Ease render positions toward the latest snapshot target — frame-rate independent
-    // so it looks the same on 60Hz and ProMotion displays.
-    const blend = 1 - Math.exp(-20 * dt);
-    for (const p of Game.players.values()) {
-      p.rx += (p.x - p.rx) * blend;
-      p.ry += (p.y - p.ry) * blend;
-    }
-  }
+  // Obstacles advance locally every frame in BOTH modes (they're deterministic functions
+  // of time); in multiplayer the server's snapshot values overwrite ours on arrival, so
+  // everyone stays corrected to the authoritative timeline while animating smoothly
+  // between packets — even during 5Hz idle keepalives.
+  advanceHoleObstacles(hole, dt);
+  if (MULTIPLAYER) mpInterpolateBalls();
   Game.flagPhase += dt;
   if (Game.state === 'BALL_MOVING') updateBallPhysics(dt);
   if (Game.state === 'HAZARD_RESET') {
@@ -923,6 +950,12 @@ let mpSocket = null;
 let mpPlayerId = null;
 let mpIsHost = false;
 let mpCanPutt = false;
+// Snapshot interpolation: render ~100ms in the past, blending between two buffered
+// snapshots, so Wi-Fi packet jitter never shows up as ball stutter. (The host on
+// localhost never sees jitter — remote players do; this is for them.)
+const MP_INTERP_DELAY_MS = 100;
+let mpSnapBuffer = [];
+let mpClock = null; // { elapsedMs, at } — server hole-clock sample for extrapolation
 
 function mpRenderLobby(msg) {
   // The server may promote a new host after the original host disconnects - re-derive
@@ -979,6 +1012,8 @@ function mpConnect() {
     } else if (msg.type === 'roundState') {
       Game.currentHoleIndex = msg.holeIndex;
       Game.players.clear();
+      mpSnapBuffer = [];
+      mpClock = null;
       mpCanPutt = false;
       hud.classList.remove('hidden');
       hideAllScreens();
@@ -1036,8 +1071,8 @@ function mpApplySnapshot(msg) {
   msg.obstacles.gatePhases.forEach((ph, i) => { hole.gates[i].phase = ph; });
 
   // Update entries in place (never clear/recreate): each keeps rx/ry render coordinates
-  // that the draw loop eases toward the latest snapshot target, so ball motion stays
-  // smooth between network updates instead of stuttering at the server's tick rate.
+  // driven by the interpolation buffer below, so ball motion stays smooth between (and
+  // through jittery arrivals of) network updates.
   const seen = new Set();
   for (const b of msg.balls) {
     seen.add(b.id);
@@ -1052,6 +1087,11 @@ function mpApplySnapshot(msg) {
     if (!seen.has(id)) Game.players.delete(id);
   }
 
+  // Feed the interpolation buffer and re-sync the extrapolated hole clock.
+  mpClock = { elapsedMs: msg.elapsedMs, at: performance.now() };
+  mpSnapBuffer.push({ t: msg.elapsedMs, byId: new Map(msg.balls.map((b) => [b.id, b])) });
+  if (mpSnapBuffer.length > 30) mpSnapBuffer.shift();
+
   for (const ev of msg.events || []) mpHandleEvent(ev, hole);
 
   const me = Game.players.get(mpPlayerId);
@@ -1064,6 +1104,46 @@ function mpApplySnapshot(msg) {
     mpCanPutt = !me.holedOut && speed < STOP_THRESHOLD;
     mpUpdateHUD(msg);
   }
+}
+
+function mpEstimatedElapsedMs() {
+  return mpClock ? mpClock.elapsedMs + (performance.now() - mpClock.at) : 0;
+}
+
+function mpInterpolateBalls() {
+  if (!mpClock || mpSnapBuffer.length === 0) return;
+  const rt = mpEstimatedElapsedMs() - MP_INTERP_DELAY_MS;
+  // Find the two snapshots bracketing the render time.
+  let s0 = mpSnapBuffer[0], s1 = mpSnapBuffer[mpSnapBuffer.length - 1];
+  for (let i = mpSnapBuffer.length - 1; i >= 0; i--) {
+    if (mpSnapBuffer[i].t <= rt) {
+      s0 = mpSnapBuffer[i];
+      s1 = mpSnapBuffer[Math.min(i + 1, mpSnapBuffer.length - 1)];
+      break;
+    }
+  }
+  const span = s1.t - s0.t;
+  const f = span > 0 ? Math.min(Math.max((rt - s0.t) / span, 0), 1) : 1;
+  for (const [id, p] of Game.players) {
+    const b0 = s0.byId.get(id), b1 = s1.byId.get(id);
+    if (b0 && b1) {
+      // Water-hazard teleports shouldn't lerp the ball sweeping across the course.
+      if (Math.hypot(b1.x - b0.x, b1.y - b0.y) > 150) {
+        p.rx = b1.x;
+        p.ry = b1.y;
+      } else {
+        p.rx = b0.x + (b1.x - b0.x) * f;
+        p.ry = b0.y + (b1.y - b0.y) * f;
+      }
+    } else if (b1) {
+      p.rx = b1.x;
+      p.ry = b1.y;
+    }
+  }
+  // Smooth timer between packets (also during 5Hz idle keepalives).
+  setHudText(hudTotal, `Time: ${(mpEstimatedElapsedMs() / 1000).toFixed(1)}s`);
+  // Prune history we can no longer render.
+  while (mpSnapBuffer.length > 2 && mpSnapBuffer[1].t < rt - 500) mpSnapBuffer.shift();
 }
 
 let mpBannerTimer = null;
@@ -1098,6 +1178,11 @@ function mpHandleEvent(ev, hole) {
         soundWater();
         mpShowBanner('SPLASH! +1');
       }
+      break;
+    case 'clash':
+      // Ball-on-ball contact: everyone hears the clack and sees the sparks.
+      playSfx('bounce', 0.7);
+      spawnBoostSpark(ev.x, ev.y, Math.random() * Math.PI * 2);
       break;
     case 'holed': {
       spawnConfetti(hole.cup.x, hole.cup.y);

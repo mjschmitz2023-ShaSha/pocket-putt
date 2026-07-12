@@ -70,6 +70,9 @@ const Lobby = {
   currentHoleIndex: 0,
   holeStartedAtMs: 0,
   holeEnding: false,
+  pendingEvents: [], // gameplay events accumulated between snapshot broadcasts
+  tickCounter: 0,
+  wasIdle: false,
 };
 
 function makeId() { return crypto.randomUUID(); }
@@ -116,13 +119,21 @@ function beginHole(holeIndex) {
   Lobby.currentHoleIndex = holeIndex;
   const hole = Shared.HOLES[holeIndex];
   Shared.resetHoleObstacles(hole);
-  for (const p of Lobby.players.values()) {
-    p.ball = Shared.createBallState(hole.tee);
+  // Line players up across the tee, perpendicular to the play line, with real spacing.
+  // The line order rotates by one slot every hole so nobody keeps the center-line
+  // advantage (the middle spot aims straight down the play line) for the whole round.
+  const roster = [...Lobby.players.values()];
+  roster.forEach((p, i) => {
+    const slot = (i + holeIndex) % roster.length;
+    p.ball = Shared.createBallState(Shared.teePositionFor(slot, roster.length, hole));
     p.strokes = 0;
     p.holedOut = false;
-  }
+  });
   Lobby.holeStartedAtMs = Date.now();
   Lobby.holeEnding = false;
+  Lobby.pendingEvents = [];
+  Lobby.tickCounter = 0;
+  Lobby.wasIdle = false;
   Lobby.state = 'PLAYING';
   broadcast({ type: 'roundState', holeIndex, holeName: hole.name, par: hole.par });
 }
@@ -172,6 +183,19 @@ function endHole() {
   }, HOLE_RESULTS_DELAY_MS);
 }
 
+// Snapshots are disposable (the next one supersedes) — skip clients whose socket buffer
+// is backed up instead of queueing behind it. Unbounded queueing is what made a slow tab
+// fall further and further behind real time ("the timer itself lags").
+const MAX_BUFFERED_BYTES = 32768;
+function broadcastSnapshot(msg) {
+  const raw = JSON.stringify(msg);
+  for (const p of Lobby.players.values()) {
+    if (!p.ws || p.ws.readyState !== WebSocket.OPEN) continue;
+    if (p.ws.bufferedAmount > MAX_BUFFERED_BYTES) continue;
+    p.ws.send(raw);
+  }
+}
+
 // ---- Authoritative tick loop ----
 function tick() {
   if (Lobby.state !== 'PLAYING') return;
@@ -179,10 +203,10 @@ function tick() {
   const dt = TICK_MS / 1000;
   Shared.advanceHoleObstacles(hole, dt);
 
-  // Per-tick gameplay events, forwarded in the snapshot so clients can play the matching
+  // Per-tick gameplay events, forwarded with snapshots so clients can play the matching
   // sound/particle juice at the right moment (the client no longer runs its own physics
   // in multiplayer, so it can't detect these locally).
-  const tickEvents = [];
+  const tickEvents = Lobby.pendingEvents;
   for (const p of Lobby.players.values()) {
     if (!p.connected || p.holedOut || !p.ball) continue;
     const events = Shared.stepBallPhysics(p.ball, hole, dt);
@@ -203,29 +227,56 @@ function tick() {
     }
   }
 
+  // Ball-vs-ball collisions: ram away. Holed-out balls are ghosts.
+  const active = [...Lobby.players.values()].filter((p) => p.connected && p.ball && !p.holedOut);
+  for (let i = 0; i < active.length; i++) {
+    for (let j = i + 1; j < active.length; j++) {
+      const a = active[i].ball, b = active[j].ball;
+      if (Shared.resolveBallBallCollision(a, b)) {
+        tickEvents.push({ kind: 'clash', x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
+      }
+    }
+  }
+
   const connected = [...Lobby.players.values()].filter((p) => p.connected);
   const elapsed = Date.now() - Lobby.holeStartedAtMs;
 
-  // Broadcast BEFORE the hole-advance check so the snapshot carrying the final 'holed'
-  // event actually reaches clients — otherwise the last player to sink never sees their
-  // own celebration.
-  broadcast({
-    type: 'snapshot',
-    holeIndex: Lobby.currentHoleIndex,
-    elapsedMs: elapsed,
-    events: tickEvents,
-    obstacles: {
-      windmillAngles: hole.windmills.map((wm) => wm.angle),
-      pendulumPhases: hole.pendulums.map((p) => p.phase),
-      gatePhases: hole.gates.map((g) => g.phase),
-    },
-    balls: [...Lobby.players.values()]
-      .filter((p) => p.connected && p.ball)
-      .map((p) => ({
-        id: p.id, name: p.name, hue: p.hue, x: p.ball.x, y: p.ball.y, vx: p.ball.vx, vy: p.ball.vy,
-        strokes: p.strokes, holedOut: p.holedOut,
-      })),
-  });
+  // Physics runs every tick (60Hz). Snapshots go out at 30Hz while anything is moving,
+  // dropping to 5Hz keepalives when every ball is at rest (clients advance obstacles and
+  // the timer locally between packets) — most of a hole is spent aiming, so this slashes
+  // Wi-Fi airtime for remote players. Broadcast happens BEFORE the hole-advance check so
+  // the snapshot carrying the final 'holed' event actually reaches clients.
+  Lobby.tickCounter++;
+  const anyMoving = active.some((p) => Math.hypot(p.ball.vx, p.ball.vy) >= Shared.STOP_THRESHOLD);
+  const idle = !anyMoving && tickEvents.length === 0;
+  const becameIdle = idle && !Lobby.wasIdle;
+  Lobby.wasIdle = idle;
+  const lastPlayer = connected.length > 0 && connected.every((p) => p.holedOut);
+  const shouldSend = tickEvents.length > 0 || lastPlayer || becameIdle ||
+    (idle ? Lobby.tickCounter % 12 === 0 : Lobby.tickCounter % 2 === 0);
+  if (shouldSend) {
+    const r1 = (v) => Math.round(v * 10) / 10;
+    const r3 = (v) => Math.round(v * 1000) / 1000;
+    broadcastSnapshot({
+      type: 'snapshot',
+      holeIndex: Lobby.currentHoleIndex,
+      elapsedMs: elapsed,
+      events: tickEvents,
+      obstacles: {
+        windmillAngles: hole.windmills.map((wm) => r3(wm.angle)),
+        pendulumPhases: hole.pendulums.map((p) => r3(p.phase)),
+        gatePhases: hole.gates.map((g) => r3(g.phase)),
+      },
+      balls: [...Lobby.players.values()]
+        .filter((p) => p.connected && p.ball)
+        .map((p) => ({
+          id: p.id, name: p.name, hue: p.hue, isHost: p.id === Lobby.hostPlayerId,
+          x: r1(p.ball.x), y: r1(p.ball.y), vx: r1(p.ball.vx), vy: r1(p.ball.vy),
+          strokes: p.strokes, holedOut: p.holedOut,
+        })),
+    });
+    Lobby.pendingEvents = [];
+  }
 
   const allHoledOut = connected.length > 0 && connected.every((p) => p.holedOut);
   const timedOut = elapsed > HOLE_TIMEOUT_MS;
@@ -245,6 +296,8 @@ const wss = new WebSocket.Server({ server: httpServer, path: '/ws' });
 
 wss.on('connection', (ws, req) => {
   let player = null;
+  // Send our small 30Hz packets immediately instead of letting Nagle batch them.
+  req.socket.setNoDelay(true);
   const remoteAddr = req.socket.remoteAddress || '';
   const isLocal = ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(remoteAddr);
 
@@ -267,7 +320,7 @@ wss.on('connection', (ws, req) => {
           // session never had one for this hole).
           if (Lobby.state === 'PLAYING') {
             const hole = Shared.HOLES[Lobby.currentHoleIndex];
-            if (!player.ball) player.ball = Shared.createBallState(hole.tee);
+            if (!player.ball) player.ball = Shared.createBallState(Shared.teePositionFor(Lobby.players.size - 1, Lobby.players.size, hole));
             send(ws, { type: 'roundState', holeIndex: Lobby.currentHoleIndex, holeName: hole.name, par: hole.par });
           }
           broadcastLobbyState();
@@ -290,7 +343,7 @@ wss.on('connection', (ws, req) => {
       // along right away instead of sitting ball-less until the next hole.
       if (Lobby.state === 'PLAYING') {
         const hole = Shared.HOLES[Lobby.currentHoleIndex];
-        player.ball = Shared.createBallState(hole.tee);
+        player.ball = Shared.createBallState(Shared.teePositionFor(Lobby.players.size - 1, Lobby.players.size, hole));
         send(ws, { type: 'roundState', holeIndex: Lobby.currentHoleIndex, holeName: hole.name, par: hole.par });
       }
       broadcastLobbyState();
