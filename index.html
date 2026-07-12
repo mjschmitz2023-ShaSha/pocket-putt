@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Pocket Putt — Mini Golf</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="stage">
+    <canvas id="game" width="800" height="500"></canvas>
+
+    <div id="hud" class="hidden">
+      <div class="hud-left">
+        <span id="hud-hole">Hole 1/9 — The Green Mile</span>
+        <span id="hud-par">Par 2</span>
+      </div>
+      <div class="hud-right">
+        <span id="hud-strokes">Strokes: 0</span>
+        <span id="hud-total">Total: 0</span>
+      </div>
+    </div>
+
+    <div id="power-label" class="hidden"></div>
+    <div id="mp-banner" class="hidden"></div>
+
+    <div id="screen-start" class="screen">
+      <h1>⛳ Pocket Putt</h1>
+      <p class="subtitle">A simple, super fun 19-hole mini golf game</p>
+      <p class="instructions">Click and drag back from the ball to aim, then release to putt.<br>Watch out for sand, water, windmills, pendulums, gates, and boost pads!</p>
+      <button id="btn-play">Play ▶</button>
+    </div>
+
+    <div id="screen-lobby" class="screen hidden">
+      <h1>⛳ Pocket Putt — Multiplayer</h1>
+      <div id="lobby-join">
+        <p class="subtitle">Everyone on this Wi-Fi plays the same 19 holes together, heat by heat.</p>
+        <input id="lobby-name-input" type="text" placeholder="Your name" maxlength="20" autocomplete="off">
+        <button id="btn-join">Join Lobby</button>
+      </div>
+      <div id="lobby-joined" class="hidden">
+        <p class="lobby-url">Friends on this Wi-Fi, open: <strong id="lobby-join-url" title="Click to copy"></strong></p>
+        <ul id="lobby-player-list"></ul>
+        <button id="btn-start-round" class="hidden">Start Round ▶</button>
+        <p id="lobby-waiting-text" class="hidden">Waiting for the host to start…</p>
+      </div>
+    </div>
+
+    <div id="screen-hole-complete" class="screen hidden">
+      <h2 id="banner-text">PAR</h2>
+      <p id="hole-complete-strokes"></p>
+      <button id="btn-next">Next Hole →</button>
+    </div>
+
+    <div id="screen-hole-results" class="screen hidden">
+      <h1 id="hole-results-title">Hole Complete</h1>
+      <table id="hole-results-table">
+        <thead>
+          <tr><th>Player</th><th>Strokes</th><th>Time</th><th>Score</th></tr>
+        </thead>
+        <tbody id="hole-results-body"></tbody>
+      </table>
+      <p class="subtitle">Standings so far</p>
+      <ol id="hole-results-standings"></ol>
+      <p id="hole-results-next">Next hole starting soon…</p>
+    </div>
+
+    <div id="screen-final-results" class="screen hidden">
+      <h1>🏆 Final Standings</h1>
+      <ol id="final-standings"></ol>
+      <button id="btn-play-again" class="hidden">Play Again</button>
+      <p id="final-waiting-text" class="hidden">Waiting for the host to start a new round…</p>
+    </div>
+
+    <div id="screen-hazard" class="screen hidden">
+      <h2 id="hazard-text">SPLASH! +1</h2>
+    </div>
+
+    <div id="screen-scorecard" class="screen hidden">
+      <h1>Round Complete!</h1>
+      <table id="scorecard-table">
+        <thead>
+          <tr><th>Hole</th><th>Name</th><th>Par</th><th>Strokes</th><th>+/-</th></tr>
+        </thead>
+        <tbody id="scorecard-body"></tbody>
+      </table>
+      <p id="scorecard-rating"></p>
+      <button id="btn-replay">Play Again</button>
+    </div>
+  </div>
+
+  <script src="shared.js"></script>
+  <script src="game.js"></script>
+</body>
+</html>

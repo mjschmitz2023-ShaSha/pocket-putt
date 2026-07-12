@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Pocket Putt — Course Atlas</title>
+<style>
+  :root {
+    --bg: #eef1ea;
+    --surface: #ffffff;
+    --surface-border: #d9ddd1;
+    --text: #1c2a20;
+    --muted: #5c6b5f;
+    --accent: #8a6a2f;
+    --fairway: #2f6b3a;
+    --shadow: rgba(30, 40, 30, 0.12);
+    --easy: #2f8f5b;
+    --easy-bg: rgba(47, 143, 91, 0.14);
+    --standard: #b3831f;
+    --standard-bg: rgba(179, 131, 31, 0.16);
+    --long: #c1503d;
+    --long-bg: rgba(193, 80, 61, 0.14);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0e1712;
+      --surface: #132018;
+      --surface-border: #22332a;
+      --text: #eef4ee;
+      --muted: #9fb3a3;
+      --accent: #d8b566;
+      --fairway: #3a7d44;
+      --shadow: rgba(0, 0, 0, 0.45);
+      --easy: #6fcf97;
+      --easy-bg: rgba(111, 207, 151, 0.14);
+      --standard: #e0b04a;
+      --standard-bg: rgba(224, 176, 74, 0.14);
+      --long: #e28066;
+      --long-bg: rgba(226, 128, 102, 0.16);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0e1712; --surface: #132018; --surface-border: #22332a; --text: #eef4ee; --muted: #9fb3a3;
+    --accent: #d8b566; --fairway: #3a7d44; --shadow: rgba(0, 0, 0, 0.45);
+    --easy: #6fcf97; --easy-bg: rgba(111, 207, 151, 0.14);
+    --standard: #e0b04a; --standard-bg: rgba(224, 176, 74, 0.14);
+    --long: #e28066; --long-bg: rgba(226, 128, 102, 0.16);
+  }
+  :root[data-theme="light"] {
+    --bg: #eef1ea; --surface: #ffffff; --surface-border: #d9ddd1; --text: #1c2a20; --muted: #5c6b5f;
+    --accent: #8a6a2f; --fairway: #2f6b3a; --shadow: rgba(30, 40, 30, 0.12);
+    --easy: #2f8f5b; --easy-bg: rgba(47, 143, 91, 0.14);
+    --standard: #b3831f; --standard-bg: rgba(179, 131, 31, 0.16);
+    --long: #c1503d; --long-bg: rgba(193, 80, 61, 0.14);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif; }
+  header { max-width: 1360px; margin: 0 auto; padding: 40px 24px 22px; text-align: center; }
+  .eyebrow {
+    display: block; font-size: 11px; font-weight: 700; letter-spacing: 0.16em; text-transform: uppercase;
+    color: var(--accent); margin-bottom: 10px;
+  }
+  h1 { font-size: 32px; font-weight: 800; letter-spacing: -0.01em; margin: 0 0 8px; text-wrap: balance; }
+  p.sub { margin: 0 auto; max-width: 46em; color: var(--muted); font-size: 14.5px; line-height: 1.5; }
+  .legend {
+    display: flex; flex-wrap: wrap; gap: 10px 20px; justify-content: center;
+    max-width: 1000px; margin: 22px auto 0; padding: 14px 20px;
+    border-top: 1px solid var(--surface-border); border-bottom: 1px solid var(--surface-border);
+    font-size: 12.5px; color: var(--muted);
+  }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .swatch { width: 11px; height: 11px; border-radius: 3px; display: inline-block; flex: none; }
+  .grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+    gap: 22px; max-width: 1360px; margin: 0 auto; padding: 28px 24px 60px;
+  }
+  .card {
+    background: var(--surface); border: 1px solid var(--surface-border); border-radius: 12px;
+    overflow: hidden; box-shadow: 0 10px 28px var(--shadow);
+  }
+  .card-head { display: flex; align-items: center; gap: 10px; padding: 12px 14px 10px; }
+  .hole-badge {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace; font-variant-numeric: tabular-nums;
+    font-size: 13px; font-weight: 700; color: #fff; background: var(--fairway);
+    width: 26px; height: 26px; border-radius: 7px; display: flex; align-items: center; justify-content: center;
+    flex: none;
+  }
+  .card-title { flex: 1; min-width: 0; }
+  .card-title h2 { font-size: 15px; font-weight: 700; margin: 0; }
+  .card-tags { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 2px; }
+  .tag {
+    font-size: 10.5px; font-weight: 600; letter-spacing: 0.03em; padding: 1px 7px; border-radius: 20px;
+    border: 1px solid var(--surface-border); color: var(--muted);
+  }
+  .par-pill {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace; font-variant-numeric: tabular-nums;
+    font-size: 12px; font-weight: 700; padding: 3px 9px; border-radius: 20px; flex: none;
+  }
+  .par-pill[data-tier="easy"] { color: var(--easy); background: var(--easy-bg); }
+  .par-pill[data-tier="standard"] { color: var(--standard); background: var(--standard-bg); }
+  .par-pill[data-tier="long"] { color: var(--long); background: var(--long-bg); }
+  canvas { display: block; width: 100%; height: auto; aspect-ratio: 8 / 5; margin: 0 auto 12px; padding: 0 12px; }
+</style>
+</head>
+<body>
+  <header>
+    <span class="eyebrow">Pocket Putt · Design Review</span>
+    <h1>Course Atlas</h1>
+    <p class="sub">Top-down layout of all 19 holes, drawn to scale straight from the live game data — for spotting dead ends, blind loops, and holes that need more (or less) chaos.</p>
+  </header>
+  <div class="legend">
+    <span><span class="swatch" style="background:#6b4a2b"></span>Wall</span>
+    <span><span class="swatch" style="background:#e6483f"></span>Bumper (bouncy)</span>
+    <span><span class="swatch" style="background:#dcc27a"></span>Sand</span>
+    <span><span class="swatch" style="background:#3b82c4"></span>Water (+1 penalty)</span>
+    <span><span class="swatch" style="background:linear-gradient(90deg,#8b2fd1,#2fd1c8)"></span>Boost pad</span>
+    <span><span class="swatch" style="background:#8a8a8a"></span>Windmill</span>
+    <span><span class="swatch" style="background:#e6483f"></span>Pendulum</span>
+    <span><span class="swatch" style="background:#c9a24b"></span>Sliding gate</span>
+  </div>
+  <div class="grid" id="grid"></div>
+
+<script>
+// ---- snapshot of hole data from game.js, for layout review only ----
+function wall(x1,y1,x2,y2,opts){ opts=opts||{}; return {x1,y1,x2,y2,bumper:!!opts.bumper}; }
+function sandRect(x1,y1,x2,y2){ return {shape:'rect',x1,y1,x2,y2}; }
+function waterRect(x1,y1,x2,y2,dropPoint){ return {shape:'rect',x1,y1,x2,y2,dropPoint}; }
+function boostRect(x1,y1,x2,y2,angle,power){ return {shape:'rect',x1,y1,x2,y2,angle,power}; }
+function pendulum(cx,cy,length,angleCenter,amplitude,period,phaseOffset){
+  return {cx,cy,length,angleCenter,amplitude,period,phase:phaseOffset||0};
+}
+function slidingGate(x1,y1,x2,y2,axis,amplitude,period,phaseOffset){
+  return {x1,y1,x2,y2,axis,amplitude,period,phase:phaseOffset||0};
+}
+function ringBumpers(cx,cy,r,n,gapIndex){
+  const walls=[];
+  for(let i=0;i<n;i++){
+    if(i===gapIndex) continue;
+    const a1=i*(2*Math.PI/n), a2=(i+1)*(2*Math.PI/n);
+    walls.push(wall(cx+Math.cos(a1)*r, cy+Math.sin(a1)*r, cx+Math.cos(a2)*r, cy+Math.sin(a2)*r, {bumper:true}));
+  }
+  return walls;
+}
+const BOUND = { left: 20, top: 20, right: 780, bottom: 480 };
+const BOUNDARY_WALLS = [
+  wall(BOUND.left, BOUND.top, BOUND.right, BOUND.top),
+  wall(BOUND.right, BOUND.top, BOUND.right, BOUND.bottom),
+  wall(BOUND.right, BOUND.bottom, BOUND.left, BOUND.bottom),
+  wall(BOUND.left, BOUND.bottom, BOUND.left, BOUND.top),
+];
+
+const HOLES = [
+  { name: 'The Green Mile', par: 2,
+    tee: {x:90,y:250}, cup:{x:710,y:250,radius:11},
+    walls: [], sand: [ sandRect(300,320,400,400) ], water: [], boost: [], pendulums: [], gates: [], windmills: [] },
+  { name: 'Bumper Alley', par: 3,
+    tee: {x:70,y:250}, cup:{x:730,y:250,radius:11},
+    walls: [ wall(340,140,520,210,{bumper:true}), wall(340,360,520,290,{bumper:true}) ],
+    sand: [ sandRect(580,220,660,280) ], water: [], boost: [], pendulums: [], gates: [], windmills: [] },
+  { name: 'The Dogleg', par: 4,
+    tee: {x:60,y:60}, cup:{x:720,y:420,radius:11},
+    walls: [ wall(400,20,400,300) ],
+    sand: [ sandRect(320,320,420,390) ],
+    water: [ waterRect(60,400,220,460,{x:80,y:340}) ], boost: [], pendulums: [], gates: [], windmills: [] },
+  { name: 'Sandy Pass', par: 3,
+    tee: {x:70,y:250}, cup:{x:730,y:250,radius:11},
+    walls: [], sand: [ sandRect(350,150,500,350) ],
+    water: [ waterRect(340,60,510,130,{x:320,y:140}) ], boost: [], pendulums: [], gates: [], windmills: [] },
+  { name: "Water's Edge", par: 4,
+    tee: {x:70,y:250}, cup:{x:730,y:250,radius:11},
+    walls: [], sand: [ sandRect(580,340,680,430) ],
+    water: [ waterRect(380,20,420,320,{x:350,y:400}), waterRect(600,420,660,470,{x:580,y:400}) ],
+    boost: [], pendulums: [], gates: [], windmills: [] },
+  { name: 'Pinball Corner', par: 4,
+    tee: {x:60,y:60}, cup:{x:730,y:430,radius:11},
+    walls: [
+      wall(260,130,400,210,{bumper:true}),
+      wall(410,250,300,330,{bumper:true}),
+      wall(480,180,610,250,{bumper:true}),
+    ],
+    sand: [ sandRect(560,340,680,440) ],
+    water: [ waterRect(300,380,400,440,{x:260,y:340}) ],
+    boost: [ boostRect(60,90,150,150, Math.atan2(1,2), 600) ], pendulums: [], gates: [], windmills: [] },
+  { name: 'The Windmill', par: 5,
+    tee: {x:70,y:250}, cup:{x:730,y:250,radius:11},
+    walls: [], sand: [ sandRect(590,330,690,420) ],
+    water: [ waterRect(660,20,710,140,{x:640,y:160}), waterRect(660,360,710,480,{x:640,y:340}) ],
+    boost: [], pendulums: [], gates: [],
+    windmills: [ { cx:400, cy:250, armLength:90, blades:4 } ] },
+  { name: 'Serpentine', par: 4,
+    tee: {x:60,y:60}, cup:{x:730,y:430,radius:11},
+    walls: [ wall(260,20,260,320), wall(520,180,520,480) ],
+    sand: [ sandRect(280,340,380,440), sandRect(560,260,640,340) ],
+    water: [],
+    boost: [ boostRect(350,40,430,100, Math.PI/4, 700) ], pendulums: [], gates: [], windmills: [] },
+  { name: 'The Crater', par: 5,
+    tee: {x:60,y:60}, cup:{x:720,y:420,radius:11},
+    walls: [ wall(340,20,340,260), ...ringBumpers(720,420,55,8,4) ],
+    sand: [ sandRect(400,300,500,400) ],
+    water: [ waterRect(560,280,650,380,{x:540,y:320}) ],
+    boost: [ boostRect(580,390,640,450, 0, 500) ], pendulums: [], gates: [], windmills: [] },
+  { name: 'The Pendulum', par: 3,
+    tee: {x:70,y:250}, cup:{x:730,y:250,radius:11},
+    walls: [], sand: [ sandRect(620,300,700,370) ], water: [], boost: [], gates: [], windmills: [],
+    pendulums: [ pendulum(400,20,235,Math.PI/2,0.85,2.2) ] },
+  { name: 'Sliding Doors', par: 3,
+    tee: {x:70,y:250}, cup:{x:730,y:250,radius:11},
+    walls: [ wall(380,20,380,220), wall(380,280,380,480) ],
+    sand: [ sandRect(500,330,600,410) ], water: [], boost: [], pendulums: [], windmills: [],
+    gates: [ slidingGate(380,220,380,280,'y',70,2.0) ] },
+  { name: 'Twin Mills', par: 4,
+    tee: {x:60,y:60}, cup:{x:730,y:430,radius:11},
+    walls: [], sand: [ sandRect(420,250,500,320) ],
+    water: [ waterRect(600,380,680,450,{x:560,y:340}) ],
+    boost: [], pendulums: [], gates: [],
+    windmills: [
+      { cx:280, cy:170, armLength:70, blades:2 },
+      { cx:520, cy:330, armLength:70, blades:2 },
+    ] },
+  { name: 'The Gauntlet Gate', par: 4,
+    tee: {x:60,y:250}, cup:{x:730,y:430,radius:11},
+    walls: [
+      wall(300,20,300,200),
+      wall(300,280,300,480),
+      wall(520,20,520,320),
+      wall(520,400,520,480),
+    ],
+    sand: [ sandRect(360,300,460,400) ], water: [], boost: [], pendulums: [], windmills: [],
+    gates: [
+      slidingGate(300,200,300,280,'y',90,2.6,0),
+      slidingGate(520,320,520,400,'y',90,2.6,1.3),
+    ] },
+  { name: 'Whirlwind', par: 3,
+    tee: {x:70,y:250}, cup:{x:730,y:250,radius:11},
+    walls: [], sand: [], water: [], boost: [], pendulums: [], gates: [],
+    windmills: [ { cx:400, cy:250, armLength:130, blades:6 } ] },
+  { name: 'The Vault', par: 4,
+    tee: {x:60,y:60}, cup:{x:730,y:430,radius:11},
+    walls: [
+      wall(340,20,340,260),
+      wall(600,340,600,380),
+      wall(600,430,600,480),
+      ...ringBumpers(730,430,50,8,4),
+    ],
+    sand: [ sandRect(420,300,520,380) ],
+    water: [ waterRect(460,380,560,440,{x:420,y:340}) ],
+    boost: [], pendulums: [], windmills: [],
+    gates: [ slidingGate(600,380,600,430,'y',60,2.5) ] },
+  { name: 'Bar Fight', par: 3,
+    tee: {x:70,y:250}, cup:{x:730,y:250,radius:11},
+    walls: [], sand: [], water: [], boost: [], gates: [], windmills: [],
+    pendulums: [
+      pendulum(300,20,230,Math.PI/2,0.8,2.0,0),
+      pendulum(500,480,230,-Math.PI/2,0.8,2.0,1.0),
+    ] },
+  { name: 'Sand Trap Symphony', par: 3,
+    tee: {x:70,y:250}, cup:{x:730,y:250,radius:11},
+    walls: [],
+    sand: [ sandRect(250,180,340,320), sandRect(450,150,540,250), sandRect(550,300,650,420) ],
+    water: [], boost: [], pendulums: [], gates: [],
+    windmills: [ { cx:400, cy:400, armLength:60, blades:3 } ] },
+  { name: 'Drawbridge', par: 4,
+    tee: {x:70,y:250}, cup:{x:730,y:250,radius:11},
+    walls: [], sand: [ sandRect(580,340,680,430) ],
+    water: [ waterRect(370,20,450,215,{x:340,y:250}), waterRect(370,285,450,480,{x:340,y:250}) ],
+    boost: [ boostRect(240,212,310,248, 0, 650) ],
+    pendulums: [ pendulum(410,20,250,Math.PI/2,0.55,2.2) ],
+    windmills: [], gates: [] },
+  { name: 'The 19th Hole', par: 5,
+    tee: {x:60,y:60}, cup:{x:720,y:420,radius:11},
+    walls: [ wall(340,20,340,260), ...ringBumpers(720,420,55,8,4) ],
+    sand: [ sandRect(400,300,500,400) ],
+    water: [ waterRect(560,280,650,380,{x:540,y:320}) ],
+    boost: [ boostRect(580,390,640,450, 0, 500) ], pendulums: [], gates: [],
+    windmills: [ { cx:520, cy:200, armLength:80, blades:4 } ] },
+];
+
+const LOGICAL_W = 800, LOGICAL_H = 500;
+
+function zoneBounds(z){ return {x1:z.x1,y1:z.y1,x2:z.x2,y2:z.y2}; }
+
+function drawHole(ctx, hole, s) {
+  ctx.clearRect(0,0,LOGICAL_W*s,LOGICAL_H*s);
+  // grass + mow stripes
+  ctx.fillStyle = '#3a7d44';
+  ctx.fillRect(0,0,LOGICAL_W*s,LOGICAL_H*s);
+  ctx.fillStyle = 'rgba(255,255,255,0.04)';
+  for (let x=0,i=0; x<LOGICAL_W; x+=42,i++) if (i%2===0) ctx.fillRect(x*s,0,42*s,LOGICAL_H*s);
+
+  // sand
+  ctx.fillStyle = '#dcc27a';
+  for (const z of hole.sand) ctx.fillRect(z.x1*s,z.y1*s,(z.x2-z.x1)*s,(z.y2-z.y1)*s);
+  // water
+  ctx.fillStyle = '#3b82c4';
+  for (const z of hole.water) {
+    ctx.fillRect(z.x1*s,z.y1*s,(z.x2-z.x1)*s,(z.y2-z.y1)*s);
+    ctx.fillStyle = 'rgba(255,255,255,0.5)';
+    ctx.beginPath(); ctx.arc(z.dropPoint.x*s, z.dropPoint.y*s, 4*s, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#3b82c4';
+  }
+  // boost pads
+  for (const z of hole.boost) {
+    const grad = ctx.createLinearGradient(z.x1*s,z.y1*s,z.x2*s,z.y2*s);
+    grad.addColorStop(0,'#8b2fd1'); grad.addColorStop(1,'#2fd1c8');
+    ctx.fillStyle = grad;
+    ctx.fillRect(z.x1*s,z.y1*s,(z.x2-z.x1)*s,(z.y2-z.y1)*s);
+    const cx=(z.x1+z.x2)/2*s, cy=(z.y1+z.y2)/2*s;
+    const len = 46*s;
+    const dx=Math.cos(z.angle)*len, dy=Math.sin(z.angle)*len;
+    ctx.strokeStyle = '#fff'; ctx.lineWidth=2*s;
+    ctx.beginPath(); ctx.moveTo(cx,cy); ctx.lineTo(cx+dx,cy+dy); ctx.stroke();
+    const ang = z.angle;
+    ctx.beginPath();
+    ctx.moveTo(cx+dx,cy+dy);
+    ctx.lineTo(cx+dx-10*s*Math.cos(ang-0.4), cy+dy-10*s*Math.sin(ang-0.4));
+    ctx.lineTo(cx+dx-10*s*Math.cos(ang+0.4), cy+dy-10*s*Math.sin(ang+0.4));
+    ctx.closePath(); ctx.fillStyle='#fff'; ctx.fill();
+  }
+
+  // walls (boundary + hole)
+  function drawWall(w){
+    ctx.lineCap='round';
+    ctx.strokeStyle = w.bumper ? '#e6483f' : '#6b4a2b';
+    ctx.lineWidth = 7*s;
+    ctx.beginPath(); ctx.moveTo(w.x1*s,w.y1*s); ctx.lineTo(w.x2*s,w.y2*s); ctx.stroke();
+    if (w.bumper) {
+      ctx.strokeStyle='rgba(255,255,255,0.85)'; ctx.lineWidth=2*s; ctx.setLineDash([6*s,6*s]);
+      ctx.beginPath(); ctx.moveTo(w.x1*s,w.y1*s); ctx.lineTo(w.x2*s,w.y2*s); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+  }
+  for (const w of BOUNDARY_WALLS) drawWall(w);
+  for (const w of hole.walls) drawWall(w);
+
+  // windmills (static, rest pose)
+  for (const wm of hole.windmills) {
+    ctx.fillStyle = '#8a8a8a';
+    ctx.fillRect((wm.cx-6)*s, wm.cy*s, 12*s, 60*s);
+    ctx.strokeStyle = '#e8e8e8'; ctx.lineWidth = 6*s; ctx.lineCap='round';
+    for (let i=0;i<wm.blades;i++){
+      const a = i*(2*Math.PI/wm.blades);
+      ctx.beginPath();
+      ctx.moveTo(wm.cx*s, wm.cy*s);
+      ctx.lineTo((wm.cx+Math.cos(a)*wm.armLength)*s, (wm.cy+Math.sin(a)*wm.armLength)*s);
+      ctx.stroke();
+    }
+    ctx.fillStyle='#444';
+    ctx.beginPath(); ctx.arc(wm.cx*s, wm.cy*s, 7*s, 0, Math.PI*2); ctx.fill();
+  }
+
+  // pendulums — dashed arc shows the full swing range, solid bar shows rest pose
+  for (const p of hole.pendulums) {
+    const a1 = p.angleCenter - p.amplitude, a2 = p.angleCenter + p.amplitude;
+    ctx.strokeStyle = 'rgba(255,255,255,0.25)'; ctx.lineWidth = 1.5*s; ctx.setLineDash([4*s,4*s]);
+    ctx.beginPath(); ctx.arc(p.cx*s, p.cy*s, p.length*s, a1, a2); ctx.stroke();
+    ctx.setLineDash([]);
+    const restX = p.cx + Math.cos(p.angleCenter)*p.length, restY = p.cy + Math.sin(p.angleCenter)*p.length;
+    ctx.strokeStyle = '#9aa0a6'; ctx.lineWidth = 5*s; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(p.cx*s, p.cy*s); ctx.lineTo(restX*s, restY*s); ctx.stroke();
+    ctx.fillStyle = '#444';
+    ctx.beginPath(); ctx.arc(p.cx*s, p.cy*s, 5*s, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#e6483f';
+    ctx.beginPath(); ctx.arc(restX*s, restY*s, 7*s, 0, Math.PI*2); ctx.fill();
+  }
+
+  // sliding gates — rail shows full travel, bar shows centered/closed pose
+  for (const g of hole.gates) {
+    const dx = g.axis === 'x' ? g.amplitude : 0, dy = g.axis === 'y' ? g.amplitude : 0;
+    ctx.strokeStyle = 'rgba(255,255,255,0.2)'; ctx.lineWidth = 2*s; ctx.lineCap='round';
+    ctx.beginPath();
+    ctx.moveTo((g.x1-dx)*s,(g.y1-dy)*s); ctx.lineTo((g.x2-dx)*s,(g.y2-dy)*s);
+    ctx.moveTo((g.x1+dx)*s,(g.y1+dy)*s); ctx.lineTo((g.x2+dx)*s,(g.y2+dy)*s);
+    ctx.stroke();
+    ctx.strokeStyle = '#c9a24b'; ctx.lineWidth = 7*s;
+    ctx.beginPath(); ctx.moveTo(g.x1*s,g.y1*s); ctx.lineTo(g.x2*s,g.y2*s); ctx.stroke();
+  }
+
+  // tee marker
+  ctx.fillStyle = 'rgba(255,255,255,0.9)';
+  ctx.beginPath(); ctx.arc(hole.tee.x*s, hole.tee.y*s, 6*s, 0, Math.PI*2); ctx.fill();
+  ctx.strokeStyle = '#1b2a1f'; ctx.lineWidth = 1.5*s; ctx.stroke();
+  ctx.fillStyle = '#1b2a1f';
+  ctx.font = `${8*s}px sans-serif`;
+  ctx.textAlign = 'center'; ctx.textBaseline='middle';
+  ctx.fillText('T', hole.tee.x*s, hole.tee.y*s);
+
+  // cup + flag
+  const cup = hole.cup;
+  ctx.fillStyle = '#111';
+  ctx.beginPath(); ctx.arc(cup.x*s, cup.y*s, cup.radius*s, 0, Math.PI*2); ctx.fill();
+  ctx.strokeStyle = '#eee'; ctx.lineWidth = 1.5*s;
+  ctx.beginPath(); ctx.moveTo(cup.x*s, cup.y*s-4*s); ctx.lineTo(cup.x*s, cup.y*s-36*s); ctx.stroke();
+  ctx.fillStyle = '#e6483f';
+  ctx.beginPath();
+  ctx.moveTo(cup.x*s, cup.y*s-36*s);
+  ctx.lineTo(cup.x*s+14*s, cup.y*s-31*s);
+  ctx.lineTo(cup.x*s, cup.y*s-26*s);
+  ctx.closePath(); ctx.fill();
+}
+
+function parTier(par) { return par <= 3 ? 'easy' : par === 4 ? 'standard' : 'long'; }
+
+const grid = document.getElementById('grid');
+HOLES.forEach((hole, i) => {
+  const card = document.createElement('div');
+  card.className = 'card';
+  const s = 1;
+  const tags = [
+    hole.boost.length ? '<span class="tag">Boost</span>' : '',
+    hole.windmills.length ? `<span class="tag">${hole.windmills.length > 1 ? hole.windmills.length + ' windmills' : 'Windmill'}</span>` : '',
+    hole.pendulums.length ? `<span class="tag">${hole.pendulums.length > 1 ? hole.pendulums.length + ' pendulums' : 'Pendulum'}</span>` : '',
+    hole.gates.length ? '<span class="tag">Sliding gate</span>' : '',
+    hole.sand.length ? `<span class="tag">${hole.sand.length} sand</span>` : '',
+    hole.water.length ? `<span class="tag">${hole.water.length} water</span>` : '',
+  ].join('');
+  card.innerHTML = `
+    <div class="card-head">
+      <span class="hole-badge">${i + 1}</span>
+      <div class="card-title">
+        <h2>${hole.name}</h2>
+        <div class="card-tags">${tags}</div>
+      </div>
+      <span class="par-pill" data-tier="${parTier(hole.par)}">PAR ${hole.par}</span>
+    </div>
+  `;
+  const canvas = document.createElement('canvas');
+  canvas.width = LOGICAL_W*s; canvas.height = LOGICAL_H*s;
+  card.appendChild(canvas);
+  grid.appendChild(card);
+  drawHole(canvas.getContext('2d'), hole, s);
+});
+</script>
+</body>
+</html>
