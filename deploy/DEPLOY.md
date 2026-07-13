@@ -52,13 +52,13 @@ Each room runs authoritative physics on the server (unlike Chess101’s pure pee
 
 ### Deploy / update
 
-Push to the connected branch (`relay`):
+Production deploys from **`main`**:
 
 ```bash
-git push origin relay
+git push origin main
 ```
 
-Confirm service **branch = `relay`**, start command **`npm start`**.
+In the Render dashboard, set the service **branch = `main`** (not `relay`), start command **`npm start`**.
 
 ### Environment
 
