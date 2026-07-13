@@ -58,7 +58,7 @@ Production deploys from **`main`**:
 git push origin main
 ```
 
-In the Render dashboard, set the service **branch = `main`** (not `relay`), start command **`npm start`**.
+In the Render dashboard, set the service **branch = `main`**, start command **`npm start`**.
 
 ### Environment
 
