@@ -50,6 +50,95 @@ const hudPar = document.getElementById('hud-par');
 const hudStrokes = document.getElementById('hud-strokes');
 const hudTotal = document.getElementById('hud-total');
 const powerLabelEl = document.getElementById('power-label');
+const respawnOfferEl = document.getElementById('respawn-offer');
+const RESPAWN_OFFER_SEC = 15;
+let unsettledSec = 0;
+let respawnOfferVisible = false;
+let respawnDismissedUntilSettle = false;
+
+function hideRespawnOffer() {
+  if (respawnOfferEl) respawnOfferEl.classList.add('hidden');
+  respawnOfferVisible = false;
+}
+function showRespawnOffer() {
+  if (!respawnOfferEl || respawnOfferVisible || respawnDismissedUntilSettle) return;
+  respawnOfferEl.classList.remove('hidden');
+  respawnOfferVisible = true;
+}
+/** True while the local ball is in play but not ready for the next putt. */
+function isBallUnsettled() {
+  if (MULTIPLAYER) {
+    if (!mpPlaying || !mpPlayerId) return false;
+    const me = Game.players.get(mpPlayerId);
+    if (!me || me.holedOut) return false;
+    return !mpCanPutt;
+  }
+  return Game.state === 'BALL_MOVING';
+}
+function resetUnsettledTimer() {
+  unsettledSec = 0;
+  respawnDismissedUntilSettle = false;
+  hideRespawnOffer();
+}
+function doLocalRespawnToTee() {
+  const hole = currentHoles()[Game.currentHoleIndex];
+  if (MULTIPLAYER) {
+    const me = Game.players.get(mpPlayerId);
+    if (me) {
+      me.x = hole.tee.x;
+      me.y = hole.tee.y;
+      me.vx = 0;
+      me.vy = 0;
+      me.z = 0;
+      me.vz = 0;
+      me.errX = 0;
+      me.errY = 0;
+      me.rx = me.x;
+      me.ry = me.y;
+      me.wet = false;
+      me.wetStroke = false;
+      me.firedBoosts = new Set();
+      me.stuckStickyIndex = -1;
+      mpSyncSelfFromPlayer(me);
+    }
+  } else {
+    Game.ball.x = hole.tee.x;
+    Game.ball.y = hole.tee.y;
+    Game.ball.vx = 0;
+    Game.ball.vy = 0;
+    Game.ball.z = 0;
+    Game.ball.vz = 0;
+    Game.ball.wet = false;
+    Game.ball.wetStroke = false;
+    Game.ball.firedBoosts = new Set();
+    Game.ball.stuckStickyIndex = -1;
+    Game.trail = [];
+    Game.drag.active = false;
+    Game.state = 'AIMING';
+  }
+  resetUnsettledTimer();
+  hideAllScreens();
+}
+function requestRespawn() {
+  soundClick();
+  if (MULTIPLAYER) {
+    if (mpSocketOpen()) {
+      mpSocket.send(JSON.stringify({ type: 'respawn' }));
+    }
+    // Optimistic local tee so the UI unlocks immediately; host hard-resync confirms.
+    doLocalRespawnToTee();
+  } else {
+    doLocalRespawnToTee();
+  }
+}
+function updateRespawnOffer(dt) {
+  if (isBallUnsettled()) {
+    unsettledSec += dt;
+    if (unsettledSec >= RESPAWN_OFFER_SEC) showRespawnOffer();
+  } else {
+    if (unsettledSec > 0 || respawnOfferVisible) resetUnsettledTimer();
+  }
+}
 
 function setupCanvasDPR() {
   const dpr = window.devicePixelRatio || 1;
@@ -409,29 +498,137 @@ function drawWaterZone(z) {
     ctx.stroke();
   }
 }
-function drawGravityBody(b) {
-  if (b.kind === 'blackHole') {
-    const hr = b.radius;
-    const dr = b.drawRadius != null ? b.drawRadius : Math.min(hr, 5);
-    // Soft field halo
-    const glow = ctx.createRadialGradient(b.x, b.y, dr, b.x, b.y, Math.min(b.fieldRadius || 80, 90));
-    glow.addColorStop(0, 'rgba(80,40,120,0.35)');
-    glow.addColorStop(1, 'rgba(20,0,40,0)');
-    ctx.fillStyle = glow;
-    ctx.beginPath();
-    ctx.arc(b.x, b.y, Math.min(b.fieldRadius || 80, 90), 0, Math.PI * 2);
-    ctx.fill();
-    ctx.fillStyle = '#0a0612';
-    ctx.beginPath();
-    ctx.arc(b.x, b.y, dr, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.strokeStyle = 'rgba(180,120,255,0.7)';
-    ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    ctx.arc(b.x, b.y, hr, 0, Math.PI * 2);
-    ctx.stroke();
+/**
+ * Approach B: screen-space gravitational lens — warp already-drawn fairway pixels
+ * toward the horizon, then paint the black disk + photon ring on top.
+ * Not real GR; looks like light bending. CPU cost is ~π·R² samples per BH per frame.
+ */
+function sampleBilinearRGBA(data, w, h, x, y) {
+  // Clamp to edge so the warp doesn't sample garbage outside the patch.
+  x = Math.max(0, Math.min(w - 1.001, x));
+  y = Math.max(0, Math.min(h - 1.001, y));
+  const x0 = x | 0;
+  const y0 = y | 0;
+  const x1 = x0 + 1;
+  const y1 = y0 + 1;
+  const fx = x - x0;
+  const fy = y - y0;
+  const i00 = (y0 * w + x0) * 4;
+  const i10 = (y0 * w + x1) * 4;
+  const i01 = (y1 * w + x0) * 4;
+  const i11 = (y1 * w + x1) * 4;
+  const ifx = 1 - fx;
+  const ify = 1 - fy;
+  return [
+    data[i00] * ifx * ify + data[i10] * fx * ify + data[i01] * ifx * fy + data[i11] * fx * fy,
+    data[i00 + 1] * ifx * ify + data[i10 + 1] * fx * ify + data[i01 + 1] * ifx * fy + data[i11 + 1] * fx * fy,
+    data[i00 + 2] * ifx * ify + data[i10 + 2] * fx * ify + data[i01 + 2] * ifx * fy + data[i11 + 2] * fx * fy,
+    data[i00 + 3] * ifx * ify + data[i10 + 3] * fx * ify + data[i01 + 3] * ifx * fy + data[i11 + 3] * fx * fy,
+  ];
+}
+
+// Black-hole lens look — dialed in via bh-lens-demo.html
+const BH_LENS = {
+  rsLogical: 7, // horizon / pure-black radius in warp
+  rOutLogical: 108, // warp extent
+  lensK: 1.45, // Schwarzschild-ish strength
+  fallPow: 0.8, // edge falloff power
+  denMin: 0.11, // clamp in r/(1 - k Rs/r)
+  mix: 0.7, // blend of schwarz term
+  diskDraw: 2.5, // solid event-horizon disk on top
+};
+
+function warpBlackHoleLens(b) {
+  // getImageData / putImageData are in *device* pixels and ignore ctx.setTransform(dpr).
+  // Drawing uses logical coords with dpr transform — scale everything so warp aligns
+  // with the horizon disk.
+  const dpr = window.devicePixelRatio || 1;
+  const cx = b.x * dpr;
+  const cy = b.y * dpr;
+  const rs = BH_LENS.rsLogical * dpr;
+  const rOut = BH_LENS.rOutLogical * dpr;
+  const lensK = BH_LENS.lensK;
+  const fallPow = BH_LENS.fallPow;
+  const denMin = BH_LENS.denMin;
+  const mix = BH_LENS.mix;
+
+  const pad = Math.ceil(rOut) + 2;
+  const x0 = Math.max(0, Math.floor(cx - pad));
+  const y0 = Math.max(0, Math.floor(cy - pad));
+  const x1 = Math.min(canvas.width, Math.ceil(cx + pad));
+  const y1 = Math.min(canvas.height, Math.ceil(cy + pad));
+  const w = x1 - x0;
+  const h = y1 - y0;
+  if (w < 4 || h < 4) return;
+
+  let src;
+  try {
+    src = ctx.getImageData(x0, y0, w, h);
+  } catch (err) {
     return;
   }
+  const dst = ctx.createImageData(w, h);
+  const s = src.data;
+  const d = dst.data;
+
+  for (let j = 0; j < h; j++) {
+    for (let i = 0; i < w; i++) {
+      const di = (j * w + i) * 4;
+      const px = x0 + i + 0.5;
+      const py = y0 + j + 0.5;
+      const dx = px - cx;
+      const dy = py - cy;
+      const r = Math.hypot(dx, dy);
+
+      // Event horizon: pure black, no glow/shadow.
+      if (r < rs) {
+        d[di] = 0;
+        d[di + 1] = 0;
+        d[di + 2] = 0;
+        d[di + 3] = 255;
+        continue;
+      }
+      if (r >= rOut || r < 1e-4) {
+        d[di] = s[di];
+        d[di + 1] = s[di + 1];
+        d[di + 2] = s[di + 2];
+        d[di + 3] = s[di + 3];
+        continue;
+      }
+
+      // map: fall = 1 - (r-rs)/(rOut-rs)
+      //      schwarz = r / max(denMin, 1 - lensK*rs/r)
+      //      rSrc = r + (schwarz-r)*mix*fall^fallPow
+      const fall = 1 - (r - rs) / (rOut - rs);
+      const schwarz = r / Math.max(denMin, 1 - (lensK * rs) / r);
+      let rSrc = r + (schwarz - r) * mix * Math.pow(Math.max(0, fall), fallPow);
+      rSrc = Math.min(Math.max(rSrc, r), rOut * 0.998);
+
+      const scale = rSrc / r;
+      const sx = cx + dx * scale - x0;
+      const sy = cy + dy * scale - y0;
+      const rgba = sampleBilinearRGBA(s, w, h, sx, sy);
+      d[di] = rgba[0];
+      d[di + 1] = rgba[1];
+      d[di + 2] = rgba[2];
+      d[di + 3] = rgba[3];
+    }
+  }
+  ctx.putImageData(dst, x0, y0);
+}
+
+/** Solid event-horizon disk on top of warped grass (no glow). */
+function drawBlackHoleOverlay(b) {
+  const diskR = BH_LENS.diskDraw;
+  ctx.fillStyle = '#000000';
+  ctx.beginPath();
+  ctx.arc(b.x, b.y, diskR, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function drawGravityBody(b) {
+  // Black holes are warped + overlaid later in drawWorld (need fairway pixels first).
+  if (b.kind === 'blackHole') return;
   // planet / moon
   const r = b.radius;
   const bodyGrad = ctx.createRadialGradient(b.x - r * 0.3, b.y - r * 0.3, r * 0.2, b.x, b.y, r);
@@ -957,6 +1154,7 @@ function drawWorld() {
   for (const z of hole.sticky || []) drawStickyZone(z);
   for (const z of hole.boost) drawBoostZone(z);
   for (const z of hole.ramps || []) drawRampZone(z);
+  // Planets/moons first (solid bodies sit under lens warp if a BH is nearby).
   for (const b of hole.gravityBodies || []) drawGravityBody(b);
   for (const w of BOUNDARY_WALLS) drawWallSegment(w);
   for (const w of hole.walls) drawWallSegment(w);
@@ -964,6 +1162,12 @@ function drawWorld() {
   for (const p of hole.pendulums) drawPendulum(p);
   for (const g of hole.gates) drawSlidingGate(g);
   drawHoleAndFlag(hole);
+
+  // Black holes (approach B): warp already-painted fairway/walls toward each horizon,
+  // then draw the disk + photon ring. Balls stay unwarped on top for readability.
+  const blackHoles = (hole.gravityBodies || []).filter((b) => b.kind === 'blackHole');
+  for (const b of blackHoles) warpBlackHoleLens(b);
+  for (const b of blackHoles) drawBlackHoleOverlay(b);
 
   if (MULTIPLAYER) {
     for (const b of Game.players.values()) {
@@ -1042,6 +1246,7 @@ function loadHole(i) {
   hud.classList.remove('hidden');
   hideAllScreens();
   Game.state = 'AIMING';
+  resetUnsettledTimer();
   updateHUD();
 }
 function startGame() {
@@ -1061,6 +1266,7 @@ function onHoleComplete() {
   document.getElementById('hole-complete-strokes').textContent = `${Game.strokes} stroke${Game.strokes === 1 ? '' : 's'} (Par ${hole.par})`;
   document.getElementById('btn-next').textContent = Game.currentHoleIndex === currentHoles().length - 1 ? 'See Scorecard →' : 'Next Hole →';
   Game.state = 'HOLE_COMPLETE';
+  resetUnsettledTimer();
   showScreen('screen-hole-complete');
 }
 function showRoundComplete() {
@@ -1174,6 +1380,16 @@ document.getElementById('btn-next').addEventListener('click', () => {
   else loadHole(Game.currentHoleIndex + 1);
 });
 document.getElementById('btn-replay').addEventListener('click', () => { soundClick(); startGame(); });
+const btnRespawn = document.getElementById('btn-respawn');
+const btnRespawnDismiss = document.getElementById('btn-respawn-dismiss');
+if (btnRespawn) btnRespawn.addEventListener('click', requestRespawn);
+if (btnRespawnDismiss) {
+  btnRespawnDismiss.addEventListener('click', () => {
+    soundClick();
+    hideRespawnOffer();
+    respawnDismissedUntilSettle = true;
+  });
+}
 
 // ---- Main loop ----
 function update(dt) {
@@ -1201,8 +1417,10 @@ function update(dt) {
     if (Game.hazardTimer <= 0) {
       hideAllScreens();
       Game.state = 'AIMING';
+      resetUnsettledTimer();
     }
   }
+  updateRespawnOffer(dt);
   for (const pt of Game.trail) pt.age += dt;
   Game.trail = Game.trail.filter((pt) => pt.age < 0.6);
   updateParticles(dt);
@@ -1624,6 +1842,7 @@ function mpBeginHole(msg) {
   mpCanPutt = false;
   mpPlaying = true;
   mpFrozenTimerMs = 0;
+  resetUnsettledTimer();
   resetAchvHoleCounters();
   mpInRound = true;
   gameMenuEl.classList.remove('hidden');

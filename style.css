@@ -92,6 +92,54 @@ canvas#game {
   white-space: nowrap;
 }
 
+/* Escape hatch when the ball never settles (Orbit gravity loops, etc.) */
+#respawn-offer {
+  position: absolute;
+  left: 50%;
+  bottom: 22px;
+  transform: translateX(-50%);
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 14px 18px;
+  border-radius: 12px;
+  background: rgba(12, 18, 14, 0.88);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+  pointer-events: auto;
+  animation: bounceIn 0.3s ease;
+}
+#respawn-offer p {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  opacity: 0.9;
+}
+#respawn-offer button {
+  min-width: 160px;
+  padding: 8px 14px;
+  border-radius: 8px;
+  border: none;
+  font-size: 14px;
+  font-weight: 700;
+  cursor: pointer;
+}
+#btn-respawn {
+  background: #3d8f5a;
+  color: #fff;
+}
+#btn-respawn:hover { background: #48a86a; }
+#btn-respawn-dismiss,
+.btn-quiet {
+  background: transparent;
+  color: rgba(238, 247, 238, 0.75);
+  border: 1px solid rgba(255, 255, 255, 0.15) !important;
+  font-weight: 600 !important;
+}
+#btn-respawn-dismiss:hover { color: #fff; }
+
 .screen {
   position: absolute;
   inset: 0;

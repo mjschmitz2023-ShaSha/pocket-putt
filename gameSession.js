@@ -658,6 +658,24 @@ class GameSession {
         this.broadcast({ type: 'notice', text: `${player.name} ended the game` });
         this.broadcastLobbyState();
       }
+    } else if (msg.type === 'respawn') {
+      // Escape hatch when a ball never settles (e.g. Orbit gravity loops). No stroke penalty.
+      if (this.state !== 'PLAYING' || !player.ball || player.holedOut) return;
+      const hole = this.currentHoles()[this.currentHoleIndex];
+      const roster = [...this.players.values()];
+      const slot = Math.max(0, roster.indexOf(player));
+      const spot = Shared.teePositionFor(slot, roster.length, hole);
+      player.ball.x = spot.x;
+      player.ball.y = spot.y;
+      player.ball.vx = 0;
+      player.ball.vy = 0;
+      player.ball.z = 0;
+      player.ball.vz = 0;
+      player.ball.stuckStickyIndex = -1;
+      player.ball.wet = false;
+      player.ball.wetStroke = false;
+      player.ball.firedBoosts = new Set();
+      this.sendCorrectionNow([], { reason: 'resync', includeObstacles: true, hard: true });
     } else if (msg.type === 'putt') {
       if (this.state !== 'PLAYING' || !player.ball || player.holedOut) return;
       if (Math.hypot(player.ball.vx, player.ball.vy) >= Shared.STOP_THRESHOLD) return;

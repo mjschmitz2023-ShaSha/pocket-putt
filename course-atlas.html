@@ -177,11 +177,22 @@ function drawHole(ctx, hole, s) {
   // Orbit gravity bodies
   for (const b of hole.gravityBodies || []) {
     if (b.kind === 'blackHole') {
-      ctx.fillStyle = '#1a0a28';
-      ctx.beginPath(); ctx.arc(b.x*s, b.y*s, (b.drawRadius || b.radius)*s, 0, Math.PI*2); ctx.fill();
-      ctx.strokeStyle = 'rgba(180,120,255,0.8)';
-      ctx.lineWidth = 1.5*s;
-      ctx.beginPath(); ctx.arc(b.x*s, b.y*s, b.radius*s, 0, Math.PI*2); ctx.stroke();
+      const hr = b.radius * s;
+      const disk = (b.drawRadius != null ? b.drawRadius : Math.min(b.radius, 5)) * s;
+      const ringR = hr * 1.35;
+      const dim = ctx.createRadialGradient(b.x*s, b.y*s, disk * 0.5, b.x*s, b.y*s, ringR * 2.2);
+      dim.addColorStop(0, 'rgba(0,0,0,0.5)');
+      dim.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = dim;
+      ctx.beginPath(); ctx.arc(b.x*s, b.y*s, ringR * 2.2, 0, Math.PI*2); ctx.fill();
+      ctx.strokeStyle = 'rgba(255,236,200,0.7)';
+      ctx.lineWidth = 2*s;
+      ctx.beginPath(); ctx.arc(b.x*s, b.y*s, ringR, 0, Math.PI*2); ctx.stroke();
+      ctx.strokeStyle = 'rgba(160,200,255,0.35)';
+      ctx.lineWidth = 1.2*s;
+      ctx.beginPath(); ctx.arc(b.x*s, b.y*s, ringR * 1.12, 0, Math.PI*2); ctx.stroke();
+      ctx.fillStyle = '#000';
+      ctx.beginPath(); ctx.arc(b.x*s, b.y*s, Math.max(disk, hr * 0.85), 0, Math.PI*2); ctx.fill();
     } else {
       ctx.fillStyle = b.kind === 'moon' ? '#9aa3b5' : '#3a7eb8';
       ctx.beginPath(); ctx.arc(b.x*s, b.y*s, b.radius*s, 0, Math.PI*2); ctx.fill();
