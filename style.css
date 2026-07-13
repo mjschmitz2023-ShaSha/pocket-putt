@@ -244,6 +244,21 @@ button:active {
   gap: 14px;
 }
 
+.lobby-join-row {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+.lobby-join-row input {
+  max-width: 140px;
+  text-align: center;
+  letter-spacing: 0.12em;
+}
+#lobby-relay-actions button {
+  margin: 6px 4px;
+}
 .lobby-url {
   font-size: 13px;
   opacity: 0.85;

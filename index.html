@@ -33,12 +33,23 @@
     <div id="screen-lobby" class="screen hidden">
       <h1>⛳ Pocket Putt — Multiplayer</h1>
       <div id="lobby-join">
-        <p class="subtitle">Everyone on this Wi-Fi plays the same 19 holes together, heat by heat.</p>
+        <p id="lobby-subtitle" class="subtitle">Everyone on this Wi-Fi plays the same 19 holes together, heat by heat.</p>
         <input id="lobby-name-input" type="text" placeholder="Your name" maxlength="20" autocomplete="off">
-        <button id="btn-join">Join Lobby</button>
+        <!-- LAN host: single Join. Online relay (?online=1 or ?relay=…): Create / Join with code. -->
+        <div id="lobby-lan-actions">
+          <button id="btn-join">Join Lobby</button>
+        </div>
+        <div id="lobby-relay-actions" class="hidden">
+          <button id="btn-create-room">Create Room</button>
+          <div class="lobby-join-row">
+            <input id="lobby-room-input" type="text" placeholder="Room code" maxlength="8" autocomplete="off" style="text-transform:uppercase">
+            <button id="btn-join-room">Join Room</button>
+          </div>
+          <p id="lobby-relay-status" class="subtitle"></p>
+        </div>
       </div>
       <div id="lobby-joined" class="hidden">
-        <p class="lobby-url">Friends on this Wi-Fi, open: <strong id="lobby-join-url" title="Click to copy"></strong></p>
+        <p class="lobby-url"><span id="lobby-join-label">Friends open:</span> <strong id="lobby-join-url" title="Click to copy"></strong></p>
         <ul id="lobby-player-list"></ul>
         <button id="btn-start-round" class="hidden">Start Round ▶</button>
         <p id="lobby-waiting-text" class="hidden">Waiting for the host to start…</p>
@@ -88,7 +99,8 @@
     </div>
   </div>
 
-  <script src="shared.js"></script>
-  <script src="game.js"></script>
+  <!-- Cache-bust so LAN phones don't keep a stale multiplayer netcode bundle. -->
+  <script src="shared.js?v=relay1"></script>
+  <script src="game.js?v=relay1"></script>
 </body>
 </html>

@@ -516,6 +516,15 @@ function computeLaunchVelocity(pointerVec) {
   return { vx: dirX * speed, vy: dirY * speed, speed };
 }
 
+// Same clamp host and clients use before computeLaunchVelocity — keeps optimistic putts
+// bit-identical to puttApplied when the raw drag is accepted.
+function clampDragVector(v) {
+  const dragLen = Math.hypot(v.x, v.y);
+  if (dragLen < MIN_DRAG_DIST || !Number.isFinite(dragLen)) return null;
+  const clampedLen = Math.min(dragLen, MAX_DRAG_DIST);
+  return { x: (v.x / dragLen) * clampedLen, y: (v.y / dragLen) * clampedLen, len: clampedLen };
+}
+
 return {
   TICK_HZ, TICK_DT, TICK_MS, tickToElapsedMs, elapsedMsToTick,
   LOGICAL_W, LOGICAL_H, BALL_RADIUS, FRICTION_GRASS, FRICTION_SAND, STOP_THRESHOLD,
@@ -527,7 +536,7 @@ return {
   BOUNDARY_WALLS, HOLES,
   resolveWallCollision, getWindmillBlades,
   createBallState, stepBallPhysics, advanceHoleObstacles, setHoleObstaclesAtTick, resetHoleObstacles,
-  computeLaunchVelocity,
+  computeLaunchVelocity, clampDragVector,
   resolveBallBallCollision, teePositionFor,
 };
 

@@ -1,7 +1,7 @@
-# Pocket Putt — Render Blueprint
-# Same pattern as Chess101's render.yaml: Blueprint auto-creates services from this file.
-# Deploy: Render dashboard → New → Blueprint → connect this GitHub repo.
-# Step-by-step: deploy/DEPLOY.md
+# Pocket Putt multi-room relay — Chess101-style Blueprint
+# WebSocket + /health only (no static game frontend).
+# Deploy: New → Blueprint → this repo, branch relay (or main once merged).
+# Docs: deploy/DEPLOY.md
 services:
   - type: web
     name: pocket-putt-server
@@ -10,7 +10,8 @@ services:
     buildCommand: npm install
     startCommand: npm start
     healthCheckPath: /health
-    # PORT is injected by Render — do not set it in the dashboard.
-    # Optional: set PUBLIC_URL in the dashboard after adding a custom domain
-    # (e.g. https://play.yourdomain.com) so lobby join links use that host.
-    # See deploy/DEPLOY.md.
+    # PORT is injected by Render — do not set it.
+    # Optional dashboard env vars (same names as Chess101):
+    #   RELAY_MAX_ROOMS=200
+    #   RELAY_ROOM_TIMEOUT=900
+    #   RELAY_MAX_PLAYERS=8

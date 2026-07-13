@@ -10,7 +10,7 @@ const {
   BOUNDARY_WALLS, HOLES, pointInZone, zoneBounds, resolveWallCollision, getWindmillBlades,
   getPendulumSegment, getSlidingGateSegment,
   createBallState, stepBallPhysics, advanceHoleObstacles, setHoleObstaclesAtTick, resetHoleObstacles,
-  computeLaunchVelocity,
+  computeLaunchVelocity, clampDragVector,
 } = window.Shared;
 
 const BOOST_COLOR_A = '#8b2fd1';
@@ -951,21 +951,47 @@ function loop(ts) {
 // Host: putt validation, scoring, multi-ball clashes.
 // Client: local shared.js coast from puttApplied; soft-reconcile sparse snapshots.
 // Tick-locked to host samples so we don't race ahead and rubber-band on corrections.
+//
+// Two backends:
+//   LAN  — open http://host:8977 (node server.js). Same-origin /ws, type:join.
+//   Relay — ?online=1 or ?relay=wss://host/ws (node relay.js on Render). Room codes.
 const MULTIPLAYER = location.protocol !== 'file:';
+const MP_PARAMS = new URLSearchParams(location.search);
+const DEFAULT_RELAY_WS = 'wss://pocket-putt-server.onrender.com/ws';
+function resolveRelayWsUrl() {
+  const r = MP_PARAMS.get('relay');
+  if (r) {
+    if (r.startsWith('ws://') || r.startsWith('wss://')) {
+      return r.includes('/ws') ? r : r.replace(/\/$/, '') + '/ws';
+    }
+    const proto = (location.protocol === 'https:' || r.includes('onrender.com')) ? 'wss:' : 'ws:';
+    return `${proto}//${r.replace(/^\/\//, '').replace(/\/$/, '')}/ws`;
+  }
+  if (MP_PARAMS.get('online') === '1' || MP_PARAMS.get('mode') === 'online') return DEFAULT_RELAY_WS;
+  if (typeof window.POCKET_PUTT_RELAY === 'string' && window.POCKET_PUTT_RELAY) {
+    return window.POCKET_PUTT_RELAY;
+  }
+  return null;
+}
+const RELAY_WS = resolveRelayWsUrl();
+const RELAY_MODE = !!RELAY_WS;
+
 let mpSocket = null;
 let mpPlayerId = null;
 let mpIsHost = false;
 let mpCanPutt = false;
 let mpPlaying = false;
+let mpRoomCode = null;
 // Local sim tick (integer). Host clock sample drives how far we may advance.
 let mpSimTick = 0;
 let mpHostTick = 0;
 let mpHostTickAt = 0; // performance.now() when mpHostTick was observed
 const MP_MAX_CATCH_UP = 8;
-// Soft reconcile: keep visual continuous; hard snap only on big desync / events / resync.
+// Soft render offset only used if a hard event snap still leaves a visual gap (rare).
+// There are no mid-flight pose heartbeats anymore — coasts are pure local sim.
 const MP_SOFT_ERR_PX = 10;
 const MP_HARD_ERR_PX = 80;
-const MP_ERR_DECAY_TAU = 0.12; // seconds — exponential blend of render error
+const MP_ERR_DECAY_TAU = 0.12;
 
 function mpRenderLobby(msg) {
   // The server may promote a new host after the original host disconnects - re-derive
@@ -974,10 +1000,16 @@ function mpRenderLobby(msg) {
   const me = msg.players.find((p) => p.id === mpPlayerId);
   if (me) mpIsHost = me.isHost;
 
+  if (msg.roomCode) mpRoomCode = msg.roomCode;
   const joinUrlEl = document.getElementById('lobby-join-url');
-  joinUrlEl.textContent = msg.joinUrl;
+  const labelEl = document.getElementById('lobby-join-label');
+  const display = msg.roomCode || msg.joinUrl || '';
+  if (labelEl) {
+    labelEl.textContent = msg.roomCode ? 'Room code (share this):' : 'Friends open:';
+  }
+  joinUrlEl.textContent = display;
   joinUrlEl.onclick = () => {
-    navigator.clipboard.writeText(msg.joinUrl).then(() => {
+    navigator.clipboard.writeText(display).then(() => {
       const original = joinUrlEl.textContent;
       joinUrlEl.textContent = 'Copied!';
       setTimeout(() => { joinUrlEl.textContent = original; }, 1000);
@@ -999,24 +1031,73 @@ function mpRenderLobby(msg) {
   waitingText.classList.toggle('hidden', mpIsHost);
 }
 
+function mpSetRelayStatus(text) {
+  const el = document.getElementById('lobby-relay-status');
+  if (el) el.textContent = text || '';
+}
+
 function mpConnect() {
-  // wss on HTTPS (Render / custom domain); ws on local LAN / plain HTTP.
   const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  mpSocket = new WebSocket(`${wsProto}//${location.host}/ws`);
+  const url = RELAY_WS || `${wsProto}//${location.host}/ws`;
+  mpSetRelayStatus(RELAY_MODE ? `Connecting to relay…` : '');
+  mpSocket = new WebSocket(url);
   mpSocket.addEventListener('open', () => {
     const savedToken = localStorage.getItem('pocketPuttReconnectToken');
     const savedName = localStorage.getItem('pocketPuttName') || '';
+    const savedRoom = localStorage.getItem('pocketPuttRoomCode') || '';
     document.getElementById('lobby-name-input').value = savedName;
-    if (savedToken) {
+    if (savedRoom) {
+      const roomInput = document.getElementById('lobby-room-input');
+      if (roomInput) roomInput.value = savedRoom;
+    }
+    mpSetRelayStatus(RELAY_MODE ? 'Connected. Create a room or join with a code.' : '');
+    // Auto-reconnect only — don't auto-create rooms.
+    if (RELAY_MODE && savedRoom && savedToken) {
+      mpSetRelayStatus(`Reconnecting to ${savedRoom}…`);
+      mpSocket.send(JSON.stringify({
+        type: 'relay_reconnect',
+        room_code: savedRoom,
+        token: savedToken,
+        player_name: savedName,
+      }));
+    } else if (!RELAY_MODE && savedToken) {
       mpSocket.send(JSON.stringify({ type: 'join', name: savedName, reconnectToken: savedToken }));
     }
   });
+  mpSocket.addEventListener('close', () => {
+    mpSetRelayStatus(RELAY_MODE ? 'Disconnected from relay.' : '');
+  });
+  mpSocket.addEventListener('error', () => {
+    mpSetRelayStatus(RELAY_MODE ? 'Relay connection failed (cold start?). Retry in a moment.' : '');
+  });
   mpSocket.addEventListener('message', (e) => {
     const msg = JSON.parse(e.data);
+    if (msg.type === 'relay_error') {
+      const hints = {
+        room_not_found: 'Room not found (expired or wrong code).',
+        room_full: 'That room is full.',
+        server_full: 'Relay is full — try later.',
+        bad_token: 'Reconnect failed — create/join again.',
+        bad_handshake: 'Bad handshake — update the client.',
+      };
+      mpSetRelayStatus(hints[msg.code] || `Relay error: ${msg.code || 'unknown'}`);
+      return;
+    }
+    if (msg.type === 'relay_created' || msg.type === 'relay_reconnected') {
+      mpRoomCode = msg.room_code;
+      if (msg.room_code) localStorage.setItem('pocketPuttRoomCode', msg.room_code);
+      if (msg.token) localStorage.setItem('pocketPuttReconnectToken', msg.token);
+      mpSetRelayStatus(msg.room_code ? `In room ${msg.room_code}` : '');
+      return;
+    }
     if (msg.type === 'welcome') {
       mpPlayerId = msg.playerId;
       mpIsHost = msg.isHost;
       localStorage.setItem('pocketPuttReconnectToken', msg.reconnectToken);
+      if (msg.roomCode) {
+        mpRoomCode = msg.roomCode;
+        localStorage.setItem('pocketPuttRoomCode', msg.roomCode);
+      }
       document.getElementById('lobby-join').classList.add('hidden');
       document.getElementById('lobby-joined').classList.remove('hidden');
     } else if (msg.type === 'lobbyState') {
@@ -1035,6 +1116,39 @@ function mpConnect() {
       mpRenderFinalResults(msg);
     }
   });
+}
+
+function mpLobbyName() {
+  return document.getElementById('lobby-name-input').value.trim() || 'Player';
+}
+
+function mpSendCreateRoom() {
+  if (!mpSocket || mpSocket.readyState !== WebSocket.OPEN) {
+    mpSetRelayStatus('Not connected yet…');
+    return;
+  }
+  const name = mpLobbyName();
+  localStorage.setItem('pocketPuttName', name);
+  localStorage.removeItem('pocketPuttRoomCode');
+  localStorage.removeItem('pocketPuttReconnectToken');
+  mpSetRelayStatus('Creating room…');
+  mpSocket.send(JSON.stringify({ type: 'relay_create', player_name: name }));
+}
+
+function mpSendJoinRoom() {
+  if (!mpSocket || mpSocket.readyState !== WebSocket.OPEN) {
+    mpSetRelayStatus('Not connected yet…');
+    return;
+  }
+  const name = mpLobbyName();
+  const code = (document.getElementById('lobby-room-input').value || '').trim().toUpperCase();
+  if (!code) {
+    mpSetRelayStatus('Enter a room code.');
+    return;
+  }
+  localStorage.setItem('pocketPuttName', name);
+  mpSetRelayStatus(`Joining ${code}…`);
+  mpSocket.send(JSON.stringify({ type: 'relay_join', room_code: code, player_name: name }));
 }
 
 function mpBeginHole(msg) {
@@ -1132,19 +1246,19 @@ function mpApplyAuthorityPose(p, b, hard) {
   }
 }
 
-// Apply a putt on the local sim. `fromServer` carries host-confirmed pose/strokes when present.
+// Apply a putt on the local sim. `fromServer` is the host puttApplied payload (authoritative
+// pose/launch). Optimistic path uses the same clampDragVector + computeLaunchVelocity as Node.
 function mpApplyPuttLocal(playerId, dragVector, fromServer, playSound) {
   const p = Game.players.get(playerId);
   if (!p || p.holedOut) return;
-  const dragLen = Math.hypot(dragVector.x, dragVector.y);
-  if (dragLen < MIN_DRAG_DIST) return;
-  const clampedLen = Math.min(dragLen, MAX_DRAG_DIST);
-  const clamped = { x: (dragVector.x / dragLen) * clampedLen, y: (dragVector.y / dragLen) * clampedLen };
-  const launch = computeLaunchVelocity(clamped);
+  const clamped = clampDragVector(dragVector);
+  if (!clamped && !fromServer) return;
+  const launch = clamped ? computeLaunchVelocity(clamped) : null;
   p.firedBoosts = new Set();
   p.errX = 0;
   p.errY = 0;
   if (fromServer) {
+    // Exact host numbers — full precision, no 0.1 rounding — so coast matches Node.
     p.x = fromServer.x;
     p.y = fromServer.y;
     p.vx = fromServer.vx;
@@ -1168,7 +1282,7 @@ function mpApplyPuttLocal(playerId, dragVector, fromServer, playSound) {
 
 function mpOnPuttApplied(msg) {
   if (!mpPlaying) return;
-  // Lock local timeline to the host putt tick — pose comes from the message, not catch-up.
+  // Lock timeline to host putt tick; both sides then coast with no mid-flight pose stream.
   if (typeof msg.tick === 'number') {
     mpNoteHostTick(msg.tick);
     if (msg.tick >= mpSimTick) {
@@ -1177,9 +1291,25 @@ function mpOnPuttApplied(msg) {
     }
   }
   const isSelf = msg.playerId === mpPlayerId;
-  mpApplyPuttLocal(msg.playerId, msg.dragVector, {
-    x: msg.x, y: msg.y, vx: msg.vx, vy: msg.vy, strokes: msg.strokes,
-  }, !isSelf);
+  const p = Game.players.get(msg.playerId);
+  // Self already launched optimistically: only re-snap if host differs (should be tiny).
+  // Others apply for the first time here and coast purely until idle/event.
+  if (isSelf && p) {
+    const dist = Math.hypot(p.x - msg.x, p.y - msg.y);
+    const dv = Math.hypot(p.vx - msg.vx, p.vy - msg.vy);
+    if (dist > 1 || dv > 1) {
+      mpApplyPuttLocal(msg.playerId, msg.dragVector, {
+        x: msg.x, y: msg.y, vx: msg.vx, vy: msg.vy, strokes: msg.strokes,
+      }, false);
+    } else {
+      p.strokes = msg.strokes;
+      mpSyncSelfFromPlayer(p);
+    }
+  } else {
+    mpApplyPuttLocal(msg.playerId, msg.dragVector, {
+      x: msg.x, y: msg.y, vx: msg.vx, vy: msg.vy, strokes: msg.strokes,
+    }, true);
+  }
 }
 
 function mpStepOneTick() {
@@ -1407,10 +1537,27 @@ function mpHandleEvent(ev, hole) {
 
 document.getElementById('btn-join').addEventListener('click', () => {
   unlockAudio();
-  const name = document.getElementById('lobby-name-input').value.trim() || 'Player';
+  const name = mpLobbyName();
   localStorage.setItem('pocketPuttName', name);
+  if (!mpSocket || mpSocket.readyState !== WebSocket.OPEN) return;
   mpSocket.send(JSON.stringify({ type: 'join', name }));
 });
+const btnCreate = document.getElementById('btn-create-room');
+if (btnCreate) {
+  btnCreate.addEventListener('click', () => {
+    unlockAudio();
+    soundClick();
+    mpSendCreateRoom();
+  });
+}
+const btnJoinRoom = document.getElementById('btn-join-room');
+if (btnJoinRoom) {
+  btnJoinRoom.addEventListener('click', () => {
+    unlockAudio();
+    soundClick();
+    mpSendJoinRoom();
+  });
+}
 document.getElementById('btn-start-round').addEventListener('click', () => {
   unlockAudio();
   soundClick();
@@ -1430,6 +1577,21 @@ Game.ball.x = HOLES[0].tee.x;
 Game.ball.y = HOLES[0].tee.y;
 if (MULTIPLAYER) {
   showScreen('screen-lobby');
+  // Toggle LAN vs relay UI.
+  const lanActions = document.getElementById('lobby-lan-actions');
+  const relayActions = document.getElementById('lobby-relay-actions');
+  const subtitle = document.getElementById('lobby-subtitle');
+  if (RELAY_MODE) {
+    if (lanActions) lanActions.classList.add('hidden');
+    if (relayActions) relayActions.classList.remove('hidden');
+    if (subtitle) {
+      subtitle.textContent =
+        'Online multiplayer via relay. Create a room and share the code, or join a friend’s code.';
+    }
+  } else {
+    if (lanActions) lanActions.classList.remove('hidden');
+    if (relayActions) relayActions.classList.add('hidden');
+  }
   mpConnect();
 } else {
   showScreen('screen-start');
