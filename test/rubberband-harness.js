@@ -18,10 +18,10 @@
  *
  * Thresholds (exit 1 if any scenario fails):
  *   ideal:            maxVisErr < 2,  hardSnapsWhileMoving === 0
- *   delayed_putt:     maxVisErr < 15, hardSnapsWhileMoving <= 2
- *   jitter:           hardSnapsWhileMoving <= 5
- *   sticky_escape:    maxVisErr < 25, hardSnapsWhileMoving <= 4
- *   multi_clash:      hardSnapsWhileMoving <= 8  (clashes are hard by design)
+ *   delayed_putt:     puttResyncs === 0 (never re-fire launch Δv mid-coast)
+ *   jitter:           hardSnapsWhileMoving near 0 (soft in-flight is juice-only)
+ *   sticky_escape:    puttResyncs === 0
+ *   multi_clash:      hardSnapsWhileMoving low (clashes are hard by design)
  */
 'use strict';
 
@@ -531,7 +531,8 @@ const SCENARIOS = {
     holeIndex: 0,
     frames: 240,
     net: { delayMs: 80, jitterMs: 20, dropRate: 0, seed: 42 },
-    thresholds: { maxVisErr: 65, hardSnapsWhileMoving: 0, puttResyncs: 2 },
+    // puttApplied must never re-fire launch Δv after optimistic coast.
+    thresholds: { maxVisErr: 65, hardSnapsWhileMoving: 0, puttResyncs: 0 },
     script(ctx) {
       ctx.atFrame(15, () => ctx.putt(ctx.remotePlayer, { x: 100, y: 10 }));
       ctx.atFrame(160, () => ctx.putt(ctx.hostPlayer, { x: -60, y: 40 }));
@@ -559,7 +560,7 @@ const SCENARIOS = {
     holeIndex: 0,
     frames: 300,
     net: { delayMs: 50, jitterMs: 15, dropRate: 0, seed: 3 },
-    thresholds: { maxVisErr: 80, hardSnapsWhileMoving: 2, puttResyncs: 3 },
+    thresholds: { maxVisErr: 80, hardSnapsWhileMoving: 2, puttResyncs: 0 },
     script(ctx) {
       ctx.atFrame(10, () => ctx.putt(ctx.remotePlayer, { x: 60, y: 0 }));
       ctx.atFrame(130, () => ctx.putt(ctx.remotePlayer, { x: 120, y: 0 }));

@@ -80,6 +80,23 @@ class ClientModel {
     this.noteHostTick(startTick, 0);
     Shared.setHoleObstaclesAtTick(hole, startTick);
     this.playing = true;
+    for (const b of msg.balls || []) {
+      const p = this.upsert(b);
+      p.x = b.x;
+      p.y = b.y;
+      p.vx = b.vx || 0;
+      p.vy = b.vy || 0;
+      p.z = b.z || 0;
+      p.vz = b.vz || 0;
+      p.strokes = b.strokes || 0;
+      p.holedOut = !!b.holedOut;
+      p.errX = 0;
+      p.errY = 0;
+      p.rx = p.x;
+      p.ry = p.y;
+      if (typeof b.stuckStickyIndex === 'number') p.stuckStickyIndex = b.stuckStickyIndex;
+      p.firedBoosts = new Set();
+    }
   }
 
   upsert(b) {
@@ -116,43 +133,46 @@ class ClientModel {
     const visX = p.rx;
     const visY = p.ry;
     const dBefore = dist(p.x, p.y, b.x, b.y);
-    const moving = Math.hypot(b.vx || 0, b.vy || 0) >= STOP || Math.hypot(p.vx, p.vy) >= STOP;
-    const skipSimSnap = !hard && moving && dBefore < SOFT_ERR_PX * 2 && !b.holedOut;
+    const clientMoving = Math.hypot(p.vx, p.vy) >= STOP;
+    const hostMoving = Math.hypot(b.vx || 0, b.vy || 0) >= STOP;
+    const moving = clientMoving || hostMoving;
 
-    if (!skipSimSnap) {
-      p.strokes = b.strokes;
-      p.holedOut = !!b.holedOut;
-      p.x = b.x;
-      p.y = b.y;
-      p.vx = b.vx;
-      p.vy = b.vy;
-      p.z = b.z || 0;
-      p.vz = b.vz || 0;
-      if (typeof b.stuckStickyIndex === 'number') p.stuckStickyIndex = b.stuckStickyIndex;
-      if (Math.hypot(b.vx, b.vy) < STOP && p.z === 0) p.firedBoosts = new Set();
-    } else {
-      if (b.holedOut) p.holedOut = true;
+    // Soft + in-flight: never touch sim pose or velocity (instant Δv = rubber band).
+    if (!hard && moving && !b.holedOut) {
       if (typeof b.strokes === 'number' && b.strokes > p.strokes) p.strokes = b.strokes;
+      p.rx = p.x + p.errX;
+      p.ry = p.y + p.errY;
+      return dBefore;
     }
 
-    const d = skipSimSnap ? dBefore : dist(p.x, p.y, b.x, b.y);
+    p.strokes = b.strokes;
+    p.holedOut = !!b.holedOut;
+    p.x = b.x;
+    p.y = b.y;
+    p.vx = b.vx || 0;
+    p.vy = b.vy || 0;
+    p.z = b.z || 0;
+    p.vz = b.vz || 0;
+    if (typeof b.stuckStickyIndex === 'number') p.stuckStickyIndex = b.stuckStickyIndex;
+    if (Math.hypot(p.vx, p.vy) < STOP && p.z === 0) p.firedBoosts = new Set();
+
+    const visGap = dist(visX, visY, p.x, p.y);
     const forceHard =
-      b.holedOut ||
-      d >= HARD_ERR_PX ||
-      (hard && !moving) ||
-      (hard && d >= SOFT_ERR_PX * 3);
+      b.holedOut || hard || dBefore >= HARD_ERR_PX || visGap < SOFT_ERR_PX;
     if (forceHard) {
       p.errX = 0;
       p.errY = 0;
       p.rx = p.x;
       p.ry = p.y;
       this.metrics.hardSnaps++;
-      if (moving && d > 0.5) {
+      // Tiny settle snaps (host idle hard while client is 1px off) aren't rubber bands.
+      // Count only when the ball was clearly in flight with a visible pose jump.
+      if (moving && dBefore >= SOFT_ERR_PX) {
         this.metrics.hardSnapsWhileMoving++;
         this.metrics.rubberBands.push({
           tick: this.simTick,
           kind: 'hard_snap',
-          dist: d,
+          dist: dBefore,
           moving: true,
         });
       }
@@ -161,15 +181,8 @@ class ClientModel {
       p.errY = visY - p.y;
       const elen = Math.hypot(p.errX, p.errY);
       this.metrics.softApplies++;
-      if (elen < SOFT_ERR_PX) {
-        p.errX = 0;
-        p.errY = 0;
-        p.rx = p.x;
-        p.ry = p.y;
-      } else {
-        p.rx = p.x + p.errX;
-        p.ry = p.y + p.errY;
-      }
+      p.rx = p.x + p.errX;
+      p.ry = p.y + p.errY;
       if (elen > 2) {
         this.metrics.rubberBands.push({
           tick: this.simTick,
@@ -179,7 +192,7 @@ class ClientModel {
         });
       }
     }
-    return d;
+    return dBefore;
   }
 
   applyPuttLocal(playerId, dragVector, fromServer) {
@@ -227,7 +240,6 @@ class ClientModel {
         Shared.setHoleObstaclesAtTick(this.hole(), this.simTick);
       }
     }
-    // Ensure player exists for remote putts
     if (!this.players.has(msg.playerId)) {
       this.upsert({
         id: msg.playerId,
@@ -254,29 +266,12 @@ class ClientModel {
       z: msg.z,
       vz: msg.vz,
     };
+    // puttApplied is an impulse at putt-tick, not a live pose. Never re-fire Δv after coast.
     if (isSelf && p) {
-      const wasOptimistic = Math.hypot(p.vx, p.vy) >= STOP || p.strokes >= (msg.strokes || 0);
-      const d = dist(p.x, p.y, msg.x, msg.y);
-      const dv = Math.hypot(p.vx - msg.vx, p.vy - msg.vy);
-      const ticksAhead = typeof msg.tick === 'number' ? this.simTick - msg.tick : 0;
-      if (wasOptimistic && (d > 1 || dv > 1)) {
-        if (ticksAhead <= 2 || d >= HARD_ERR_PX) {
-          this.metrics.puttResyncs++;
-          this.metrics.rubberBands.push({
-            tick: this.simTick,
-            kind: 'putt_resync',
-            dist: d,
-            moving: true,
-          });
-          this.applyPuttLocal(msg.playerId, msg.dragVector, hostPose);
-          if (typeof msg.tick === 'number' && ticksAhead > 2) this.simTick = msg.tick;
-        } else {
-          // Late confirm — keep coasting.
-          p.strokes = msg.strokes;
-          if (typeof msg.stuckStickyIndex === 'number') p.stuckStickyIndex = msg.stuckStickyIndex;
-        }
-      } else if (wasOptimistic) {
-        p.strokes = msg.strokes;
+      const alreadyLaunched =
+        Math.hypot(p.vx, p.vy) >= STOP || p.strokes >= (msg.strokes || 0);
+      if (alreadyLaunched) {
+        p.strokes = Math.max(p.strokes, msg.strokes || 0);
         if (typeof msg.stuckStickyIndex === 'number') p.stuckStickyIndex = msg.stuckStickyIndex;
       } else {
         this.applyPuttLocal(msg.playerId, msg.dragVector, hostPose);
@@ -320,8 +315,13 @@ class ClientModel {
       const p = this.upsert(b);
       this.applyAuthorityPose(p, b, hard || !existed);
     }
-    for (const id of this.players.keys()) {
-      if (!seen.has(id)) this.players.delete(id);
+    // Only prune on hard full roster — soft/partial must not evaporate balls.
+    if (hard && (msg.balls || []).length > 0) {
+      for (const id of this.players.keys()) {
+        if (seen.has(id)) continue;
+        if (id === this.playerId) continue;
+        this.players.delete(id);
+      }
     }
 
     for (const ev of msg.events || []) {

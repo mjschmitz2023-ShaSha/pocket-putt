@@ -1227,7 +1227,9 @@ function buildCustomizeUI() {
 
 // ---- Multiplayer (lobby) ----
 // ---- Multiplayer ----
-// Coast netcode: puttApplied + local tick-locked sim + sparse soft/hard corrections.
+// Coast netcode: puttApplied impulse + local tick-locked sim + sparse hard corrections.
+// Soft packets never rewrite in-flight velocity/pose (instant Δv mid-coast = rubber band).
+// puttApplied for self is confirm-only after optimistic launch (pose is putt-tick history).
 // Multi-room relay protocol (create/join). Cosmetics + menu from main still apply.
 const MULTIPLAYER = location.protocol !== 'file:';
 const MP_PARAMS = new URLSearchParams(location.search);
@@ -1491,6 +1493,28 @@ function mpBeginHole(msg) {
   mpSimTick = startTick;
   mpNoteHostTick(startTick);
   setHoleObstaclesAtTick(hole, startTick);
+  // Seed balls from reliable roundState so a dropped resync snapshot can't leave an
+  // empty roster (ball "disappears" until the next idle correction).
+  for (const b of msg.balls || []) {
+    const p = mpUpsertPlayer(b);
+    p.x = b.x;
+    p.y = b.y;
+    p.vx = b.vx || 0;
+    p.vy = b.vy || 0;
+    p.z = b.z || 0;
+    p.vz = b.vz || 0;
+    p.strokes = b.strokes || 0;
+    p.holedOut = !!b.holedOut;
+    p.errX = 0;
+    p.errY = 0;
+    p.rx = p.x;
+    p.ry = p.y;
+    p.rz = p.z;
+    if (typeof b.stuckStickyIndex === 'number') p.stuckStickyIndex = b.stuckStickyIndex;
+    p.firedBoosts = new Set();
+  }
+  const me = Game.players.get(mpPlayerId);
+  if (me) mpSyncSelfFromPlayer(me);
   mpCanPutt = false;
   mpPlaying = true;
   mpFrozenTimerMs = 0;
@@ -1562,36 +1586,40 @@ function mpSyncSelfFromPlayer(p) {
 
 function mpApplyAuthorityPose(p, b, hard) {
   const visX = p.rx, visY = p.ry;
+  const clientMoving = Math.hypot(p.vx, p.vy) >= STOP_THRESHOLD;
+  const hostMoving = Math.hypot(b.vx || 0, b.vy || 0) >= STOP_THRESHOLD;
+  const moving = clientMoving || hostMoving;
   const distBefore = Math.hypot((p.x - b.x), (p.y - b.y));
-  const clientMoving =
-    Math.hypot(p.vx, p.vy) >= STOP_THRESHOLD || Math.hypot(b.vx || 0, b.vy || 0) >= STOP_THRESHOLD;
 
-  // Soft + small error while coasting: leave sim alone (coast is truth until a real hard
-  // event). Overwriting x/v on every bounce soft-event was the "rubber band at putt start".
-  const skipSimSnap = !hard && clientMoving && distBefore < MP_SOFT_ERR_PX * 2 && !b.holedOut;
-  if (!skipSimSnap) {
-    p.strokes = b.strokes;
-    p.holedOut = !!b.holedOut;
-    p.x = b.x;
-    p.y = b.y;
-    p.vx = b.vx;
-    p.vy = b.vy;
-    p.z = b.z || 0;
-    p.vz = b.vz || 0;
-    if (typeof b.stuckStickyIndex === 'number') p.stuckStickyIndex = b.stuckStickyIndex;
-    if (Math.hypot(b.vx, b.vy) < STOP_THRESHOLD && p.z === 0) p.firedBoosts = new Set();
-  } else {
-    // Still adopt discrete flags that don't yank pose.
-    if (b.holedOut) p.holedOut = true;
+  // Soft + in-flight: never touch sim pose or velocity.
+  // Instant Δv (or mid-coast x/y snap) rewrites the integration path under the ball —
+  // visual error decay cannot hide that kink. Soft packets are juice/meta only until
+  // a hard discrete event (clash/water/holed/idle/resync) or catastrophic error.
+  if (!hard && moving && !b.holedOut) {
     if (typeof b.strokes === 'number' && b.strokes > p.strokes) p.strokes = b.strokes;
+    p.rx = p.x + p.errX;
+    p.ry = p.y + p.errY;
+    p.rz = p.z || 0;
+    return;
   }
 
-  const dist = skipSimSnap ? distBefore : Math.hypot((p.x - b.x), (p.y - b.y));
+  // Hard authority, settled soft, or hole-out: adopt host sim state.
+  p.strokes = b.strokes;
+  p.holedOut = !!b.holedOut;
+  p.x = b.x;
+  p.y = b.y;
+  p.vx = b.vx || 0;
+  p.vy = b.vy || 0;
+  p.z = b.z || 0;
+  p.vz = b.vz || 0;
+  if (typeof b.stuckStickyIndex === 'number') p.stuckStickyIndex = b.stuckStickyIndex;
+  if (Math.hypot(p.vx, p.vy) < STOP_THRESHOLD && p.z === 0) p.firedBoosts = new Set();
+
+  const visGap = Math.hypot(visX - p.x, visY - p.y);
+  // Hard / hole-out / catastrophic / already aligned → clean snap.
+  // Soft settled with leftover offset → glide via err decay (no pop).
   const forceHard =
-    b.holedOut ||
-    dist >= MP_HARD_ERR_PX ||
-    (hard && !clientMoving) ||
-    (hard && dist >= MP_SOFT_ERR_PX * 3);
+    b.holedOut || hard || distBefore >= MP_HARD_ERR_PX || visGap < MP_SOFT_ERR_PX;
   if (forceHard) {
     p.errX = 0;
     p.errY = 0;
@@ -1599,19 +1627,10 @@ function mpApplyAuthorityPose(p, b, hard) {
     p.ry = p.y;
     p.rz = p.z;
   } else {
-    // Keep visual continuous; error decays toward sim each frame.
     p.errX = visX - p.x;
     p.errY = visY - p.y;
-    const elen = Math.hypot(p.errX, p.errY);
-    if (elen < MP_SOFT_ERR_PX) {
-      p.errX = 0;
-      p.errY = 0;
-      p.rx = p.x;
-      p.ry = p.y;
-    } else {
-      p.rx = p.x + p.errX;
-      p.ry = p.y + p.errY;
-    }
+    p.rx = p.x + p.errX;
+    p.ry = p.y + p.errY;
     p.rz = p.z;
   }
 }
@@ -1670,43 +1689,38 @@ function mpOnPuttApplied(msg) {
     }
   }
   const isSelf = msg.playerId === mpPlayerId;
-  const p = Game.players.get(msg.playerId);
+  let p = Game.players.get(msg.playerId);
+  const hostPose = {
+    x: msg.x, y: msg.y, vx: msg.vx, vy: msg.vy, strokes: msg.strokes,
+    stuckStickyIndex: msg.stuckStickyIndex, z: msg.z, vz: msg.vz,
+  };
+
+  // puttApplied carries pose *at the putt tick* (rest x/y + full launch v). That is an
+  // impulse sample, not a live pose. Re-applying it after any coast re-fires Δv and
+  // teleports back to the tee — the classic launch rubber band.
   if (isSelf && p) {
-    const dist = Math.hypot(p.x - msg.x, p.y - msg.y);
-    const dv = Math.hypot(p.vx - msg.vx, p.vy - msg.vy);
-    const wasOptimistic =
+    const alreadyLaunched =
       Math.hypot(p.vx, p.vy) >= STOP_THRESHOLD || p.strokes >= (msg.strokes || 0);
-    const ticksAhead = typeof msg.tick === 'number' ? mpSimTick - msg.tick : 0;
-    const hostPose = {
-      x: msg.x, y: msg.y, vx: msg.vx, vy: msg.vy, strokes: msg.strokes,
-      stuckStickyIndex: msg.stuckStickyIndex, z: msg.z, vz: msg.vz,
-    };
-    if (wasOptimistic && (dist > 1 || dv > 1)) {
-      // Late confirm after we already coasted: only hard-rebase if still near the putt
-      // tick or error is catastrophic. Otherwise keep coasting.
-      if (ticksAhead <= 2 || dist >= MP_HARD_ERR_PX) {
-        mpApplyPuttLocal(msg.playerId, msg.dragVector, hostPose, false);
-        if (typeof msg.tick === 'number' && ticksAhead > 2) {
-          mpSimTick = msg.tick;
-          setHoleObstaclesAtTick(currentHoles()[Game.currentHoleIndex], mpSimTick);
-        }
-      } else {
-        p.strokes = msg.strokes;
-        if (typeof msg.stuckStickyIndex === 'number') p.stuckStickyIndex = msg.stuckStickyIndex;
-        mpSyncSelfFromPlayer(p);
-      }
-    } else if (wasOptimistic) {
-      p.strokes = msg.strokes;
+    if (alreadyLaunched) {
+      // Confirm only. Optimistic coast is truth until a real hard correction.
+      p.strokes = Math.max(p.strokes, msg.strokes || 0);
       if (typeof msg.stuckStickyIndex === 'number') p.stuckStickyIndex = msg.stuckStickyIndex;
       mpSyncSelfFromPlayer(p);
     } else {
+      // Missed optimistic launch (or input arrived before local apply) — take impulse once.
       mpApplyPuttLocal(msg.playerId, msg.dragVector, hostPose, false);
     }
   } else {
-    mpApplyPuttLocal(msg.playerId, msg.dragVector, {
-      x: msg.x, y: msg.y, vx: msg.vx, vy: msg.vy, strokes: msg.strokes,
-      stuckStickyIndex: msg.stuckStickyIndex, z: msg.z, vz: msg.vz,
-    }, true);
+    // Remote (or self with no local player yet): apply the launch impulse once.
+    if (!p) {
+      p = mpUpsertPlayer({
+        id: msg.playerId, name: '?', hue: 0,
+        x: msg.x, y: msg.y, vx: msg.vx, vy: msg.vy,
+        strokes: msg.strokes || 0, holedOut: false,
+        stuckStickyIndex: msg.stuckStickyIndex,
+      });
+    }
+    mpApplyPuttLocal(msg.playerId, msg.dragVector, hostPose, !isSelf);
   }
 }
 
@@ -1847,10 +1861,18 @@ function mpApplyCorrection(msg) {
     seen.add(b.id);
     const existed = Game.players.has(b.id);
     const p = mpUpsertPlayer(b);
+    // First sighting is always hard seed (need a starting pose).
     mpApplyAuthorityPose(p, b, hard || !existed);
   }
-  for (const id of Game.players.keys()) {
-    if (!seen.has(id)) Game.players.delete(id);
+  // Never evaporate balls from soft/partial snapshots. Soft event packets can race;
+  // deleting missing ids made the local ball vanish mid-hole. Only prune on hard
+  // authority, and never delete self while a hole is active.
+  if (hard && (msg.balls || []).length > 0) {
+    for (const id of Game.players.keys()) {
+      if (seen.has(id)) continue;
+      if (id === mpPlayerId) continue;
+      Game.players.delete(id);
+    }
   }
 
   for (const ev of msg.events || []) mpHandleEvent(ev, hole);

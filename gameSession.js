@@ -87,6 +87,11 @@ class GameSession {
       par: hole.par,
       tick: this.simTick,
       tickHz: TICK_HZ,
+      // Reliable tee seed — clients must not depend solely on an unreliable resync
+      // snapshot to populate Game.players (dropped resync → empty roster / vanished ball).
+      balls: [...this.players.values()]
+        .filter((p) => p.connected && p.ball)
+        .map((p) => this.ballWire(p)),
     };
   }
 
@@ -173,8 +178,12 @@ class GameSession {
     this.wasIdle = false;
     this.state = 'PLAYING';
     this.touch();
+    // Reliable roundState now carries tee balls; also push a hard resync for obstacles.
     this.broadcastReliable(this.roundStatePayload());
-    this.sendCorrectionNow([], { reason: 'resync', includeObstacles: true, hard: true });
+    this.broadcastReliable(
+      this.buildCorrection([], { reason: 'resync', includeObstacles: true, hard: true })
+    );
+    this.pendingEvents = [];
   }
 
   startNewRound() {
