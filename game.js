@@ -883,13 +883,11 @@ function handlePointerDown(x, y) {
     if (!mpCanPutt) return;
   } else {
     const hole = currentHoles()[Game.currentHoleIndex];
-    if (Game.state !== 'AIMING' && !mayPuttBall(Game.ball, hole, Game.speedTracker)) return;
-    if (Game.state !== 'AIMING' && mayPuttBall(Game.ball, hole, Game.speedTracker)) {
-      Game.ball.vx = 0;
-      Game.ball.vy = 0;
-      Game.state = 'AIMING';
-    }
-    if (Game.state !== 'AIMING') return;
+    // Crawl / quasi-rest: allow aim while still BALL_MOVING at low speed.
+    if (!mayPuttBall(Game.ball, hole, Game.speedTracker)) return;
+    Game.ball.vx = 0;
+    Game.ball.vy = 0;
+    Game.state = 'AIMING';
   }
   Game.drag.active = true;
   Game.drag.pointerVec = { x: 0, y: 0 };
@@ -1029,23 +1027,25 @@ function update(dt) {
     noteSpeedSample(Game.speedTracker, Math.hypot(Game.ball.vx, Game.ball.vy), dt);
   }
   // Orbit: while AIMING, only wake physics when a field is actually yanking the ball
-  // (moon sweep, fall into well). Do NOT force BALL_MOVING every frame while at rest on a
-  // planet crust/sand — that caused an infinite soft-collision loop and blocked putting.
-  // Quasi-rest: hold AIMING so a stuck soft-bounce can be putted after ~5s near-zero avg v.
+  // and the player is not allowed to putt / not mid-drag. Never clear Game.drag.active
+  // on wake — that cancelled crawl/quasi-rest putts the frame after pointerdown.
   const hasGravity = (hole.gravityBodies || []).length > 0;
   if (Game.state === 'BALL_MOVING') {
     updateBallPhysics(dt);
   } else if (
     Game.state === 'AIMING' &&
+    !Game.drag.active &&
     hasGravity &&
     !ballMayRestForAim(Game.ball, hole) &&
-    !isQuasiRest(Game.speedTracker)
+    !mayPuttBall(Game.ball, hole, Game.speedTracker)
   ) {
     Game.state = 'BALL_MOVING';
     updateBallPhysics(dt);
-  } else if (Game.state === 'AIMING' && isQuasiRest(Game.speedTracker)) {
-    Game.ball.vx = 0;
-    Game.ball.vy = 0;
+  } else if (Game.state === 'AIMING' && (isQuasiRest(Game.speedTracker) || Game.drag.active)) {
+    if (!Game.drag.active) {
+      Game.ball.vx = 0;
+      Game.ball.vy = 0;
+    }
   }
   if (Game.state === 'HAZARD_RESET') {
     Game.hazardTimer -= dt;

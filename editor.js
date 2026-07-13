@@ -1232,18 +1232,19 @@
     });
   }
 
-  /** @returns {boolean} true if aim drag started (caller should capture pointer) */
+  /**
+   * Start aim drag. Allows putt while still crawling (mayPuttBall) — not only at rest.
+   * @returns {boolean} true if aim drag started (caller should capture pointer)
+   */
   function handleTestPointerDown(p) {
-    const canPutt = mayPuttBall(testBall, hole, testSpeedTracker);
-    if (testState !== 'AIMING') {
-      if (!canPutt) return false;
-      testBall.vx = 0;
-      testBall.vy = 0;
-      testState = 'AIMING';
-    }
-    // Generous grab while quasi-rest (ball may have been jittering).
-    const grabR = isQuasiRest(testSpeedTracker) ? 80 : 48;
-    if (Math.hypot(p.x - testBall.x, p.y - testBall.y) > grabR) return false;
+    if (!testBall) return false;
+    if (!mayPuttBall(testBall, hole, testSpeedTracker)) return false;
+    // Grab near the ball (same whether resting or crawling).
+    if (Math.hypot(p.x - testBall.x, p.y - testBall.y) > 48) return false;
+    // Interrupt BALL_MOVING crawl / quasi-rest: freeze and enter aim.
+    testBall.vx = 0;
+    testBall.vy = 0;
+    testState = 'AIMING';
     testDrag.active = true;
     testDrag.pointerVec = { x: 0, y: 0 };
     hideEditorRespawn();
@@ -1403,21 +1404,25 @@
 
     noteSpeedSample(testSpeedTracker, Math.hypot(testBall.vx || 0, testBall.vy || 0), clampedDt);
 
-    // Match game.js solo: wake when a field is yanking the ball (cannot rest/aim),
-    // unless quasi-rest allows a stuck putt escape.
+    // Gravity wake: only when NOT mid-aim-drag. Cancelling testDrag.active here was the
+    // bug that made low-speed / quasi-rest putts impossible — pointerdown entered AIMING,
+    // then the next frame re-woke BALL_MOVING and cleared the drag.
     if (
       testState === 'AIMING' &&
+      !testDrag.active &&
       hasGravity &&
       !ballMayRestForAim(testBall, hole) &&
-      !isQuasiRest(testSpeedTracker)
+      !mayPuttBall(testBall, hole, testSpeedTracker)
     ) {
       testState = 'BALL_MOVING';
-      testDrag.active = false;
       clearGhostTrajectory();
       powerEl.classList.add('hidden');
-    } else if (testState === 'AIMING' && isQuasiRest(testSpeedTracker)) {
-      testBall.vx = 0;
-      testBall.vy = 0;
+    } else if (testState === 'AIMING' && (isQuasiRest(testSpeedTracker) || testDrag.active)) {
+      // Hold still while aiming (crawl putt / quasi-rest / active drag).
+      if (!testDrag.active) {
+        testBall.vx = 0;
+        testBall.vy = 0;
+      }
     }
 
     // Freeze only while human is dragging aim (trajectory ghost), not all of AIMING.

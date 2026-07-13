@@ -265,6 +265,12 @@ function ballMayRestForAim(ball, hole) {
  */
 const QUASI_REST_WINDOW_S = 5;
 const QUASI_REST_AVG_SPEED = 30; // mean speed "close to 0" (STOP_THRESHOLD is 18)
+/**
+ * Instantaneous crawl putt: still moving, but slow enough to "catch" a stroke.
+ * Intentionally does NOT require ballMayRestForAim — floating slowly in a gravity
+ * field must still be puttable (editor Test used to re-wake and cancel the drag).
+ */
+const CRAWL_PUTT_SPEED = STOP_THRESHOLD * 2.5; // ~45
 
 function createSpeedAvgTracker() {
   return { sumSpDt: 0, sumDt: 0, q: [] };
@@ -304,13 +310,15 @@ function isQuasiRest(tr) {
 }
 
 /**
- * True if the player may start a putt: clean rest, or quasi-rest escape hatch.
- * Does not require airborne false alone for quasi-rest — still blocks z>0.
+ * True if the player may start a putt while grounded:
+ *  - crawl / near-stop (even if a gravity field would refuse clean rest)
+ *  - or quasi-rest (sustained near-zero average with bounce spikes)
+ * Does not require ballMayRestForAim — that gates auto-settle, not strikeability.
  */
 function mayPuttBall(ball, hole, speedTracker) {
   if (!ball || (ball.z || 0) > 0) return false;
   const speed = Math.hypot(ball.vx || 0, ball.vy || 0);
-  if (speed < STOP_THRESHOLD && ballMayRestForAim(ball, hole)) return true;
+  if (speed < CRAWL_PUTT_SPEED) return true;
   if (isQuasiRest(speedTracker)) return true;
   return false;
 }
@@ -2550,7 +2558,7 @@ return {
   zoneCenterXY, orientedRectCorners, circleTouchesOrientedRect, circleTouchesRamp,
   gravityBody, planet, blackHole, moon, escapeSpeed, bodyCanEscapeAtMaxLaunch,
   planetContactRadius, ballOnPlanetCrust, ballFloatingInGravity, ballMayRestForAim,
-  QUASI_REST_WINDOW_S, QUASI_REST_AVG_SPEED,
+  QUASI_REST_WINDOW_S, QUASI_REST_AVG_SPEED, CRAWL_PUTT_SPEED,
   createSpeedAvgTracker, resetSpeedAvgTracker, noteSpeedSample, speedAvg, isQuasiRest, mayPuttBall,
   ballInSand, effectiveGravityMag, gravityAccelAt, REST_GRAVITY_EPS, SAND_GRAVITY_HOLD,
   setMoonPoseAtTick, applyGravityAcceleration, resolvePlanetCollision, blackHoleCaptures,

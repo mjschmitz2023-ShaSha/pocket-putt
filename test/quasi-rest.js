@@ -61,7 +61,7 @@ test('soft bounce chatter (spikes) still averages low enough', () => {
   assert.ok(isQuasiRest(tr), 'avg still low (avg=' + speedAvg(tr) + ')');
 });
 
-test('mayPuttBall: floating in gravity, clean rest false, quasi-rest true', () => {
+test('mayPuttBall: floating crawl is puttable immediately (no quasi-rest wait)', () => {
   const h = blankHole({
     gravityBodies: [planet(400, 250, 40, 25000, { fieldRadius: 280 })],
   });
@@ -69,11 +69,22 @@ test('mayPuttBall: floating in gravity, clean rest false, quasi-rest true', () =
   ball.vx = 12;
   ball.vy = 0;
   assert.ok(!ballMayRestForAim(ball, h), 'floating should not clean-rest');
-  assert.ok(!mayPuttBall(ball, h, createSpeedAvgTracker()), 'empty tracker no putt');
+  // Crawl putt: low instant speed is enough (was blocked before by ballMayRestForAim).
+  assert.ok(mayPuttBall(ball, h, createSpeedAvgTracker()), 'crawl putt while floating');
+});
+
+test('mayPuttBall: floating + high speed needs quasi-rest', () => {
+  const h = blankHole({
+    gravityBodies: [planet(400, 250, 40, 25000, { fieldRadius: 280 })],
+  });
+  const ball = createBallState({ x: 400 + 40 + BALL_RADIUS + 20, y: 250 });
+  ball.vx = 90;
+  ball.vy = 0;
+  assert.ok(!mayPuttBall(ball, h, createSpeedAvgTracker()), 'fast float denied');
   const tr = createSpeedAvgTracker();
   for (let i = 0; i < 55; i++) noteSpeedSample(tr, 15, 0.1);
   assert.ok(isQuasiRest(tr));
-  assert.ok(mayPuttBall(ball, h, tr), 'quasi-rest allows putt while floating');
+  assert.ok(mayPuttBall(ball, h, tr), 'quasi-rest allows putt while floating fast');
 });
 
 test('mayPuttBall still works for normal rest without tracker fill', () => {
