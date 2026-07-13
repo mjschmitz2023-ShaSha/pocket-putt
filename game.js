@@ -10,8 +10,10 @@ const {
   BOUNDARY_WALLS, COURSES, pointInZone, zoneBounds, resolveWallCollision, getWindmillBlades,
   getPendulumSegment, getSlidingGateSegment,
   createBallState, stepBallPhysics, advanceHoleObstacles, setHoleObstaclesAtTick, resetHoleObstacles,
-  computeLaunchVelocity, clampDragVector, stickyLaunchFactor,
+  computeLaunchVelocity, clampDragVector, stickyLaunchFactor, stickyIndexAt, latchStickyAfterPutt,
 } = window.Shared;
+// Must match gameSession PHYSICS_SUBTICKS — same dt schedule keeps sticky latch deterministic.
+const MP_PHYSICS_SUBTICKS = 4;
 // Every hole lookup goes through the selected course.
 function currentHoles() { return COURSES[Game.courseIndex].holes; }
 
@@ -1004,9 +1006,11 @@ function handlePointerMove(x, y) {
   Game.drag.pointerVec = { x: vx, y: vy };
 }
 function launchBall(dragLen, pointerVec) {
-  Game.ball.firedBoosts.clear();
+  Game.ball.firedBoosts = new Set();
+  const hole = currentHoles()[Game.currentHoleIndex];
   const v = computeLaunchVelocity(pointerVec);
-  const factor = stickyLaunchFactor(Game.ball, currentHoles()[Game.currentHoleIndex]);
+  const factor = stickyLaunchFactor(Game.ball, hole);
+  latchStickyAfterPutt(Game.ball, hole);
   Game.ball.vx = v.vx * factor;
   Game.ball.vy = v.vy * factor;
   Game.ball.squash = 0.6;
@@ -1512,7 +1516,7 @@ function mpUpsertPlayer(b) {
       errX: 0, errY: 0,
       squash: 0, spin: 0, angleDir: 0,
       firedBoosts: new Set(),
-      stuckTo: null,
+      stuckStickyIndex: typeof b.stuckStickyIndex === 'number' ? b.stuckStickyIndex : -1,
       trailPts: null,
     };
     Game.players.set(b.id, p);
@@ -1551,6 +1555,7 @@ function mpApplyAuthorityPose(p, b, hard) {
   p.vy = b.vy;
   p.z = b.z || 0;
   p.vz = b.vz || 0;
+  if (typeof b.stuckStickyIndex === 'number') p.stuckStickyIndex = b.stuckStickyIndex;
   if (Math.hypot(b.vx, b.vy) < STOP_THRESHOLD && p.z === 0) p.firedBoosts = new Set();
 
   const forceHard = hard || dist >= MP_HARD_ERR_PX || b.holedOut;
@@ -1583,6 +1588,7 @@ function mpApplyPuttLocal(playerId, dragVector, fromServer, playSound) {
   p.firedBoosts = new Set();
   p.errX = 0;
   p.errY = 0;
+  const hole = currentHoles()[Game.currentHoleIndex];
   if (fromServer) {
     p.x = fromServer.x;
     p.y = fromServer.y;
@@ -1591,8 +1597,14 @@ function mpApplyPuttLocal(playerId, dragVector, fromServer, playSound) {
     p.z = fromServer.z || 0;
     p.vz = fromServer.vz || 0;
     p.strokes = fromServer.strokes;
+    if (typeof fromServer.stuckStickyIndex === 'number') {
+      p.stuckStickyIndex = fromServer.stuckStickyIndex;
+    } else {
+      latchStickyAfterPutt(p, hole);
+    }
   } else {
-    const factor = stickyLaunchFactor(p, currentHoles()[Game.currentHoleIndex]);
+    const factor = stickyLaunchFactor(p, hole);
+    latchStickyAfterPutt(p, hole);
     p.vx = launch.vx * factor;
     p.vy = launch.vy * factor;
     p.z = 0;
@@ -1645,51 +1657,58 @@ function mpStepOneTick() {
   setHoleObstaclesAtTick(hole, mpSimTick);
 
   const active = [...Game.players.values()].filter((p) => !p.holedOut);
-  for (const p of active) {
-    const events = stepBallPhysics(p, hole, TICK_DT);
-    const mine = p.id === mpPlayerId;
-    if (events.bounced && mine) {
-      maybePlayBounceSound();
-      achvOnBounce();
-    }
-    if (events.enteredSand && mine) soundSand();
-    for (const z of events.boosts) {
-      spawnBoostSpark(p.x, p.y, p.angleDir);
-      if (mine) soundBoost();
-    }
-    if (events.water) {
-      p.x = events.water.dropPoint.x;
-      p.y = events.water.dropPoint.y;
-      p.vx = 0;
-      p.vy = 0;
-      p.strokes += 1;
-      p.errX = 0;
-      p.errY = 0;
-      p.rx = p.x;
-      p.ry = p.y;
-      spawnSplash(events.water.dropPoint.x, events.water.dropPoint.y);
-      if (mine) {
-        soundWater();
-        mpShowBanner('SPLASH! +1');
-        achvOnSplash();
+  // Same PHYSICS_SUBTICKS schedule as the host so sticky stop/latch thresholds match.
+  for (let s = 0; s < MP_PHYSICS_SUBTICKS; s++) {
+    for (const p of active) {
+      if (p.holedOut) continue;
+      const events = stepBallPhysics(p, hole, TICK_DT / MP_PHYSICS_SUBTICKS);
+      const mine = p.id === mpPlayerId;
+      if (events.bounced && mine) {
+        maybePlayBounceSound();
+        achvOnBounce();
       }
-    }
-    if (events.holed) {
-      p.holedOut = true;
-      p.vx = 0;
-      p.vy = 0;
-      p.errX = 0;
-      p.errY = 0;
-      p.rx = p.x;
-      p.ry = p.y;
-      spawnConfetti(hole.cup.x, hole.cup.y);
-      const diff = p.strokes - hole.par;
-      soundHole(p.strokes === 1 || diff <= -2);
-      if (mine) {
-        if (p.strokes === 1) unlockAchievement('ace');
-        mpShowBanner(ratingText(diff, p.strokes));
-      } else {
-        mpShowBanner(`${p.name} is in! (${p.strokes})`);
+      if (events.enteredSand && mine) soundSand();
+      for (const z of events.boosts) {
+        spawnBoostSpark(p.x, p.y, p.angleDir);
+        if (mine) soundBoost();
+      }
+      if (events.water) {
+        p.x = events.water.dropPoint.x;
+        p.y = events.water.dropPoint.y;
+        p.vx = 0;
+        p.vy = 0;
+        p.z = 0;
+        p.vz = 0;
+        p.stuckStickyIndex = -1;
+        p.strokes += 1;
+        p.errX = 0;
+        p.errY = 0;
+        p.rx = p.x;
+        p.ry = p.y;
+        spawnSplash(events.water.dropPoint.x, events.water.dropPoint.y);
+        if (mine) {
+          soundWater();
+          mpShowBanner('SPLASH! +1');
+          achvOnSplash();
+        }
+      }
+      if (events.holed) {
+        p.holedOut = true;
+        p.vx = 0;
+        p.vy = 0;
+        p.errX = 0;
+        p.errY = 0;
+        p.rx = p.x;
+        p.ry = p.y;
+        spawnConfetti(hole.cup.x, hole.cup.y);
+        const diff = p.strokes - hole.par;
+        soundHole(p.strokes === 1 || diff <= -2);
+        if (mine) {
+          if (p.strokes === 1) unlockAchievement('ace');
+          mpShowBanner(ratingText(diff, p.strokes));
+        } else {
+          mpShowBanner(`${p.name} is in! (${p.strokes})`);
+        }
       }
     }
   }

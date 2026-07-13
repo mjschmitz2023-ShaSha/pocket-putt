@@ -19,7 +19,9 @@ const PLAYER_HUES = [0, 45, 190, 270, 130, 320, 25, 210];
 const MAX_CATCH_UP_TICKS = 8;
 const MAX_BUFFERED_BYTES = 32768;
 const CORRECTION_IDLE_EVERY = 120; // 2s idle keepalives while aiming
-const SUBTICKS = 4; // anti-tunnel for ball-ball (from main)
+// Must match client mpStepOneTick: N calls of stepBallPhysics(TICK_DT/N) per sim tick.
+// (Inner shared.js also uses 4 microsteps — host and client must use the same N.)
+const PHYSICS_SUBTICKS = 4;
 const MAX_PLAYERS = Number(process.env.RELAY_MAX_PLAYERS) || 8;
 
 function makeId() {
@@ -256,6 +258,8 @@ class GameSession {
       vy: p.ball.vy,
       strokes: p.strokes,
       holedOut: p.holedOut,
+      // Index latch (not object ref) so clients keep escape-grass vs trap-sticky correct.
+      stuckStickyIndex: typeof p.ball.stuckStickyIndex === 'number' ? p.ball.stuckStickyIndex : -1,
     };
     // Omit grounded z/vz to keep idle packets small.
     if (p.ball.z > 0) {
@@ -315,11 +319,12 @@ class GameSession {
     const sandedThisTick = new Set();
     const clashedPairs = new Set();
 
-    // Subticks: step physics + ball-ball interleaved so fast rams don't tunnel.
-    for (let s = 0; s < SUBTICKS; s++) {
+    // Physics subticks must match client mpStepOneTick (same dt schedule → sticky latch agrees).
+    // Ball-ball interleaved each subtick so fast rams still connect.
+    for (let s = 0; s < PHYSICS_SUBTICKS; s++) {
       for (const p of this.players.values()) {
         if (!p.connected || p.holedOut || !p.ball) continue;
-        const events = Shared.stepBallPhysics(p.ball, hole, TICK_DT / SUBTICKS);
+        const events = Shared.stepBallPhysics(p.ball, hole, TICK_DT / PHYSICS_SUBTICKS);
         if (events.bounced && !bouncedThisTick.has(p.id)) {
           bouncedThisTick.add(p.id);
           tickEvents.push({ id: p.id, kind: 'bounce' });
@@ -344,6 +349,9 @@ class GameSession {
           p.ball.y = events.water.dropPoint.y;
           p.ball.vx = 0;
           p.ball.vy = 0;
+          p.ball.z = 0;
+          p.ball.vz = 0;
+          p.ball.stuckStickyIndex = -1;
         }
         if (events.holed) {
           this.finishPlayerHole(p, false);
@@ -576,8 +584,10 @@ class GameSession {
       const launch = Shared.computeLaunchVelocity(clamped);
       const hole = this.currentHoles()[this.currentHoleIndex];
       const factor = Shared.stickyLaunchFactor(player.ball, hole);
-      player.ball.firedBoosts.clear();
-      player.ball.stuckTo = null;
+      player.ball.firedBoosts = new Set();
+      // Latch to current goo patch (if any) so escape rolls on grass until exit —
+      // do NOT clear the latch or the next microstep re-applies sticky drag and forks.
+      Shared.latchStickyAfterPutt(player.ball, hole);
       player.ball.vx = launch.vx * factor;
       player.ball.vy = launch.vy * factor;
       player.ball.z = 0;
@@ -596,6 +606,7 @@ class GameSession {
         vy: player.ball.vy,
         z: player.ball.z,
         vz: player.ball.vz,
+        stuckStickyIndex: player.ball.stuckStickyIndex,
       });
     }
   }

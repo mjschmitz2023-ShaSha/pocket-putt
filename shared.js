@@ -53,9 +53,12 @@ const RAMP_VZ_MAX = 520;
 const RAMP_UPHILL_ACCEL = 900;
 const FRICTION_AIR = 0.1;
 // Sticky goo: drags a ball to a dead stop on entry; the escape putt leaves at reduced power.
-const FRICTION_STICKY = 22;
-const STICKY_STOP_SPEED = 50;
-const STICKY_LAUNCH_FACTOR = 0.45;
+// Keep friction high enough to stop, but not so high that a 1-substep host/client skew
+// (or soft pose correction) turns into a multi-metre fork. Escape uses a latch (see
+// stuckStickyIndex) so the ball can roll out at grass friction after a putt.
+const FRICTION_STICKY = 14;
+const STICKY_STOP_SPEED = 40;
+const STICKY_LAUNCH_FACTOR = 0.55;
 const BOUND = { left: 20, top: 20, right: 780, bottom: 480 };
 
 // ---- Small geometry / data helpers ----
@@ -811,18 +814,50 @@ function getWindmillBlades(wm) {
 }
 
 // ---- Per-ball state and stepping (used by both solo game.js and the multiplayer server) ----
+// stuckStickyIndex: -1 = free / re-armed. >=0 = latched to hole.sticky[i] (escape uses grass
+// friction while still inside that patch). MUST be an index, never a zone object reference —
+// host and client each have their own hole.sticky arrays, so object identity never matches.
 function createBallState(tee) {
-  return { x: tee.x, y: tee.y, vx: 0, vy: 0, z: 0, vz: 0, squash: 0, spin: 0, angleDir: 0, firedBoosts: new Set(), stuckTo: null };
+  return {
+    x: tee.x, y: tee.y, vx: 0, vy: 0, z: 0, vz: 0,
+    squash: 0, spin: 0, angleDir: 0,
+    firedBoosts: new Set(), // boost zone indices (numbers), not object refs
+    stuckStickyIndex: -1,
+  };
+}
+
+function stickyIndexAt(ball, hole) {
+  const list = hole.sticky || [];
+  for (let i = 0; i < list.length; i++) {
+    if (circleTouchesZone(ball.x, ball.y, BALL_RADIUS, list[i])) return i;
+  }
+  return -1;
+}
+
+// After a putt while sitting in goo: latch to that patch so the escape rolls on grass
+// friction until the ball leaves. Re-arms (index = -1) only once fully clear of goo.
+function latchStickyAfterPutt(ball, hole) {
+  ball.stuckStickyIndex = stickyIndexAt(ball, hole);
 }
 
 // Advances one ball by dt against a hole's current obstacle positions. Mutates `ball` in
 // place and returns what happened this step so the caller (solo game.js or the server) can
 // react with sound/particles/scoring - this function itself never touches audio/DOM/score.
+//
+// CRITICAL for multiplayer: host and client must call this with the SAME dt schedule per
+// sim tick. Sticky latch thresholds are speed-based and fork hard if one side microsteps more.
 function stepBallPhysics(ball, hole, dt) {
   let walls = BOUNDARY_WALLS.concat(hole.walls);
   for (const wm of hole.windmills) walls = walls.concat(getWindmillBlades(wm));
   if (hole.pendulums.length) walls = walls.concat(hole.pendulums.map(getPendulumSegment));
   if (hole.gates.length) walls = walls.concat(hole.gates.map(getSlidingGateSegment));
+
+  // Normalize legacy balls that still have stuckTo object refs.
+  if (typeof ball.stuckStickyIndex !== 'number') {
+    ball.stuckStickyIndex = -1;
+    delete ball.stuckTo;
+  }
+  if (!(ball.firedBoosts instanceof Set)) ball.firedBoosts = new Set();
 
   const substeps = 4;
   const subDt = dt / substeps;
@@ -830,25 +865,30 @@ function stepBallPhysics(ball, hole, dt) {
   const events = { holed: false, water: null, boosts: [], bounced: false, enteredSand: false, launched: false, landed: false, stuck: false };
 
   for (let s = 0; s < substeps; s++) {
-    const airborne = ball.z > 0;
+    const airborne = (ball.z || 0) > 0;
     let friction = FRICTION_GRASS;
     let inSand = false;
-    let trapZone = null; // sticky zone actively dragging the ball toward a dead stop
+    let trappingIndex = -1; // sticky index actively dragging toward a stop this substep
     if (airborne) {
       friction = FRICTION_AIR;
     } else {
-      let stickyZone = null;
-      for (const z of hole.sticky) { if (circleTouchesZone(ball.x, ball.y, BALL_RADIUS, z)) { stickyZone = z; break; } }
-      if (!stickyZone) {
-        // Off the goo entirely: re-arm so the next patch entry (even this same one) traps again.
-        ball.stuckTo = null;
-        for (const z of hole.sand) { if (circleTouchesZone(ball.x, ball.y, BALL_RADIUS, z)) { friction = FRICTION_SAND; inSand = true; break; } }
-      } else if (ball.stuckTo !== stickyZone) {
+      const stickyIdx = stickyIndexAt(ball, hole);
+      if (stickyIdx < 0) {
+        // Off the goo entirely: re-arm so the next patch entry traps again.
+        ball.stuckStickyIndex = -1;
+        for (const z of hole.sand) {
+          if (circleTouchesZone(ball.x, ball.y, BALL_RADIUS, z)) {
+            friction = FRICTION_SAND;
+            inSand = true;
+            break;
+          }
+        }
+      } else if (ball.stuckStickyIndex !== stickyIdx) {
+        // Entering goo (or a different patch) without a latch — sticky drag.
         friction = FRICTION_STICKY;
-        trapZone = stickyZone;
+        trappingIndex = stickyIdx;
       }
-      // stuckTo === stickyZone: the escape putt rolls at grass friction until it exits the
-      // patch — without this latch, no putt could ever cross a wide patch.
+      // stuckStickyIndex === stickyIdx: escape latch — grass friction until exit.
     }
     if (inSand && !inSandLastStep) events.enteredSand = true;
     inSandLastStep = inSand;
@@ -873,10 +913,11 @@ function stepBallPhysics(ball, hole, dt) {
       ball.vx *= extra;
       ball.vy *= extra;
     }
-    if (trapZone && Math.hypot(ball.vx, ball.vy) < STICKY_STOP_SPEED) {
+    if (trappingIndex >= 0 && Math.hypot(ball.vx, ball.vy) < STICKY_STOP_SPEED) {
+      // Exact zero — no float crawl that would diverge host/client under sticky drag.
       ball.vx = 0;
       ball.vy = 0;
-      ball.stuckTo = trapZone;
+      ball.stuckStickyIndex = trappingIndex;
       events.stuck = true;
     }
     ball.x += ball.vx * subDt;
@@ -926,13 +967,16 @@ function stepBallPhysics(ball, hole, dt) {
     if (ball.z > 0) continue;
 
     let inBoost = null;
-    for (const z of hole.boost) { if (circleTouchesZone(ball.x, ball.y, BALL_RADIUS, z)) { inBoost = z; break; } }
-    // Each pad fires at most once per stroke (re-armed on the next putt) so a bumper that
-    // knocks the ball back across a pad can never re-trigger it into an endless loop.
-    if (inBoost && !ball.firedBoosts.has(inBoost)) {
-      // Add to the ball's existing velocity rather than overwriting it, so the shot you set
-      // up still matters - the pad kicks the ball harder along its trajectory instead of
-      // always snapping it to one fixed direction.
+    let inBoostIndex = -1;
+    for (let bi = 0; bi < hole.boost.length; bi++) {
+      if (circleTouchesZone(ball.x, ball.y, BALL_RADIUS, hole.boost[bi])) {
+        inBoost = hole.boost[bi];
+        inBoostIndex = bi;
+        break;
+      }
+    }
+    // Each pad fires at most once per stroke (index-keyed so host/client agree).
+    if (inBoost && !ball.firedBoosts.has(inBoostIndex)) {
       ball.vx += Math.cos(inBoost.angle) * inBoost.power;
       ball.vy += Math.sin(inBoost.angle) * inBoost.power;
       const boostedSpeed = Math.hypot(ball.vx, ball.vy);
@@ -940,7 +984,7 @@ function stepBallPhysics(ball, hole, dt) {
         ball.vx *= BOOST_MAX_SPEED / boostedSpeed;
         ball.vy *= BOOST_MAX_SPEED / boostedSpeed;
       }
-      ball.firedBoosts.add(inBoost);
+      ball.firedBoosts.add(inBoostIndex);
       ball.squash = 0.7;
       ball.angleDir = Math.atan2(ball.vy, ball.vx);
       events.boosts.push(inBoost);
@@ -1028,10 +1072,7 @@ function teePositionFor(index, count, hole) {
 // predicted escape shots match. Deliberately keyed off position, not `stuckTo`, so even a
 // ball that rolled into goo and stopped short of "stuck" putts out weakened.
 function stickyLaunchFactor(ball, hole) {
-  for (const z of hole.sticky) {
-    if (circleTouchesZone(ball.x, ball.y, BALL_RADIUS, z)) return STICKY_LAUNCH_FACTOR;
-  }
-  return 1;
+  return stickyIndexAt(ball, hole) >= 0 ? STICKY_LAUNCH_FACTOR : 1;
 }
 
 // Given a raw drag vector (pull-back from the ball), returns the launch velocity. Shared so
@@ -1066,7 +1107,7 @@ return {
   BOUNDARY_WALLS, HOLES, COURSES,
   resolveWallCollision, getWindmillBlades,
   createBallState, stepBallPhysics, advanceHoleObstacles, setHoleObstaclesAtTick, resetHoleObstacles,
-  computeLaunchVelocity, clampDragVector, stickyLaunchFactor,
+  computeLaunchVelocity, clampDragVector, stickyLaunchFactor, stickyIndexAt, latchStickyAfterPutt,
   resolveBallBallCollision, teePositionFor,
 };
 
