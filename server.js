@@ -1,7 +1,6 @@
-// Pocket Putt — LAN multiplayer host.
-// Serves the game's static files and runs a single authoritative session over WebSocket.
-// For internet multi-room (no frontend), use: node relay.js
-// Run with: npm install && node server.js
+// Pocket Putt — optional single-process LAN entry (legacy).
+// Prefer `npm start` / `relay.js` for multi-room + static UI (local and Render).
+// This file remains a thin single-room host for debugging.
 'use strict';
 
 const http = require('http');
@@ -13,8 +12,6 @@ const { GameSession, TICK_MS } = require('./gameSession.js');
 
 const PORT = process.env.PORT || 8977;
 const ROOT = __dirname;
-
-// ---- Static file serving ----
 const MIME = {
   '.html': 'text/html',
   '.css': 'text/css',
@@ -40,8 +37,7 @@ function serveStatic(req, res) {
     res.end('Not found');
     return;
   }
-  const filePath = path.join(ROOT, name);
-  fs.readFile(filePath, (err, data) => {
+  fs.readFile(path.join(ROOT, name), (err, data) => {
     if (err) {
       res.writeHead(500);
       res.end('Server error');
@@ -53,8 +49,7 @@ function serveStatic(req, res) {
 }
 
 function handleRequest(req, res) {
-  const urlPath = (req.url || '/').split('?')[0];
-  if (urlPath === '/health') {
+  if ((req.url || '/').split('?')[0] === '/health') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.end('OK\n');
     return;
@@ -74,22 +69,15 @@ function getLanIp() {
   return '127.0.0.1';
 }
 
-const publicBase = (process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '').replace(
-  /\/$/,
-  ''
-);
 const hostname = os.hostname();
 const lanIp = getLanIp();
-const joinUrl = publicBase || `http://${hostname}:${PORT}`;
-const joinUrlFallback = publicBase || `http://${lanIp}:${PORT}`;
-
-// Single LAN lobby (not multi-room — use relay.js for that).
-const session = new GameSession({ joinUrl, joinUrlFallback });
+const joinUrl = `http://${hostname}:${PORT}`;
+const joinUrlFallback = `http://${lanIp}:${PORT}`;
+const session = new GameSession({ joinUrl, joinUrlFallback, code: 'LAN' });
 
 setInterval(() => session.tickDriver(), TICK_MS);
 
 const wss = new WebSocket.Server({ server: httpServer, path: '/ws' });
-
 wss.on('connection', (ws, req) => {
   let player = null;
   try {
@@ -107,26 +95,14 @@ wss.on('connection', (ws, req) => {
     } catch {
       return;
     }
-
-    if (msg.type === 'join') {
-      const result = session.addPlayer(ws, {
-        name: msg.name,
-        reconnectToken: msg.reconnectToken,
-        isLocal,
-      });
-      player = result.player;
-      return;
-    }
-
-    // Optional: ignore Chess101-style handshake on LAN (or treat create as join).
-    if (msg.type === 'relay_create' || msg.type === 'relay_join' || msg.type === 'relay_reconnect') {
+    if (msg.type === 'join' || msg.type === 'relay_create' || msg.type === 'relay_join' || msg.type === 'relay_reconnect') {
       const result = session.addPlayer(ws, {
         name: msg.player_name || msg.name,
         reconnectToken: msg.reconnect_token || msg.reconnectToken || msg.token,
         isLocal,
       });
       player = result.player;
-      if (player) {
+      if (player && msg.type !== 'join') {
         ws.send(
           JSON.stringify({
             type: msg.type === 'relay_reconnect' ? 'relay_reconnected' : 'relay_created',
@@ -137,22 +113,18 @@ wss.on('connection', (ws, req) => {
       }
       return;
     }
-
     if (player) session.handleMessage(player, msg);
   });
-
   ws.on('close', () => {
-    if (!player) return;
-    session.onDisconnect(player);
+    if (player) session.onDisconnect(player);
   });
 });
 
 httpServer.listen(PORT, '0.0.0.0', () => {
   console.log('');
-  console.log('  Pocket Putt LAN host running.');
-  console.log('  Ask friends on the same Wi-Fi to open this in Safari:');
+  console.log('  Pocket Putt single-room LAN host (legacy).');
   console.log(`    ${joinUrl}`);
-  console.log(`    (fallback if that .local address doesn't resolve: ${joinUrlFallback})`);
-  console.log('  For multi-room internet relay: npm run relay');
+  console.log(`    ${joinUrlFallback}`);
+  console.log('  Prefer: npm start  (multi-room relay + same UI)');
   console.log('');
 });

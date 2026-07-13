@@ -6,6 +6,10 @@
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
+  <div id="game-menu" class="hidden">
+    <button id="btn-menu-restart" class="btn-small">↺ Restart Game</button>
+    <button id="btn-menu-end" class="btn-small btn-danger">✕ End Game</button>
+  </div>
   <div id="stage">
     <canvas id="game" width="800" height="500"></canvas>
 
@@ -33,13 +37,9 @@
     <div id="screen-lobby" class="screen hidden">
       <h1>⛳ Pocket Putt — Multiplayer</h1>
       <div id="lobby-join">
-        <p id="lobby-subtitle" class="subtitle">Everyone on this Wi-Fi plays the same 19 holes together, heat by heat.</p>
+        <p id="lobby-subtitle" class="subtitle">Create a room and share the link or code with friends. Same 19 holes, heat by heat.</p>
         <input id="lobby-name-input" type="text" placeholder="Your name" maxlength="20" autocomplete="off">
-        <!-- LAN host: single Join. Online relay (?online=1 or ?relay=…): Create / Join with code. -->
-        <div id="lobby-lan-actions">
-          <button id="btn-join">Join Lobby</button>
-        </div>
-        <div id="lobby-relay-actions" class="hidden">
+        <div id="lobby-relay-actions">
           <button id="btn-create-room">Create Room</button>
           <div class="lobby-join-row">
             <input id="lobby-room-input" type="text" placeholder="Room code" maxlength="8" autocomplete="off" style="text-transform:uppercase">
@@ -49,8 +49,16 @@
         </div>
       </div>
       <div id="lobby-joined" class="hidden">
-        <p class="lobby-url"><span id="lobby-join-label">Friends open:</span> <strong id="lobby-join-url" title="Click to copy"></strong></p>
+        <p class="lobby-url"><span id="lobby-join-label">Share with friends:</span> <strong id="lobby-join-url" title="Click to copy"></strong></p>
         <ul id="lobby-player-list"></ul>
+        <div id="lobby-customize">
+          <div class="customize-row">
+            <input id="lobby-rename-input" type="text" maxlength="20" autocomplete="off" placeholder="New name">
+            <button id="btn-rename" class="btn-small">Rename</button>
+          </div>
+          <div id="color-swatches" class="swatch-row"></div>
+          <div id="trail-picker" class="swatch-row hidden"></div>
+        </div>
         <button id="btn-start-round" class="hidden">Start Round ▶</button>
         <p id="lobby-waiting-text" class="hidden">Waiting for the host to start…</p>
       </div>
@@ -99,8 +107,7 @@
     </div>
   </div>
 
-  <!-- Cache-bust so LAN phones don't keep a stale multiplayer netcode bundle. -->
-  <script src="shared.js?v=relay2"></script>
-  <script src="game.js?v=relay2"></script>
+  <script src="shared.js?v=main-relay1"></script>
+  <script src="game.js?v=main-relay1"></script>
 </body>
 </html>

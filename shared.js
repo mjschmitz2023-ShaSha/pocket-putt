@@ -57,10 +57,13 @@ function pendulum(cx, cy, length, angleCenter, amplitude, period, phaseOffset) {
 }
 function getPendulumSegment(p) {
   const angle = p.angleCenter + p.amplitude * Math.sin((2 * Math.PI * p.phase) / p.period);
+  // Angular velocity right now (d/dt of the swing), so collisions know the bar's motion.
+  const omega = p.amplitude * Math.cos((2 * Math.PI * p.phase) / p.period) * (2 * Math.PI / p.period);
   return {
     x1: p.cx, y1: p.cy,
     x2: p.cx + Math.cos(angle) * p.length, y2: p.cy + Math.sin(angle) * p.length,
     restitution: PENDULUM_RESTITUTION,
+    pivot: { x: p.cx, y: p.cy }, omega,
   };
 }
 function slidingGate(x1, y1, x2, y2, axis, amplitude, period, phaseOffset) {
@@ -68,9 +71,13 @@ function slidingGate(x1, y1, x2, y2, axis, amplitude, period, phaseOffset) {
 }
 function getSlidingGateSegment(g) {
   const offset = g.amplitude * Math.sin((2 * Math.PI * g.phase) / g.period);
+  const speed = g.amplitude * Math.cos((2 * Math.PI * g.phase) / g.period) * (2 * Math.PI / g.period);
   const dx = g.axis === 'x' ? offset : 0;
   const dy = g.axis === 'y' ? offset : 0;
-  return { x1: g.x1 + dx, y1: g.y1 + dy, x2: g.x2 + dx, y2: g.y2 + dy, restitution: GATE_RESTITUTION };
+  return {
+    x1: g.x1 + dx, y1: g.y1 + dy, x2: g.x2 + dx, y2: g.y2 + dy, restitution: GATE_RESTITUTION,
+    svx: g.axis === 'x' ? speed : 0, svy: g.axis === 'y' ? speed : 0,
+  };
 }
 function ringBumpers(cx, cy, r, n, gapIndex) {
   const walls = [];
@@ -84,6 +91,14 @@ function ringBumpers(cx, cy, r, n, gapIndex) {
 function pointInZone(x, y, z) {
   if (z.shape === 'circle') return Math.hypot(x - z.cx, y - z.cy) < z.r;
   return x >= z.x1 && x <= z.x2 && y >= z.y1 && y <= z.y2;
+}
+// Circle-vs-zone overlap: true when any part of the ball's perimeter touches the zone,
+// not just its center — closest-point projection onto the rect, radius-expanded circles.
+function circleTouchesZone(x, y, r, z) {
+  if (z.shape === 'circle') return Math.hypot(x - z.cx, y - z.cy) < z.r + r;
+  const nx = Math.max(z.x1, Math.min(x, z.x2));
+  const ny = Math.max(z.y1, Math.min(y, z.y2));
+  return Math.hypot(x - nx, y - ny) < r;
 }
 function zoneBounds(z) {
   return z.shape === 'circle'
@@ -337,13 +352,26 @@ function resolveWallCollision(ball, w) {
   if (dist < BALL_RADIUS && dist > 0.0001) {
     const nx = distX / dist, ny = distY / dist;
     const overlap = BALL_RADIUS - dist;
-    ball.x += nx * overlap;
-    ball.y += ny * overlap;
-    const dot = ball.vx * nx + ball.vy * ny;
+    ball.x += nx * (overlap + 0.1);
+    ball.y += ny * (overlap + 0.1);
+    // Moving obstacles (windmill blades, pendulums, gates) carry surface velocity at the
+    // contact point. Reflecting the ball's velocity RELATIVE to the surface (then adding
+    // the surface velocity back) means a sweeping blade smacks the ball away with its own
+    // momentum instead of re-penetrating every substep and dragging the ball around.
+    let wvx = 0, wvy = 0;
+    if (w.pivot) {
+      wvx = -w.omega * (cy - w.pivot.y);
+      wvy = w.omega * (cx - w.pivot.x);
+    } else if (w.svx || w.svy) {
+      wvx = w.svx || 0;
+      wvy = w.svy || 0;
+    }
+    const rvx = ball.vx - wvx, rvy = ball.vy - wvy;
+    const dot = rvx * nx + rvy * ny;
     if (dot < 0) {
       const restitution = w.restitution || WALL_RESTITUTION;
-      ball.vx -= (1 + restitution) * dot * nx;
-      ball.vy -= (1 + restitution) * dot * ny;
+      ball.vx = wvx + rvx - (1 + restitution) * dot * nx;
+      ball.vy = wvy + rvy - (1 + restitution) * dot * ny;
       return true;
     }
   }
@@ -353,7 +381,11 @@ function getWindmillBlades(wm) {
   const blades = [];
   for (let i = 0; i < wm.blades; i++) {
     const angle = wm.angle + i * (2 * Math.PI / wm.blades);
-    blades.push({ x1: wm.cx, y1: wm.cy, x2: wm.cx + Math.cos(angle) * wm.armLength, y2: wm.cy + Math.sin(angle) * wm.armLength, restitution: WALL_RESTITUTION });
+    blades.push({
+      x1: wm.cx, y1: wm.cy, x2: wm.cx + Math.cos(angle) * wm.armLength, y2: wm.cy + Math.sin(angle) * wm.armLength,
+      restitution: WALL_RESTITUTION,
+      pivot: { x: wm.cx, y: wm.cy }, omega: wm.rotationSpeed,
+    });
   }
   return blades;
 }
@@ -380,7 +412,7 @@ function stepBallPhysics(ball, hole, dt) {
   for (let s = 0; s < substeps; s++) {
     let friction = FRICTION_GRASS;
     let inSand = false;
-    for (const z of hole.sand) { if (pointInZone(ball.x, ball.y, z)) { friction = FRICTION_SAND; inSand = true; break; } }
+    for (const z of hole.sand) { if (circleTouchesZone(ball.x, ball.y, BALL_RADIUS, z)) { friction = FRICTION_SAND; inSand = true; break; } }
     if (inSand && !inSandLastStep) events.enteredSand = true;
     inSandLastStep = inSand;
 
@@ -412,7 +444,7 @@ function stepBallPhysics(ball, hole, dt) {
     }
 
     let inBoost = null;
-    for (const z of hole.boost) { if (pointInZone(ball.x, ball.y, z)) { inBoost = z; break; } }
+    for (const z of hole.boost) { if (circleTouchesZone(ball.x, ball.y, BALL_RADIUS, z)) { inBoost = z; break; } }
     // Each pad fires at most once per stroke (re-armed on the next putt) so a bumper that
     // knocks the ball back across a pad can never re-trigger it into an endless loop.
     if (inBoost && !ball.firedBoosts.has(inBoost)) {
@@ -433,7 +465,7 @@ function stepBallPhysics(ball, hole, dt) {
     }
 
     for (const z of hole.water) {
-      if (pointInZone(ball.x, ball.y, z)) { events.water = z; return events; }
+      if (circleTouchesZone(ball.x, ball.y, BALL_RADIUS, z)) { events.water = z; return events; }
     }
 
     const dCup = Math.hypot(ball.x - hole.cup.x, ball.y - hole.cup.y);
@@ -532,7 +564,7 @@ return {
   WALL_RESTITUTION, BUMPER_RESTITUTION, PENDULUM_RESTITUTION, GATE_RESTITUTION,
   MAX_DRAG_DIST, MIN_DRAG_DIST, POWER_MULTIPLIER, MAX_LAUNCH_SPEED, BOOST_MAX_SPEED, BOUND,
   wall, sandRect, waterRect, boostRect, pendulum, getPendulumSegment, slidingGate,
-  getSlidingGateSegment, ringBumpers, pointInZone, zoneBounds,
+  getSlidingGateSegment, ringBumpers, pointInZone, circleTouchesZone, zoneBounds,
   BOUNDARY_WALLS, HOLES,
   resolveWallCollision, getWindmillBlades,
   createBallState, stepBallPhysics, advanceHoleObstacles, setHoleObstaclesAtTick, resetHoleObstacles,
