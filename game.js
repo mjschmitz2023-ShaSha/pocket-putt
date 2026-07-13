@@ -950,15 +950,14 @@ function loop(ts) {
 // ---- Multiplayer ----
 // Host: putt validation, scoring, multi-ball clashes.
 // Client: local shared.js coast from puttApplied; soft-reconcile sparse snapshots.
-// Tick-locked to host samples so we don't race ahead and rubber-band on corrections.
 //
-// Two backends:
-//   LAN  — open http://host:8977 (node server.js). Same-origin /ws, type:join.
-//   Relay — ?online=1 or ?relay=wss://host/ws (node relay.js on Render). Room codes.
+// Multiplayer always uses the multi-room relay protocol (create/join room codes).
+// Same-origin is normal: open the Render (or local npm start) URL in a browser.
+// Optional ?relay=wss://other-host/ws if the static page is hosted elsewhere.
+// Optional ?room=ABCDEF to pre-fill / auto-join a room.
 const MULTIPLAYER = location.protocol !== 'file:';
 const MP_PARAMS = new URLSearchParams(location.search);
-const DEFAULT_RELAY_WS = 'wss://pocket-putt-server.onrender.com/ws';
-function resolveRelayWsUrl() {
+function resolveWsUrl() {
   const r = MP_PARAMS.get('relay');
   if (r) {
     if (r.startsWith('ws://') || r.startsWith('wss://')) {
@@ -967,14 +966,15 @@ function resolveRelayWsUrl() {
     const proto = (location.protocol === 'https:' || r.includes('onrender.com')) ? 'wss:' : 'ws:';
     return `${proto}//${r.replace(/^\/\//, '').replace(/\/$/, '')}/ws`;
   }
-  if (MP_PARAMS.get('online') === '1' || MP_PARAMS.get('mode') === 'online') return DEFAULT_RELAY_WS;
   if (typeof window.POCKET_PUTT_RELAY === 'string' && window.POCKET_PUTT_RELAY) {
     return window.POCKET_PUTT_RELAY;
   }
-  return null;
+  // Same origin as the page (Render, or local `npm start`).
+  const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${wsProto}//${location.host}/ws`;
 }
-const RELAY_WS = resolveRelayWsUrl();
-const RELAY_MODE = !!RELAY_WS;
+const RELAY_WS = resolveWsUrl();
+const RELAY_MODE = true; // multiplayer always uses room codes
 
 let mpSocket = null;
 let mpPlayerId = null;
@@ -1003,9 +1003,10 @@ function mpRenderLobby(msg) {
   if (msg.roomCode) mpRoomCode = msg.roomCode;
   const joinUrlEl = document.getElementById('lobby-join-url');
   const labelEl = document.getElementById('lobby-join-label');
-  const display = msg.roomCode || msg.joinUrl || '';
+  // Prefer full share URL (https://host/?room=CODE); fall back to bare code.
+  const display = msg.joinUrl || msg.roomCode || '';
   if (labelEl) {
-    labelEl.textContent = msg.roomCode ? 'Room code (share this):' : 'Friends open:';
+    labelEl.textContent = msg.roomCode ? 'Share with friends:' : 'Friends open:';
   }
   joinUrlEl.textContent = display;
   joinUrlEl.onclick = () => {
@@ -1037,22 +1038,20 @@ function mpSetRelayStatus(text) {
 }
 
 function mpConnect() {
-  const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const url = RELAY_WS || `${wsProto}//${location.host}/ws`;
-  mpSetRelayStatus(RELAY_MODE ? `Connecting to relay…` : '');
+  const url = RELAY_WS;
+  mpSetRelayStatus('Connecting…');
   mpSocket = new WebSocket(url);
   mpSocket.addEventListener('open', () => {
     const savedToken = localStorage.getItem('pocketPuttReconnectToken');
     const savedName = localStorage.getItem('pocketPuttName') || '';
     const savedRoom = localStorage.getItem('pocketPuttRoomCode') || '';
+    const queryRoom = (MP_PARAMS.get('room') || '').trim().toUpperCase();
     document.getElementById('lobby-name-input').value = savedName;
-    if (savedRoom) {
-      const roomInput = document.getElementById('lobby-room-input');
-      if (roomInput) roomInput.value = savedRoom;
-    }
-    mpSetRelayStatus(RELAY_MODE ? 'Connected. Create a room or join with a code.' : '');
-    // Auto-reconnect only — don't auto-create rooms.
-    if (RELAY_MODE && savedRoom && savedToken) {
+    const roomInput = document.getElementById('lobby-room-input');
+    if (roomInput) roomInput.value = queryRoom || savedRoom || '';
+    mpSetRelayStatus('Connected. Create a room or join with a code.');
+    // Prefer reconnect to a room we already left; else auto-join ?room= if present.
+    if (savedRoom && savedToken && (!queryRoom || queryRoom === savedRoom)) {
       mpSetRelayStatus(`Reconnecting to ${savedRoom}…`);
       mpSocket.send(JSON.stringify({
         type: 'relay_reconnect',
@@ -1060,15 +1059,21 @@ function mpConnect() {
         token: savedToken,
         player_name: savedName,
       }));
-    } else if (!RELAY_MODE && savedToken) {
-      mpSocket.send(JSON.stringify({ type: 'join', name: savedName, reconnectToken: savedToken }));
+    } else if (queryRoom && savedName) {
+      // Deep link: https://host/?room=ABCDEF
+      mpSetRelayStatus(`Joining ${queryRoom}…`);
+      mpSocket.send(JSON.stringify({
+        type: 'relay_join',
+        room_code: queryRoom,
+        player_name: savedName || 'Player',
+      }));
     }
   });
   mpSocket.addEventListener('close', () => {
-    mpSetRelayStatus(RELAY_MODE ? 'Disconnected from relay.' : '');
+    mpSetRelayStatus('Disconnected. Refresh to reconnect.');
   });
   mpSocket.addEventListener('error', () => {
-    mpSetRelayStatus(RELAY_MODE ? 'Relay connection failed (cold start?). Retry in a moment.' : '');
+    mpSetRelayStatus('Connection failed (cold start on free tier can take ~1 min). Retry.');
   });
   mpSocket.addEventListener('message', (e) => {
     const msg = JSON.parse(e.data);
@@ -1577,20 +1582,14 @@ Game.ball.x = HOLES[0].tee.x;
 Game.ball.y = HOLES[0].tee.y;
 if (MULTIPLAYER) {
   showScreen('screen-lobby');
-  // Toggle LAN vs relay UI.
   const lanActions = document.getElementById('lobby-lan-actions');
   const relayActions = document.getElementById('lobby-relay-actions');
   const subtitle = document.getElementById('lobby-subtitle');
-  if (RELAY_MODE) {
-    if (lanActions) lanActions.classList.add('hidden');
-    if (relayActions) relayActions.classList.remove('hidden');
-    if (subtitle) {
-      subtitle.textContent =
-        'Online multiplayer via relay. Create a room and share the code, or join a friend’s code.';
-    }
-  } else {
-    if (lanActions) lanActions.classList.remove('hidden');
-    if (relayActions) relayActions.classList.add('hidden');
+  if (lanActions) lanActions.classList.add('hidden');
+  if (relayActions) relayActions.classList.remove('hidden');
+  if (subtitle) {
+    subtitle.textContent =
+      'Create a room and share the link or code with friends. Same 19 holes, heat by heat.';
   }
   mpConnect();
 } else {

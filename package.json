@@ -5,8 +5,9 @@
   "main": "server.js",
   "scripts": {
     "start": "node relay.js",
-    "lan": "node server.js",
-    "relay": "node relay.js"
+    "lan": "node relay.js",
+    "relay": "node relay.js",
+    "lan-legacy": "node server.js"
   },
   "engines": {
     "node": ">=18"

@@ -1,5 +1,5 @@
 # Pocket Putt multi-room relay — Chess101-style Blueprint
-# WebSocket + /health only (no static game frontend).
+# Serves game UI + WebSocket multi-room authority + /health.
 # Deploy: New → Blueprint → this repo, branch relay (or main once merged).
 # Docs: deploy/DEPLOY.md
 services:

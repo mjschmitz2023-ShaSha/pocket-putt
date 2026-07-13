@@ -1,72 +1,66 @@
 # Pocket Putt Deployment Guide
 
-Mirrors Chess101’s relay deploy (`Chess101/render.yaml` + `deploy/DEPLOY.md`).
+Mirrors Chess101’s relay deploy layout (`render.yaml` + this guide).
 
 ## What runs on Render
 
-| Process | Command | Role |
-|---|---|---|
-| **`relay.js`** | `npm start` | Multi-room WebSocket relay — **no game UI** |
-| `server.js` | `npm run lan` | Local LAN host **with** static frontend (not deployed) |
+**One service** (`npm start` → `relay.js`):
 
-The cloud service only speaks:
+| Path | Role |
+|---|---|
+| `GET /` | Game UI (HTML/JS/CSS/audio) — players open this in a browser |
+| `GET /health` | Health check (`OK`) |
+| `WS /ws` | Multi-room multiplayer (create/join by room code) |
 
-- `GET /health` → `OK`
-- `WS /ws` → room handshake + game protocol
-
-Visiting `https://….onrender.com/` in a browser returns a short plain-text notice, **not** the putt game. Clients load the game from a LAN host or any static host, then open:
+No separate static site. Friends only need the public URL — they do **not** download the repo.
 
 ```
-http://localhost:8977/?online=1
-# or
-http://localhost:8977/?relay=wss://pocket-putt-server.onrender.com/ws
+https://pocket-putt-server.onrender.com/
 ```
+
+1. Open the URL  
+2. **Create Room** → share the link (`/?room=ABCDEF`) or the code  
+3. Friend opens the link (or joins with the code)  
+4. Host starts the round  
 
 ---
 
-## Architecture (like Chess101)
+## Architecture
 
 ```
-Browser A  ──wss──┐
-Browser B  ──wss──┼──►  relay.js (Render)  ── per-room GameSession (authority)
-Browser C  ──wss──┘         rooms keyed by 6-char codes
+Browser A  ──HTTPS+WSS──┐
+Browser B  ──HTTPS+WSS──┼──►  relay.js (Render)
+Browser C  ──HTTPS+WSS──┘       ├── static game files
+                                └── rooms[code] → GameSession (authority)
 ```
 
 Handshake (first WebSocket message), Chess101-style:
 
 | Client → relay | Meaning |
 |---|---|
-| `relay_create` `{ player_name }` | Host creates a room |
+| `relay_create` `{ player_name }` | Create a room (you become host) |
 | `relay_join` `{ room_code, player_name }` | Join existing room |
 | `relay_reconnect` `{ room_code, token }` | Resume after refresh |
 
-Responses: `relay_created` / `relay_reconnected` / `relay_error`, then game `welcome` + `lobbyState`.
+Then normal game messages: `startRound`, `putt`, etc.
 
-Unlike Chess101’s pure peer-forward relay, each Pocket Putt room runs **authoritative physics** on the relay (putts, scoring, multi-ball). That matches today’s client protocol.
+Each room runs authoritative physics on the server (unlike Chess101’s pure peer-forward), so putts/scoring stay consistent.
 
 ---
 
-## Render (recommended)
+## Render
 
-### 1. Push the `relay` branch
+### Deploy / update
+
+Push to the connected branch (`relay`):
 
 ```bash
 git push origin relay
 ```
 
-### 2. Blueprint / service
+Confirm service **branch = `relay`**, start command **`npm start`**.
 
-Service **`pocket-putt-server`** should already exist if you applied the Blueprint earlier.
-
-After pushing multi-room relay code:
-
-1. Confirm **branch = `relay`**
-2. **Manual Deploy → Deploy latest commit**
-3. Ensure **start command** is `npm start` (runs `node relay.js`)
-
-### 3. Environment variables
-
-Dashboard → **Environment**
+### Environment
 
 | Variable | Required | Suggested | Description |
 |---|---|---|---|
@@ -74,72 +68,36 @@ Dashboard → **Environment**
 | `RELAY_MAX_ROOMS` | No | `200` | Max concurrent rooms |
 | `RELAY_ROOM_TIMEOUT` | No | `900` | Idle seconds before room deleted |
 | `RELAY_MAX_PLAYERS` | No | `8` | Max players per room |
+| `PUBLIC_URL` | No | custom domain | Optional; else uses `RENDER_EXTERNAL_URL` for share links |
 
-### 4. Verify (no game UI)
+### Verify
 
 ```bash
 curl -sS https://pocket-putt-server.onrender.com/health
 # OK
 
-curl -sS https://pocket-putt-server.onrender.com/
-# plain text: "Pocket Putt relay (WebSocket only)…"
+curl -sS -o /dev/null -w "%{http_code}\n" https://pocket-putt-server.onrender.com/
+# 200  (game HTML)
 ```
 
-Logs should say:
+Open the URL in two browsers → Create Room / Join → Start Round.
 
-```text
-Pocket Putt multi-room relay
-Listening  0.0.0.0:…
-No static frontend — clients use relay_create / relay_join
-```
-
-### 5. Play against the cloud relay
-
-On a machine with the game files (LAN host or any static server):
-
-```bash
-npm run lan
-# open http://localhost:8977/?online=1
-```
-
-1. **Create Room** → share the 6-letter code  
-2. Friend opens same URL with `?online=1` → **Join Room** + code  
-3. Host **Start Round**
-
-Cold start on free plan can take 30–60s on first WebSocket connect.
+Free tier: first hit after idle can take 30–60s (spin-up).
 
 ---
 
-## Local multi-room relay (dev)
+## Local
 
 ```bash
-# terminal 1 — relay (no UI)
-npm run relay
-
-# terminal 2 — game files only (or any static server)
-npm run lan
-# open http://localhost:8977/?relay=ws://127.0.0.1:8978/ws
+npm start          # same process as production
+# open http://localhost:8977/
 ```
 
-If LAN host and relay both default to 8977, run relay on another port:
-
-```bash
-PORT=8978 npm run relay
-# ?relay=ws://127.0.0.1:8978/ws
-```
+`npm run lan` is an alias for the same multi-room server.  
+`npm run lan-legacy` runs the old single-lobby `server.js` if you ever need it.
 
 ---
 
 ## Custom domain (optional)
 
-Same as before: Custom Domains → CNAME → set clients’ `?relay=wss://your.domain/ws`.
-
----
-
-## Free-plan gotchas
-
-| Issue | What to do |
-|---|---|
-| First connect after idle is slow | Free spin-down; upgrade for always-on |
-| Browser shows plain text at onrender.com | **Expected** — not a bug |
-| Health fails | Don’t set `PORT`; start must be `npm start` → `relay.js` |
+Service → Custom Domains → CNAME. Share links use that host once TLS is ready.

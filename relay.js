@@ -1,33 +1,60 @@
 // Pocket Putt multi-room relay — Chess101-style cloud process.
 //
-// WebSocket + health only. No game frontend.
-// Each room runs its own authoritative GameSession (lobby, physics, scoring).
+// Serves the game UI (static files) + multi-room WebSocket authority.
+// Players open the public URL in a browser — no code download required.
 //
-// Handshake (first message), same spirit as Chess101 network/relay.py:
+// Handshake (first WS message), same spirit as Chess101 network/relay.py:
 //   relay_create   { player_name }
 //   relay_join     { room_code, player_name, reconnect_token? }
 //   relay_reconnect { room_code, token }   // token = reconnectToken from welcome
 //
-// Then game messages: setName, startRound, putt (same as LAN host).
+// Then game messages: setName, startRound, putt.
 //
 // Env:
 //   PORT / RELAY_PORT     listen port (Render injects PORT)
+//   PUBLIC_URL            optional public origin for share links
 //   RELAY_MAX_ROOMS       default 100
 //   RELAY_ROOM_TIMEOUT    idle seconds before room deleted (default 600)
 //   RELAY_MAX_PLAYERS     players per room (default 8)
 //
-// Run: node relay.js
+// Run: node relay.js   (also: npm start / npm run lan)
 'use strict';
 
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
 const crypto = require('crypto');
 const WebSocket = require('ws');
 const { GameSession, TICK_MS } = require('./gameSession.js');
 
 const PORT = Number(process.env.RELAY_PORT || process.env.PORT || 8977);
+const ROOT = __dirname;
 const MAX_ROOMS = Number(process.env.RELAY_MAX_ROOMS || 100);
 const ROOM_TIMEOUT_MS = (Number(process.env.RELAY_ROOM_TIMEOUT || 600) || 600) * 1000;
 const CODE_LEN = 6;
+const publicBase = (process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '').replace(
+  /\/$/,
+  ''
+);
+
+const MIME = {
+  '.html': 'text/html',
+  '.css': 'text/css',
+  '.js': 'application/javascript',
+  '.wav': 'audio/wav',
+  '.png': 'image/png',
+  '.ico': 'image/x-icon',
+  '.svg': 'image/svg+xml',
+};
+const STATIC_FILES = [
+  'index.html',
+  'style.css',
+  'game.js',
+  'shared.js',
+  'putt.wav',
+  'echoey_putt.wav',
+  'putt_go_in.wav',
+];
 
 /** @type {Map<string, { code: string, session: GameSession, createdAt: number }>} */
 const rooms = new Map();
@@ -47,11 +74,19 @@ function send(ws, obj) {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
 }
 
+function roomShareUrl(code) {
+  // Prefer a clickable deep link so friends open the game and join in one step.
+  if (publicBase) return `${publicBase}/?room=${code}`;
+  // Local / no PUBLIC_URL yet: still a path; host is whatever they already used.
+  return `/?room=${code}`;
+}
+
 function createRoom() {
   const code = generateCode();
+  const share = roomShareUrl(code);
   const session = new GameSession({
     code,
-    joinUrl: code,
+    joinUrl: share,
     joinUrlFallback: code,
   });
   const room = { code, session, createdAt: Date.now() };
@@ -73,7 +108,28 @@ function destroyRoom(code) {
   console.log(`[${code}] room destroyed (${rooms.size} active)`);
 }
 
-// ---- HTTP: health only (no static frontend) ----
+// ---- HTTP: health + game static files (same origin as /ws) ----
+function serveStatic(req, res) {
+  let reqPath = (req.url || '/').split('?')[0];
+  if (reqPath === '/') reqPath = '/index.html';
+  const name = path.basename(reqPath);
+  if (!STATIC_FILES.includes(name)) {
+    res.writeHead(404, { 'Content-Type': 'text/plain' });
+    res.end('Not found\n');
+    return;
+  }
+  const filePath = path.join(ROOT, name);
+  fs.readFile(filePath, (err, data) => {
+    if (err) {
+      res.writeHead(500, { 'Content-Type': 'text/plain' });
+      res.end('Server error\n');
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': MIME[path.extname(name)] || 'application/octet-stream' });
+    res.end(data);
+  });
+}
+
 const httpServer = http.createServer((req, res) => {
   const urlPath = (req.url || '/').split('?')[0];
   if (urlPath === '/health') {
@@ -81,13 +137,7 @@ const httpServer = http.createServer((req, res) => {
     res.end('OK\n');
     return;
   }
-  // Explicitly no game UI — clients connect with their own frontend over wss.
-  res.writeHead(404, { 'Content-Type': 'text/plain' });
-  res.end(
-    'Pocket Putt relay (WebSocket only).\n' +
-      'Connect to /ws with relay_create or relay_join.\n' +
-      'Health: GET /health\n'
-  );
+  serveStatic(req, res);
 });
 
 const wss = new WebSocket.Server({ server: httpServer, path: '/ws' });
@@ -250,9 +300,11 @@ httpServer.listen(PORT, '0.0.0.0', () => {
   console.log('');
   console.log('  Pocket Putt multi-room relay');
   console.log(`  Listening  0.0.0.0:${PORT}`);
+  console.log(`  Game UI    http://0.0.0.0:${PORT}/`);
   console.log(`  WebSocket  ws://0.0.0.0:${PORT}/ws`);
   console.log(`  Health     http://0.0.0.0:${PORT}/health`);
+  if (publicBase) console.log(`  Public     ${publicBase}`);
   console.log(`  Max rooms  ${MAX_ROOMS}  timeout ${ROOM_TIMEOUT_MS / 1000}s`);
-  console.log('  No static frontend — clients use relay_create / relay_join');
+  console.log('  Open the URL → Create Room / Join with code (or ?room=CODE)');
   console.log('');
 });
