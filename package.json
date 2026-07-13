@@ -7,7 +7,10 @@
     "start": "node relay.js",
     "lan": "node relay.js",
     "relay": "node relay.js",
-    "lan-legacy": "node server.js"
+    "lan-legacy": "node server.js",
+    "test": "node test/rubberband-harness.js --all",
+    "test:rubberband": "node test/rubberband-harness.js --all",
+    "test:lockstep": "node test/rubberband-harness.js lockstep_coast"
   },
   "engines": {
     "node": ">=18"
