@@ -282,6 +282,11 @@ class GameSession {
       // Index latch (not object ref) so clients keep escape-grass vs trap-sticky correct.
       stuckStickyIndex: typeof p.ball.stuckStickyIndex === 'number' ? p.ball.stuckStickyIndex : -1,
     };
+    // Only send wet flags when armed (keeps idle packets small).
+    if (p.ball.wet) {
+      wire.wet = true;
+      if (p.ball.wetStroke) wire.wetStroke = true;
+    }
     // Omit grounded z/vz to keep idle packets small.
     if (p.ball.z > 0) {
       wire.z = p.ball.z;
@@ -396,6 +401,7 @@ class GameSession {
           p.ball.z = 0;
           p.ball.vz = 0;
           p.ball.stuckStickyIndex = -1;
+          Shared.markWetFromWater(p.ball);
         }
         if (events.holed) {
           this.finishPlayerHole(p, false);
@@ -647,13 +653,14 @@ class GameSession {
       player.ball.firedBoosts = new Set();
       // Goo stays sticky while inside the patch (no grass escape latch).
       Shared.latchStickyAfterPutt(player.ball, hole);
+      Shared.noteWetPutt(player.ball);
       player.ball.vx = launch.vx * factor;
       player.ball.vy = launch.vy * factor;
       player.ball.z = 0;
       player.ball.vz = 0;
       player.strokes++;
       // One reliable event — no pose stream while the ball is rolling.
-      this.broadcastReliable({
+      const puttMsg = {
         type: 'puttApplied',
         playerId: player.id,
         tick: this.simTick,
@@ -666,7 +673,12 @@ class GameSession {
         z: player.ball.z,
         vz: player.ball.vz,
         stuckStickyIndex: player.ball.stuckStickyIndex,
-      });
+      };
+      if (player.ball.wet) {
+        puttMsg.wet = true;
+        if (player.ball.wetStroke) puttMsg.wetStroke = true;
+      }
+      this.broadcastReliable(puttMsg);
     }
   }
 

@@ -59,9 +59,13 @@ const FRICTION_AIR = 0.1;
 //   - Putts from inside goo are also weakened by STICKY_LAUNCH_FACTOR.
 // Original numbers (d7e080d). stuckStickyIndex is bookkeeping (which patch last stuck us)
 // for wire/state; it does NOT disable sticky friction.
+//
+// Wet (after water hazard): the next putt only treats goo as super-slick — less friction
+// than grass, and no hard-stick. Clears when that putt's coast settles.
 const FRICTION_STICKY = 22;
 const STICKY_STOP_SPEED = 50;
 const STICKY_LAUNCH_FACTOR = 0.45;
+const FRICTION_WET_GOO = 0.35; // < FRICTION_GRASS (1.15) — slides through goo while wet
 const BOUND = { left: 20, top: 20, right: 780, bottom: 480 };
 
 // ---- Small geometry / data helpers ----
@@ -835,7 +839,20 @@ function createBallState(tee) {
     squash: 0, spin: 0, angleDir: 0,
     firedBoosts: new Set(), // boost zone indices (numbers), not object refs
     stuckStickyIndex: -1,
+    wet: false,       // true after a water drop until the wet stroke settles
+    wetStroke: false, // true once the post-water putt has been taken
   };
+}
+
+/** Call when the ball is dropped from water — arms wet for the next putt. */
+function markWetFromWater(ball) {
+  ball.wet = true;
+  ball.wetStroke = false;
+}
+
+/** Call on every putt: if wet, this coast is the wet stroke (clears on settle). */
+function noteWetPutt(ball) {
+  if (ball.wet) ball.wetStroke = true;
 }
 
 function stickyIndexAt(ball, hole) {
@@ -894,6 +911,9 @@ function stepBallPhysics(ball, hole, dt) {
             break;
           }
         }
+      } else if (ball.wet) {
+        // Wet after water: goo is slicker than grass for this one stroke — no hard stick.
+        friction = FRICTION_WET_GOO;
       } else {
         // Inside goo: always sticky drag, including shots launched from within the patch.
         friction = FRICTION_STICKY;
@@ -1008,6 +1028,15 @@ function stepBallPhysics(ball, hole, dt) {
     if (dCup < hole.cup.radius) { events.holed = true; return events; }
   }
 
+  // Wet lasts for exactly one post-water putt: clear once that stroke settles.
+  if (ball.wet && ball.wetStroke) {
+    const sp = Math.hypot(ball.vx, ball.vy);
+    if (sp < STOP_THRESHOLD && (ball.z || 0) === 0) {
+      ball.wet = false;
+      ball.wetStroke = false;
+    }
+  }
+
   return events;
 }
 
@@ -1111,13 +1140,14 @@ return {
   WALL_RESTITUTION, BUMPER_RESTITUTION, PENDULUM_RESTITUTION, GATE_RESTITUTION,
   MAX_DRAG_DIST, MIN_DRAG_DIST, POWER_MULTIPLIER, MAX_LAUNCH_SPEED, BOOST_MAX_SPEED, BOUND,
   RAMP_MIN_SPEED, RAMP_GRAVITY, RAMP_VZ_SCALE, RAMP_VZ_MIN, RAMP_VZ_MAX,
-  FRICTION_STICKY, STICKY_STOP_SPEED, STICKY_LAUNCH_FACTOR,
+  FRICTION_STICKY, STICKY_STOP_SPEED, STICKY_LAUNCH_FACTOR, FRICTION_WET_GOO,
   wall, sandRect, waterRect, boostRect, rampRect, stickyRect, pendulum, getPendulumSegment, slidingGate,
   getSlidingGateSegment, ringBumpers, pointInZone, circleTouchesZone, zoneBounds, cupHasGravity,
   BOUNDARY_WALLS, HOLES, COURSES,
   resolveWallCollision, getWindmillBlades,
   createBallState, stepBallPhysics, advanceHoleObstacles, setHoleObstaclesAtTick, resetHoleObstacles,
   computeLaunchVelocity, clampDragVector, stickyLaunchFactor, stickyIndexAt, latchStickyAfterPutt,
+  markWetFromWater, noteWetPutt,
   resolveBallBallCollision, teePositionFor,
 };
 

@@ -11,6 +11,7 @@ const {
   getPendulumSegment, getSlidingGateSegment,
   createBallState, stepBallPhysics, advanceHoleObstacles, setHoleObstaclesAtTick, resetHoleObstacles,
   computeLaunchVelocity, clampDragVector, stickyLaunchFactor, stickyIndexAt, latchStickyAfterPutt,
+  markWetFromWater, noteWetPutt,
 } = window.Shared;
 // Must match gameSession PHYSICS_SUBTICKS — same dt schedule keeps sticky latch deterministic.
 const MP_PHYSICS_SUBTICKS = 4;
@@ -206,6 +207,7 @@ function handleWaterHazard(zone) {
   Game.ball.y = zone.dropPoint.y;
   Game.ball.vx = 0;
   Game.ball.vy = 0;
+  markWetFromWater(Game.ball);
   Game.trail = [];
   spawnSplash(zone.dropPoint.x, zone.dropPoint.y);
   soundWater();
@@ -214,6 +216,8 @@ function handleWaterHazard(zone) {
   Game.hazardTimer = 0.9;
   Game.state = 'HAZARD_RESET';
   showScreen('screen-hazard');
+  const hazardMsg = document.getElementById('hazard-text');
+  if (hazardMsg) hazardMsg.textContent = 'Splash! +1  ·  WET — goo is slick this putt';
 }
 // Thin wrapper around shared.js's stepBallPhysics: the physics itself is identical to what
 // the multiplayer server runs, this just reacts to the returned events with solo-mode
@@ -602,14 +606,21 @@ function drawBall() {
   const stretch = b.squash || 0;
   ctx.scale(1 + stretch * 0.5, 1 - stretch * 0.35);
 
-  // outer glow, pulsing gently
+  // outer glow, pulsing gently (wet = cool water sheen)
   const glowR = BALL_RADIUS + 5 + Math.sin(t * 4) * 1.5;
-  const glow = ctx.createRadialGradient(0, 0, BALL_RADIUS * 0.5, 0, 0, glowR);
-  glow.addColorStop(0, `hsla(${baseHue}, 100%, 65%, 0.55)`);
-  glow.addColorStop(1, `hsla(${baseHue}, 100%, 65%, 0)`);
-  ctx.fillStyle = glow;
+  if (b.wet) {
+    const wetGlow = ctx.createRadialGradient(0, 0, BALL_RADIUS * 0.4, 0, 0, glowR + 2);
+    wetGlow.addColorStop(0, 'rgba(120, 210, 255, 0.65)');
+    wetGlow.addColorStop(1, 'rgba(40, 140, 255, 0)');
+    ctx.fillStyle = wetGlow;
+  } else {
+    const glow = ctx.createRadialGradient(0, 0, BALL_RADIUS * 0.5, 0, 0, glowR);
+    glow.addColorStop(0, `hsla(${baseHue}, 100%, 65%, 0.55)`);
+    glow.addColorStop(1, `hsla(${baseHue}, 100%, 65%, 0)`);
+    ctx.fillStyle = glow;
+  }
   ctx.beginPath();
-  ctx.arc(0, 0, glowR, 0, Math.PI * 2);
+  ctx.arc(0, 0, glowR + (b.wet ? 2 : 0), 0, Math.PI * 2);
   ctx.fill();
 
   // rainbow gradient body
@@ -701,6 +712,12 @@ function drawMultiplayerBall(b, isSelf) {
     ctx.fillStyle = 'rgba(255,255,255,0.25)';
     ctx.beginPath();
     ctx.arc(0, 0, BALL_RADIUS + 4, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  if (b.wet) {
+    ctx.fillStyle = 'rgba(80, 190, 255, 0.35)';
+    ctx.beginPath();
+    ctx.arc(0, 0, BALL_RADIUS + 5, 0, Math.PI * 2);
     ctx.fill();
   }
   if (b.special === 'sunburst') {
@@ -1012,6 +1029,7 @@ function launchBall(dragLen, pointerVec) {
   const v = computeLaunchVelocity(pointerVec);
   const factor = stickyLaunchFactor(Game.ball, hole);
   latchStickyAfterPutt(Game.ball, hole);
+  noteWetPutt(Game.ball);
   Game.ball.vx = v.vx * factor;
   Game.ball.vy = v.vy * factor;
   Game.ball.squash = 0.6;
@@ -1557,6 +1575,8 @@ function mpUpsertPlayer(b) {
       squash: 0, spin: 0, angleDir: 0,
       firedBoosts: new Set(),
       stuckStickyIndex: typeof b.stuckStickyIndex === 'number' ? b.stuckStickyIndex : -1,
+      wet: !!b.wet,
+      wetStroke: !!b.wetStroke,
       trailPts: null,
     };
     Game.players.set(b.id, p);
@@ -1613,6 +1633,9 @@ function mpApplyAuthorityPose(p, b, hard) {
   p.z = b.z || 0;
   p.vz = b.vz || 0;
   if (typeof b.stuckStickyIndex === 'number') p.stuckStickyIndex = b.stuckStickyIndex;
+  // Absent wet on wire means dry (ballWire only sets the flag when true).
+  p.wet = !!b.wet;
+  p.wetStroke = !!b.wetStroke;
   if (Math.hypot(p.vx, p.vy) < STOP_THRESHOLD && p.z === 0) p.firedBoosts = new Set();
 
   const visGap = Math.hypot(visX - p.x, visY - p.y);
@@ -1658,9 +1681,12 @@ function mpApplyPuttLocal(playerId, dragVector, fromServer, playSound) {
     } else {
       latchStickyAfterPutt(p, hole);
     }
+    if (fromServer.wet !== undefined) p.wet = !!fromServer.wet;
+    if (fromServer.wetStroke !== undefined) p.wetStroke = !!fromServer.wetStroke;
   } else {
     const factor = stickyLaunchFactor(p, hole);
     latchStickyAfterPutt(p, hole);
+    noteWetPutt(p);
     p.vx = launch.vx * factor;
     p.vy = launch.vy * factor;
     p.z = 0;
@@ -1693,6 +1719,7 @@ function mpOnPuttApplied(msg) {
   const hostPose = {
     x: msg.x, y: msg.y, vx: msg.vx, vy: msg.vy, strokes: msg.strokes,
     stuckStickyIndex: msg.stuckStickyIndex, z: msg.z, vz: msg.vz,
+    wet: msg.wet, wetStroke: msg.wetStroke,
   };
 
   // puttApplied carries pose *at the putt tick* (rest x/y + full launch v). That is an
@@ -1705,6 +1732,8 @@ function mpOnPuttApplied(msg) {
       // Confirm only. Optimistic coast is truth until a real hard correction.
       p.strokes = Math.max(p.strokes, msg.strokes || 0);
       if (typeof msg.stuckStickyIndex === 'number') p.stuckStickyIndex = msg.stuckStickyIndex;
+      if (msg.wet !== undefined) p.wet = !!msg.wet;
+      if (msg.wetStroke !== undefined) p.wetStroke = !!msg.wetStroke;
       mpSyncSelfFromPlayer(p);
     } else {
       // Missed optimistic launch (or input arrived before local apply) — take impulse once.
@@ -1753,6 +1782,7 @@ function mpStepOneTick() {
         p.z = 0;
         p.vz = 0;
         p.stuckStickyIndex = -1;
+        markWetFromWater(p);
         p.strokes += 1;
         p.errX = 0;
         p.errY = 0;
@@ -1761,7 +1791,7 @@ function mpStepOneTick() {
         spawnSplash(events.water.dropPoint.x, events.water.dropPoint.y);
         if (mine) {
           soundWater();
-          mpShowBanner('SPLASH! +1');
+          mpShowBanner('SPLASH! +1  ·  WET');
           achvOnSplash();
         }
       }

@@ -120,6 +120,8 @@ class ClientModel {
         errY: 0,
         firedBoosts: new Set(),
         stuckStickyIndex: typeof b.stuckStickyIndex === 'number' ? b.stuckStickyIndex : -1,
+        wet: !!b.wet,
+        wetStroke: !!b.wetStroke,
       };
       this.players.set(b.id, p);
     } else {
@@ -154,6 +156,8 @@ class ClientModel {
     p.z = b.z || 0;
     p.vz = b.vz || 0;
     if (typeof b.stuckStickyIndex === 'number') p.stuckStickyIndex = b.stuckStickyIndex;
+    p.wet = !!b.wet;
+    p.wetStroke = !!b.wetStroke;
     if (Math.hypot(p.vx, p.vy) < STOP && p.z === 0) p.firedBoosts = new Set();
 
     const visGap = dist(visX, visY, p.x, p.y);
@@ -217,10 +221,13 @@ class ClientModel {
       } else {
         Shared.latchStickyAfterPutt(p, hole);
       }
+      if (fromServer.wet !== undefined) p.wet = !!fromServer.wet;
+      if (fromServer.wetStroke !== undefined) p.wetStroke = !!fromServer.wetStroke;
     } else {
       const launch = Shared.computeLaunchVelocity(clamped);
       const factor = Shared.stickyLaunchFactor(p, hole);
       Shared.latchStickyAfterPutt(p, hole);
+      Shared.noteWetPutt(p);
       p.vx = launch.vx * factor;
       p.vy = launch.vy * factor;
       p.z = 0;
@@ -273,6 +280,8 @@ class ClientModel {
       if (alreadyLaunched) {
         p.strokes = Math.max(p.strokes, msg.strokes || 0);
         if (typeof msg.stuckStickyIndex === 'number') p.stuckStickyIndex = msg.stuckStickyIndex;
+        if (msg.wet !== undefined) p.wet = !!msg.wet;
+        if (msg.wetStroke !== undefined) p.wetStroke = !!msg.wetStroke;
       } else {
         this.applyPuttLocal(msg.playerId, msg.dragVector, hostPose);
       }
@@ -375,6 +384,7 @@ class ClientModel {
           p.z = 0;
           p.vz = 0;
           p.stuckStickyIndex = -1;
+          Shared.markWetFromWater(p);
           p.strokes += 1;
           p.errX = 0;
           p.errY = 0;

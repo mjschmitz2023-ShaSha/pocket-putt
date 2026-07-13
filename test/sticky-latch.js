@@ -248,6 +248,35 @@ console.log('='.repeat(48));
   assert(Math.abs(hb.x - c.x) < 50, 'did not free-roll far through goo');
 }
 
+// --- wet after water: goo friction below grass for one putt ---
+{
+  console.log('\nwet goo (post-water)');
+  assert(Shared.FRICTION_WET_GOO < Shared.FRICTION_GRASS, 'wet goo friction < grass');
+  const hole = gooHole();
+  const c = patchCenter(hole);
+  const dry = Shared.createBallState(c);
+  dry.vx = 400;
+  dry.vy = 0;
+  const wet = Shared.createBallState(c);
+  wet.vx = 400;
+  wet.vy = 0;
+  Shared.markWetFromWater(wet);
+  Shared.noteWetPutt(wet);
+  assert(wet.wet && wet.wetStroke, 'wet stroke armed after water + putt');
+  for (let i = 0; i < 10; i++) {
+    Shared.stepBallPhysics(dry, hole, Shared.TICK_DT);
+    Shared.stepBallPhysics(wet, hole, Shared.TICK_DT);
+  }
+  const dryV = Math.hypot(dry.vx, dry.vy);
+  const wetV = Math.hypot(wet.vx, wet.vy);
+  const wetX = Math.abs(wet.x - c.x);
+  const dryX = Math.abs(dry.x - c.x);
+  assert(wetV > dryV + 50 || wetX > dryX + 20, `wet slides farther (wet v=${wetV.toFixed(0)} x=${wetX.toFixed(0)} dry v=${dryV.toFixed(0)} x=${dryX.toFixed(0)})`);
+  // Settle wet stroke → dry again
+  for (let i = 0; i < 120; i++) Shared.stepBallPhysics(wet, hole, Shared.TICK_DT);
+  assert(!wet.wet && !wet.wetStroke, 'wet clears after stroke settles');
+}
+
 console.log('\n' + '='.repeat(48));
 if (failed) {
   console.error(`${failed} sticky test(s) failed`);
