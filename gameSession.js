@@ -269,14 +269,37 @@ class GameSession {
     return wire;
   }
 
+  /**
+   * hard policy (rubber-band reduction):
+   *  - resync / becameIdle: hard (clean settled authority)
+   *  - event water/holed/clash: hard (discrete authority)
+   *  - event bounce/sand/boost: soft (juice + gentle pose)
+   *  - periodic idle keepalive: soft (don't yank mid-aim drift)
+   */
+  eventsNeedHardSnap(events) {
+    for (const ev of events || []) {
+      if (ev.kind === 'water' || ev.kind === 'holed' || ev.kind === 'clash') return true;
+    }
+    return false;
+  }
+
   buildCorrection(events, opts) {
     opts = opts || {};
     const reason = opts.reason || 'idle';
     const includeObstacles = !!opts.includeObstacles || reason === 'resync' || reason === 'idle';
-    const hard =
-      opts.hard !== undefined
-        ? !!opts.hard
-        : reason === 'resync' || reason === 'event' || reason === 'idle';
+    let hard;
+    if (opts.hard !== undefined) {
+      hard = !!opts.hard;
+    } else if (reason === 'resync') {
+      hard = true;
+    } else if (reason === 'event') {
+      hard = this.eventsNeedHardSnap(events);
+    } else if (reason === 'idle') {
+      // becameIdle should pass hard:true explicitly; periodic keepalives stay soft
+      hard = false;
+    } else {
+      hard = false;
+    }
     const hole = this.currentHoles()[this.currentHoleIndex];
     const msg = {
       type: 'snapshot',
@@ -399,11 +422,14 @@ class GameSession {
     const becameIdle = idle && !this.wasIdle;
     this.wasIdle = idle;
     if (tickEvents.length > 0) {
-      this.sendCorrectionNow(tickEvents, { reason: 'event', hard: true });
+      // hard decided by event kinds (clash/water/holed hard; bounce/sand/boost soft)
+      this.sendCorrectionNow(tickEvents, { reason: 'event' });
     } else if (becameIdle) {
+      // Everyone just stopped — hard snap so aim poses match before next putt.
       this.sendCorrectionNow([], { reason: 'idle', includeObstacles: true, hard: true });
     } else if (idle && this.simTick % CORRECTION_IDLE_EVERY === 0) {
-      this.sendCorrectionNow([], { reason: 'idle', includeObstacles: true, hard: true });
+      // Periodic keepalive: soft — corrects drift without rubber-banding.
+      this.sendCorrectionNow([], { reason: 'idle', includeObstacles: true, hard: false });
     }
 
     const allHoledOut = connected.length > 0 && connected.every((p) => p.holedOut);

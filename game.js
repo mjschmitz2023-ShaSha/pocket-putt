@@ -1548,6 +1548,7 @@ function mpSyncSelfFromPlayer(p) {
 function mpApplyAuthorityPose(p, b, hard) {
   const visX = p.rx, visY = p.ry;
   const dist = Math.hypot((p.x - b.x), (p.y - b.y));
+  const clientMoving = Math.hypot(p.vx, p.vy) >= STOP_THRESHOLD || Math.hypot(b.vx || 0, b.vy || 0) >= STOP_THRESHOLD;
   p.strokes = b.strokes;
   p.holedOut = !!b.holedOut;
   p.x = b.x;
@@ -1559,7 +1560,14 @@ function mpApplyAuthorityPose(p, b, hard) {
   if (typeof b.stuckStickyIndex === 'number') p.stuckStickyIndex = b.stuckStickyIndex;
   if (Math.hypot(b.vx, b.vy) < STOP_THRESHOLD && p.z === 0) p.firedBoosts = new Set();
 
-  const forceHard = hard || dist >= MP_HARD_ERR_PX || b.holedOut;
+  // Rubber-band guard: while the ball is still moving, prefer soft visual blend unless
+  // the error is huge or the ball is holed. Host `hard` still snaps sim state (x/y/v)
+  // above; this only protects the *render* pose (rx/ry).
+  const forceHard =
+    b.holedOut ||
+    dist >= MP_HARD_ERR_PX ||
+    (hard && !clientMoving) ||
+    (hard && dist >= MP_SOFT_ERR_PX * 3);
   if (forceHard) {
     p.errX = 0;
     p.errY = 0;
@@ -1627,6 +1635,7 @@ function mpOnPuttApplied(msg) {
   if (!mpPlaying) return;
   if (typeof msg.tick === 'number') {
     mpNoteHostTick(msg.tick);
+    // Never rewind simTick for a late puttApplied — that yanks a coasting ball backward.
     if (msg.tick >= mpSimTick) {
       mpSimTick = msg.tick;
       setHoleObstaclesAtTick(currentHoles()[Game.currentHoleIndex], mpSimTick);
@@ -1637,17 +1646,38 @@ function mpOnPuttApplied(msg) {
   if (isSelf && p) {
     const dist = Math.hypot(p.x - msg.x, p.y - msg.y);
     const dv = Math.hypot(p.vx - msg.vx, p.vy - msg.vy);
-    if (dist > 1 || dv > 1) {
-      mpApplyPuttLocal(msg.playerId, msg.dragVector, {
-        x: msg.x, y: msg.y, vx: msg.vx, vy: msg.vy, strokes: msg.strokes,
-      }, false);
-    } else {
+    const wasOptimistic =
+      Math.hypot(p.vx, p.vy) >= STOP_THRESHOLD || p.strokes >= (msg.strokes || 0);
+    const ticksAhead = typeof msg.tick === 'number' ? mpSimTick - msg.tick : 0;
+    const hostPose = {
+      x: msg.x, y: msg.y, vx: msg.vx, vy: msg.vy, strokes: msg.strokes,
+      stuckStickyIndex: msg.stuckStickyIndex, z: msg.z, vz: msg.vz,
+    };
+    if (wasOptimistic && (dist > 1 || dv > 1)) {
+      // Late confirm after we already coasted: only hard-rebase if still near the putt
+      // tick or error is catastrophic. Otherwise keep coasting.
+      if (ticksAhead <= 2 || dist >= MP_HARD_ERR_PX) {
+        mpApplyPuttLocal(msg.playerId, msg.dragVector, hostPose, false);
+        if (typeof msg.tick === 'number' && ticksAhead > 2) {
+          mpSimTick = msg.tick;
+          setHoleObstaclesAtTick(currentHoles()[Game.currentHoleIndex], mpSimTick);
+        }
+      } else {
+        p.strokes = msg.strokes;
+        if (typeof msg.stuckStickyIndex === 'number') p.stuckStickyIndex = msg.stuckStickyIndex;
+        mpSyncSelfFromPlayer(p);
+      }
+    } else if (wasOptimistic) {
       p.strokes = msg.strokes;
+      if (typeof msg.stuckStickyIndex === 'number') p.stuckStickyIndex = msg.stuckStickyIndex;
       mpSyncSelfFromPlayer(p);
+    } else {
+      mpApplyPuttLocal(msg.playerId, msg.dragVector, hostPose, false);
     }
   } else {
     mpApplyPuttLocal(msg.playerId, msg.dragVector, {
       x: msg.x, y: msg.y, vx: msg.vx, vy: msg.vy, strokes: msg.strokes,
+      stuckStickyIndex: msg.stuckStickyIndex, z: msg.z, vz: msg.vz,
     }, true);
   }
 }
@@ -1762,7 +1792,8 @@ function mpApplyCorrection(msg) {
   const hole = currentHoles()[msg.holeIndex];
   const tick = typeof msg.tick === 'number' ? msg.tick : elapsedMsToTick(msg.elapsedMs || 0);
   const reason = msg.reason || 'heartbeat';
-  const hard = !!msg.hard || reason === 'event' || reason === 'resync';
+  // Trust host hard flag (idle keepalives / juice events are soft). Always hard on resync.
+  const hard = reason === 'resync' ? true : !!msg.hard;
   mpPlaying = true;
   mpNoteHostTick(tick);
 
@@ -1774,6 +1805,8 @@ function mpApplyCorrection(msg) {
     setHoleObstaclesAtTick(hole, tick);
   }
 
+  // Only rewind the local tick clock on hard authority or if we're badly ahead.
+  // Soft keepalives must not yank simTick backward mid-coast.
   if (hard || mpSimTick > tick + 2) {
     mpSimTick = tick;
     if (!msg.obstacles) setHoleObstaclesAtTick(hole, tick);

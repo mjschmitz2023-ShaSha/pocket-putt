@@ -129,7 +129,12 @@ class ClientModel {
     if (typeof b.stuckStickyIndex === 'number') p.stuckStickyIndex = b.stuckStickyIndex;
     if (Math.hypot(b.vx, b.vy) < STOP && p.z === 0) p.firedBoosts = new Set();
 
-    const forceHard = hard || d >= HARD_ERR_PX || b.holedOut;
+    // Mirror game.js: while moving, prefer soft visual blend unless error is huge.
+    const forceHard =
+      b.holedOut ||
+      d >= HARD_ERR_PX ||
+      (hard && !moving) ||
+      (hard && d >= SOFT_ERR_PX * 3);
     if (forceHard) {
       p.errX = 0;
       p.errY = 0;
@@ -230,50 +235,45 @@ class ClientModel {
     }
     const isSelf = msg.playerId === this.playerId;
     const p = this.players.get(msg.playerId);
+    const hostPose = {
+      x: msg.x,
+      y: msg.y,
+      vx: msg.vx,
+      vy: msg.vy,
+      strokes: msg.strokes,
+      stuckStickyIndex: msg.stuckStickyIndex,
+      z: msg.z,
+      vz: msg.vz,
+    };
     if (isSelf && p) {
-      // Only count a "resync" if we already launched optimistically (moving) and host disagrees.
       const wasOptimistic = Math.hypot(p.vx, p.vy) >= STOP || p.strokes >= (msg.strokes || 0);
       const d = dist(p.x, p.y, msg.x, msg.y);
       const dv = Math.hypot(p.vx - msg.vx, p.vy - msg.vy);
+      const ticksAhead = typeof msg.tick === 'number' ? this.simTick - msg.tick : 0;
       if (wasOptimistic && (d > 1 || dv > 1)) {
-        this.metrics.puttResyncs++;
-        this.metrics.rubberBands.push({
-          tick: this.simTick,
-          kind: 'putt_resync',
-          dist: d,
-          moving: true,
-        });
-        this.applyPuttLocal(msg.playerId, msg.dragVector, {
-          x: msg.x,
-          y: msg.y,
-          vx: msg.vx,
-          vy: msg.vy,
-          strokes: msg.strokes,
-          stuckStickyIndex: msg.stuckStickyIndex,
-        });
-      } else if (wasOptimistic && d <= 1 && dv <= 1) {
+        if (ticksAhead <= 2 || d >= HARD_ERR_PX) {
+          this.metrics.puttResyncs++;
+          this.metrics.rubberBands.push({
+            tick: this.simTick,
+            kind: 'putt_resync',
+            dist: d,
+            moving: true,
+          });
+          this.applyPuttLocal(msg.playerId, msg.dragVector, hostPose);
+          if (typeof msg.tick === 'number' && ticksAhead > 2) this.simTick = msg.tick;
+        } else {
+          // Late confirm — keep coasting.
+          p.strokes = msg.strokes;
+          if (typeof msg.stuckStickyIndex === 'number') p.stuckStickyIndex = msg.stuckStickyIndex;
+        }
+      } else if (wasOptimistic) {
         p.strokes = msg.strokes;
         if (typeof msg.stuckStickyIndex === 'number') p.stuckStickyIndex = msg.stuckStickyIndex;
       } else {
-        // No optimistic launch yet (message-only path) — apply host putt as truth, not a resync.
-        this.applyPuttLocal(msg.playerId, msg.dragVector, {
-          x: msg.x,
-          y: msg.y,
-          vx: msg.vx,
-          vy: msg.vy,
-          strokes: msg.strokes,
-          stuckStickyIndex: msg.stuckStickyIndex,
-        });
+        this.applyPuttLocal(msg.playerId, msg.dragVector, hostPose);
       }
     } else {
-      this.applyPuttLocal(msg.playerId, msg.dragVector, {
-        x: msg.x,
-        y: msg.y,
-        vx: msg.vx,
-        vy: msg.vy,
-        strokes: msg.strokes,
-        stuckStickyIndex: msg.stuckStickyIndex,
-      });
+      this.applyPuttLocal(msg.playerId, msg.dragVector, hostPose);
     }
   }
 
@@ -281,7 +281,7 @@ class ClientModel {
     const hole = this.currentHoles()[msg.holeIndex];
     const tick = typeof msg.tick === 'number' ? msg.tick : Shared.elapsedMsToTick(msg.elapsedMs || 0);
     const reason = msg.reason || 'heartbeat';
-    const hard = !!msg.hard || reason === 'event' || reason === 'resync';
+    const hard = reason === 'resync' ? true : !!msg.hard;
     this.playing = true;
     this.noteHostTick(tick, wallMs);
 

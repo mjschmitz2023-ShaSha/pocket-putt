@@ -516,8 +516,8 @@ const SCENARIOS = {
     holeIndex: 0,
     frames: 240,
     net: { delayMs: 0, jitterMs: 0, dropRate: 0 },
-    // Sparse hard idle/event snaps still fire; small residual error is OK.
-    thresholds: { maxVisErr: 20, hardSnapsWhileMoving: 4, puttResyncs: 0 },
+    // Soft keepalives: no mid-roll hard snaps expected.
+    thresholds: { maxVisErr: 20, hardSnapsWhileMoving: 0, puttResyncs: 0 },
     script(ctx) {
       ctx.atFrame(10, () => ctx.putt(ctx.remotePlayer, { x: 80, y: 0 }));
       // Wait long enough for stop before second putt
@@ -531,7 +531,7 @@ const SCENARIOS = {
     holeIndex: 0,
     frames: 240,
     net: { delayMs: 80, jitterMs: 20, dropRate: 0, seed: 42 },
-    thresholds: { maxVisErr: 65, hardSnapsWhileMoving: 4, puttResyncs: 2 },
+    thresholds: { maxVisErr: 65, hardSnapsWhileMoving: 0, puttResyncs: 2 },
     script(ctx) {
       ctx.atFrame(15, () => ctx.putt(ctx.remotePlayer, { x: 100, y: 10 }));
       ctx.atFrame(160, () => ctx.putt(ctx.hostPlayer, { x: -60, y: 40 }));
@@ -544,8 +544,8 @@ const SCENARIOS = {
     holeIndex: 0,
     frames: 300,
     net: { delayMs: 40, jitterMs: 60, dropRate: 0.15, seed: 7 },
-    // Dropped/jittered hard idle/event snaps are the rubber-band factory.
-    thresholds: { hardSnapsWhileMoving: 150, maxVisErr: 50 },
+    // Soft recon under jitter — hardSnapsWhileMoving must stay near zero.
+    thresholds: { hardSnapsWhileMoving: 5, maxVisErr: 50 },
     script(ctx) {
       ctx.atFrame(12, () => ctx.putt(ctx.remotePlayer, { x: 90, y: -20 }));
       ctx.atFrame(120, () => ctx.putt(ctx.hostPlayer, { x: 50, y: 50 }));
@@ -559,7 +559,7 @@ const SCENARIOS = {
     holeIndex: 0,
     frames: 300,
     net: { delayMs: 50, jitterMs: 15, dropRate: 0, seed: 3 },
-    thresholds: { maxVisErr: 80, hardSnapsWhileMoving: 8, puttResyncs: 3 },
+    thresholds: { maxVisErr: 80, hardSnapsWhileMoving: 2, puttResyncs: 3 },
     script(ctx) {
       ctx.atFrame(10, () => ctx.putt(ctx.remotePlayer, { x: 60, y: 0 }));
       ctx.atFrame(130, () => ctx.putt(ctx.remotePlayer, { x: 120, y: 0 }));
@@ -573,8 +573,8 @@ const SCENARIOS = {
     holeIndex: 0,
     frames: 200,
     net: { delayMs: 30, jitterMs: 10, dropRate: 0, seed: 99 },
-    // Clashes hard-snap by design.
-    thresholds: { hardSnapsWhileMoving: 12, maxVisErr: 50 },
+    // Clash poses still snap sim; visual soft-guard should keep hardMoving low.
+    thresholds: { hardSnapsWhileMoving: 2, maxVisErr: 50 },
     script(ctx) {
       ctx.atFrame(15, () => {
         ctx.putt(ctx.hostPlayer, { x: 70, y: 0 });
