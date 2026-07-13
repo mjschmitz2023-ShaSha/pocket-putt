@@ -192,7 +192,7 @@ console.log('='.repeat(48));
   assert(puttMsg.stuckStickyIndex === 0, 'host puttApplied keeps escape latch');
   assert(
     Math.abs(Math.hypot(puttMsg.vx, puttMsg.vy) - vOpt) < 0.01,
-    'host launch matches client optimistic (0.55 factor)'
+    'host launch matches client optimistic (sticky launch factor)'
   );
   client.onPuttApplied(puttMsg);
   assert(Math.abs(Math.hypot(cp.vx, cp.vy) - vOpt) < 0.01, 'confirm does not re-fire Δv');

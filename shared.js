@@ -53,12 +53,14 @@ const RAMP_VZ_MAX = 520;
 const RAMP_UPHILL_ACCEL = 900;
 const FRICTION_AIR = 0.1;
 // Sticky goo: drags a ball to a dead stop on entry; the escape putt leaves at reduced power.
-// Keep friction high enough to stop, but not so high that a 1-substep host/client skew
-// (or soft pose correction) turns into a multi-metre fork. Escape uses a latch (see
-// stuckStickyIndex) so the ball can roll out at grass friction after a putt.
-const FRICTION_STICKY = 14;
-const STICKY_STOP_SPEED = 40;
-const STICKY_LAUNCH_FACTOR = 0.55;
+// Original design numbers (d7e080d) — intentionally harsher than sand so wide patches are
+// traps, not speed bumps. Multiplayer uses stuckStickyIndex + matched PHYSICS_SUBTICKS so
+// these values stay deterministic without softening the feel.
+// Escape latch: after a putt while sitting in goo, roll at grass friction until exit
+// (without the latch, no putt could ever cross a wide patch).
+const FRICTION_STICKY = 22;
+const STICKY_STOP_SPEED = 50;
+const STICKY_LAUNCH_FACTOR = 0.45;
 const BOUND = { left: 20, top: 20, right: 780, bottom: 480 };
 
 // ---- Small geometry / data helpers ----
