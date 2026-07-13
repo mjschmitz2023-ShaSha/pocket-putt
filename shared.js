@@ -121,6 +121,15 @@ function circleTouchesZone(x, y, r, z) {
   const ny = Math.max(z.y1, Math.min(y, z.y2));
   return Math.hypot(x - nx, y - ny) < r;
 }
+// A cup whose divot area overlaps sticky goo loses its magnet entirely: goo-guarded
+// holes are meant to be punishing, so the ball must be putt in clean - no assist.
+// Cached per hole; holes and their goo are static data, identical on host and client.
+function cupHasGravity(hole) {
+  if (hole._cupMagnet === undefined) {
+    hole._cupMagnet = !(hole.sticky || []).some((z) => circleTouchesZone(hole.cup.x, hole.cup.y, CUP_GRAVITY_RADIUS, z));
+  }
+  return hole._cupMagnet;
+}
 function zoneBounds(z) {
   return z.shape === 'circle'
     ? { x1: z.cx - z.r, y1: z.cy - z.r, x2: z.cx + z.r, y2: z.cy + z.r }
@@ -897,7 +906,7 @@ function stepBallPhysics(ball, hole, dt) {
     const dcx = hole.cup.x - ball.x, dcy = hole.cup.y - ball.y;
     const dCup0 = Math.hypot(dcx, dcy);
     const speedNow = Math.hypot(ball.vx, ball.vy);
-    if (!airborne && dCup0 < CUP_GRAVITY_RADIUS && dCup0 > 0.001 && speedNow < CUP_CAPTURE_MAX_SPEED) {
+    if (!airborne && cupHasGravity(hole) && dCup0 < CUP_GRAVITY_RADIUS && dCup0 > 0.001 && speedNow < CUP_CAPTURE_MAX_SPEED) {
       const pull = CUP_GRAVITY_PULL * (1 - dCup0 / CUP_GRAVITY_RADIUS);
       ball.vx += (dcx / dCup0) * pull * subDt;
       ball.vy += (dcy / dCup0) * pull * subDt;
@@ -908,7 +917,7 @@ function stepBallPhysics(ball, hole, dt) {
     ball.vy *= decay;
     // Rolling resistance at crawl speeds (outside the divot) so the ball settles fast
     // instead of trickling on forever.
-    if (!airborne && dCup0 >= CUP_GRAVITY_RADIUS && Math.hypot(ball.vx, ball.vy) < LOW_SPEED_CUTOFF) {
+    if (!airborne && (dCup0 >= CUP_GRAVITY_RADIUS || !cupHasGravity(hole)) && Math.hypot(ball.vx, ball.vy) < LOW_SPEED_CUTOFF) {
       const extra = Math.exp(-LOW_SPEED_DRAG * subDt);
       ball.vx *= extra;
       ball.vy *= extra;
@@ -1103,7 +1112,7 @@ return {
   RAMP_MIN_SPEED, RAMP_GRAVITY, RAMP_VZ_SCALE, RAMP_VZ_MIN, RAMP_VZ_MAX,
   FRICTION_STICKY, STICKY_STOP_SPEED, STICKY_LAUNCH_FACTOR,
   wall, sandRect, waterRect, boostRect, rampRect, stickyRect, pendulum, getPendulumSegment, slidingGate,
-  getSlidingGateSegment, ringBumpers, pointInZone, circleTouchesZone, zoneBounds,
+  getSlidingGateSegment, ringBumpers, pointInZone, circleTouchesZone, zoneBounds, cupHasGravity,
   BOUNDARY_WALLS, HOLES, COURSES,
   resolveWallCollision, getWindmillBlades,
   createBallState, stepBallPhysics, advanceHoleObstacles, setHoleObstaclesAtTick, resetHoleObstacles,

@@ -4,7 +4,7 @@
 const {
   TICK_HZ, TICK_DT, tickToElapsedMs, elapsedMsToTick,
   LOGICAL_W, LOGICAL_H, BALL_RADIUS, FRICTION_GRASS, FRICTION_SAND, STOP_THRESHOLD,
-  CUP_GRAVITY_RADIUS,
+  CUP_GRAVITY_RADIUS, cupHasGravity,
   WALL_RESTITUTION, BUMPER_RESTITUTION, PENDULUM_RESTITUTION, GATE_RESTITUTION,
   MAX_DRAG_DIST, MIN_DRAG_DIST, POWER_MULTIPLIER, MAX_LAUNCH_SPEED, BOOST_MAX_SPEED, BOUND,
   BOUNDARY_WALLS, COURSES, pointInZone, zoneBounds, resolveWallCollision, getWindmillBlades,
@@ -240,7 +240,8 @@ function updateBallPhysics(dt) {
   }
   if (speed < STOP_THRESHOLD) {
     // Inside the cup divot, let gravity keep working instead of freezing the ball on the lip.
-    const nearCup = Math.hypot(Game.ball.x - hole.cup.x, Game.ball.y - hole.cup.y) < CUP_GRAVITY_RADIUS;
+    // On goo-guarded holes the magnet is off, so never hold the ball "live" near the cup.
+    const nearCup = cupHasGravity(hole) && Math.hypot(Game.ball.x - hole.cup.x, Game.ball.y - hole.cup.y) < CUP_GRAVITY_RADIUS;
     if (!nearCup) {
       Game.ball.vx = 0;
       Game.ball.vy = 0;
