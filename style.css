@@ -10,9 +10,21 @@ html, body {
   font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
   color: #eef7ee;
   display: flex;
+  flex-direction: column;
   align-items: center;
   justify-content: center;
   overflow: hidden;
+}
+
+#game-menu {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.btn-danger {
+  background: #c0453a;
+  color: #fff;
 }
 
 #stage {
@@ -306,6 +318,79 @@ button:active {
   font-size: 14px;
   opacity: 0.7;
   margin: 0;
+}
+
+#lobby-customize {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+
+.customize-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+#lobby-rename-input {
+  font-family: inherit;
+  font-size: 13px;
+  padding: 7px 14px;
+  border-radius: 20px;
+  border: 1px solid rgba(255,255,255,0.25);
+  background: rgba(255,255,255,0.08);
+  color: #eef7ee;
+  text-align: center;
+  width: 160px;
+}
+
+.btn-small {
+  font-size: 12px;
+  padding: 7px 16px;
+}
+
+.swatch-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: center;
+  max-width: 360px;
+}
+
+.ball-swatch {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  cursor: pointer;
+  padding: 0;
+  box-shadow: 0 2px 6px rgba(0,0,0,0.35);
+  transition: transform 0.08s ease;
+}
+
+.ball-swatch:hover { transform: scale(1.15); }
+
+.ball-swatch.is-selected {
+  border-color: #ffffff;
+  transform: scale(1.15);
+}
+
+.trail-chip {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 5px 12px;
+  border-radius: 16px;
+  border: 2px solid transparent;
+  cursor: pointer;
+  background: rgba(255,255,255,0.1);
+  color: #eef7ee;
+  box-shadow: none;
+}
+
+.trail-chip.is-selected {
+  border-color: #f4c542;
+  color: #f4c542;
 }
 
 #screen-hole-results h1, #screen-final-results h1 {

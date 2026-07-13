@@ -189,6 +189,7 @@ function maybePlayBounceSound() {
   if (now - Game.lastBounceSoundAt > 70) {
     soundBounce();
     Game.lastBounceSoundAt = now;
+    achvOnBounce();
   }
 }
 function handleWaterHazard(zone) {
@@ -201,6 +202,7 @@ function handleWaterHazard(zone) {
   Game.trail = [];
   spawnSplash(zone.dropPoint.x, zone.dropPoint.y);
   soundWater();
+  achvOnSplash();
   updateHUD();
   Game.hazardTimer = 0.9;
   Game.state = 'HAZARD_RESET';
@@ -544,12 +546,32 @@ function drawGrass() {
     if (i % 2 === 0) ctx.fillRect(x, 0, stripeW, LOGICAL_H);
   }
 }
+function trailColor(style, alpha, x) {
+  switch (style) {
+    case 'comet': return `rgba(255,255,255,${alpha * 0.55})`;
+    case 'fire': return `hsla(${18 + Math.random() * 22}, 100%, 55%, ${alpha * 0.55})`;
+    case 'water': return `hsla(205, 90%, 72%, ${alpha * 0.5})`;
+    default: return `hsla(${(performance.now() / 1000 * 130 + (x || 0)) % 360}, 100%, 70%, ${alpha * 0.45})`; // rainbow
+  }
+}
+// Unlockable trails in multiplayer: points carry a wall-clock timestamp, fading over 600ms.
+function drawTrailPts(pts, style) {
+  const now = performance.now();
+  for (const pt of pts) {
+    const age = (now - pt.t) / 600;
+    if (age >= 1) continue;
+    ctx.fillStyle = trailColor(style, 1 - age, pt.x);
+    ctx.beginPath();
+    ctx.arc(pt.x, pt.y, BALL_RADIUS * 0.6 * (1 - age * 0.5), 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
 function drawTrail() {
-  const hue = (performance.now() / 1000 * 130) % 360;
+  const style = myStyle.trail || 'rainbow';
   for (const pt of Game.trail) {
     const alpha = Math.max(0, 1 - pt.age / 0.6);
     if (alpha <= 0) continue;
-    ctx.fillStyle = `hsla(${hue}, 100%, 70%, ${alpha * 0.4})`;
+    ctx.fillStyle = trailColor(style, alpha, pt.x);
     ctx.beginPath();
     ctx.arc(pt.x, pt.y, BALL_RADIUS * 0.6, 0, Math.PI * 2);
     ctx.fill();
@@ -661,8 +683,32 @@ function drawMultiplayerBall(b, isSelf) {
     ctx.arc(0, 0, BALL_RADIUS + 4, 0, Math.PI * 2);
     ctx.fill();
   }
-  if (b.isHost) {
-    // The host's exclusive rainbow ball: hue tracks speed — cool violet at rest, blazing
+  if (b.special === 'sunburst') {
+    const glow = ctx.createRadialGradient(0, 0, BALL_RADIUS * 0.4, 0, 0, BALL_RADIUS + 6);
+    glow.addColorStop(0, 'rgba(255,210,90,0.65)');
+    glow.addColorStop(1, 'rgba(255,210,90,0)');
+    ctx.fillStyle = glow;
+    ctx.beginPath();
+    ctx.arc(0, 0, BALL_RADIUS + 6, 0, Math.PI * 2);
+    ctx.fill();
+    const body = ctx.createRadialGradient(-2, -2, 1, 0, 0, BALL_RADIUS);
+    body.addColorStop(0, '#fff3b8');
+    body.addColorStop(1, '#f4a020');
+    ctx.fillStyle = body;
+  } else if (b.special === 'galaxy') {
+    const glow = ctx.createRadialGradient(0, 0, BALL_RADIUS * 0.4, 0, 0, BALL_RADIUS + 6);
+    glow.addColorStop(0, 'rgba(140,90,255,0.55)');
+    glow.addColorStop(1, 'rgba(140,90,255,0)');
+    ctx.fillStyle = glow;
+    ctx.beginPath();
+    ctx.arc(0, 0, BALL_RADIUS + 6, 0, Math.PI * 2);
+    ctx.fill();
+    const body = ctx.createRadialGradient(-2, -2, 1, 0, 0, BALL_RADIUS);
+    body.addColorStop(0, '#6a4fc9');
+    body.addColorStop(1, '#191230');
+    ctx.fillStyle = body;
+  } else if (b.isHost && !b.styled) {
+    // The host's default rainbow ball: hue tracks speed — cool violet at rest, blazing
     // red at full send — with a matching glow so it reads across the room.
     const speed = Math.hypot(b.vx, b.vy);
     const speedHue = 270 - Math.min(speed / BOOST_MAX_SPEED, 1) * 270;
@@ -685,6 +731,14 @@ function drawMultiplayerBall(b, isSelf) {
   ctx.beginPath();
   ctx.arc(0, 0, BALL_RADIUS, 0, Math.PI * 2);
   ctx.fill();
+  if (b.special === 'galaxy') {
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    for (const [sx, sy, sr] of [[-2.5, 1.5, 0.8], [2, -2.5, 1.0], [1, 3, 0.6]]) {
+      ctx.beginPath();
+      ctx.arc(sx, sy, sr, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
   ctx.strokeStyle = isSelf ? '#ffffff' : 'rgba(0,0,0,0.25)';
   ctx.lineWidth = isSelf ? 2 : 1;
   ctx.stroke();
@@ -716,6 +770,9 @@ function drawWorld() {
   drawHoleAndFlag(hole);
 
   if (MULTIPLAYER) {
+    for (const b of Game.players.values()) {
+      if (b.trail && b.trailPts) drawTrailPts(b.trailPts, b.trail);
+    }
     for (const [id, b] of Game.players) drawMultiplayerBall(b, id === mpPlayerId);
   } else {
     drawTrail();
@@ -784,6 +841,7 @@ function loadHole(i) {
   Game.ball = createBallState(hole.tee);
   Game.trail = [];
   Game.drag.active = false;
+  resetAchvHoleCounters();
   resetHoleObstacles(hole);
   hud.classList.remove('hidden');
   hideAllScreens();
@@ -793,6 +851,7 @@ function loadHole(i) {
 function startGame() {
   Game.scorecard = [];
   Game.totalStrokes = 0;
+  document.getElementById('game-menu').classList.remove('hidden');
   loadHole(0);
 }
 function onHoleComplete() {
@@ -801,6 +860,7 @@ function onHoleComplete() {
   Game.scorecard.push({ hole: Game.currentHoleIndex + 1, name: hole.name, par: hole.par, strokes: Game.strokes });
   spawnConfetti(hole.cup.x, hole.cup.y);
   soundHole(Game.strokes === 1 || diff <= -2);
+  if (Game.strokes === 1) unlockAchievement('ace');
   document.getElementById('banner-text').textContent = ratingText(diff, Game.strokes);
   document.getElementById('hole-complete-strokes').textContent = `${Game.strokes} stroke${Game.strokes === 1 ? '' : 's'} (Par ${hole.par})`;
   document.getElementById('btn-next').textContent = Game.currentHoleIndex === HOLES.length - 1 ? 'See Scorecard →' : 'Next Hole →';
@@ -970,6 +1030,117 @@ function loop(ts) {
   requestAnimationFrame(loop);
 }
 
+// ---- Hidden achievements & unlockable cosmetics ----
+// No gallery, no checklist — they pop the moment you earn them and permanently unlock
+// ball skins/trails in this browser (localStorage), usable in the multiplayer lobby.
+const ACHIEVEMENTS = {
+  ace:     { title: 'One and Done!', reward: { type: 'color', id: 'sunburst', label: 'Sunburst ball' } },
+  champ:   { title: 'Champion', reward: { type: 'color', id: 'galaxy', label: 'Galaxy ball' } },
+  speed5:  { title: 'Speed Demon', reward: { type: 'trail', id: 'comet', label: 'Comet trail' } },
+  pond3:   { title: 'Pond Lover', reward: { type: 'trail', id: 'water', label: 'Bubble trail' } },
+  menace:  { title: 'MENACE', reward: { type: 'trail', id: 'fire', label: 'Fire trail' } },
+  wall100: { title: 'Wall Whisperer', reward: { type: 'trail', id: 'rainbow', label: 'Rainbow trail' } },
+};
+const CLIENT_HUES = [0, 45, 190, 270, 130, 320, 25, 210];
+
+let unlocks = { done: {}, counters: { bounces: 0 } };
+try {
+  const saved = JSON.parse(localStorage.getItem('pocketPuttUnlocks'));
+  if (saved && saved.done) unlocks = { done: saved.done, counters: saved.counters || { bounces: 0 } };
+} catch (e) { /* fresh start */ }
+function saveUnlocks() { localStorage.setItem('pocketPuttUnlocks', JSON.stringify(unlocks)); }
+function unlockedRewards(type) {
+  return Object.entries(ACHIEVEMENTS)
+    .filter(([k, a]) => unlocks.done[k] && a.reward.type === type)
+    .map(([k, a]) => a.reward);
+}
+function hasReward(type, id) { return unlockedRewards(type).some((r) => r.id === id); }
+
+function unlockAchievement(key) {
+  if (unlocks.done[key]) return;
+  unlocks.done[key] = true;
+  saveUnlocks();
+  const a = ACHIEVEMENTS[key];
+  mpShowBanner(`🏆 ${a.title} — ${a.reward.label} unlocked!`);
+  [880, 1108, 1318, 1760].forEach((f, i) => playTone({ freq: f, duration: 0.22, type: 'triangle', vol: 0.2, delay: i * 0.11 }));
+  if (MULTIPLAYER) buildCustomizeUI();
+}
+
+// Per-hole progress toward the sneakier achievements.
+const achvHole = { splashes: 0, clashes: 0 };
+function resetAchvHoleCounters() { achvHole.splashes = 0; achvHole.clashes = 0; }
+function achvOnSplash() { achvHole.splashes++; if (achvHole.splashes >= 3) unlockAchievement('pond3'); }
+function achvOnBounce() {
+  unlocks.counters.bounces++;
+  if (unlocks.counters.bounces % 10 === 0) saveUnlocks();
+  if (unlocks.counters.bounces >= 100) unlockAchievement('wall100');
+}
+
+// ---- Cosmetic style (persisted, applied in the lobby) ----
+let myStyle = { hue: null, special: null, trail: null };
+try {
+  const saved = JSON.parse(localStorage.getItem('pocketPuttStyle'));
+  if (saved) myStyle = saved;
+} catch (e) { /* default */ }
+// Never wear cosmetics this browser hasn't actually unlocked.
+if (myStyle.special && !hasReward('color', myStyle.special)) myStyle.special = null;
+if (myStyle.trail && !hasReward('trail', myStyle.trail)) myStyle.trail = null;
+function saveMyStyle() { localStorage.setItem('pocketPuttStyle', JSON.stringify(myStyle)); }
+function sendMyStyle() {
+  if (mpSocket && mpSocket.readyState === WebSocket.OPEN) {
+    mpSocket.send(JSON.stringify({
+      type: 'setStyle',
+      hue: myStyle.hue === null ? undefined : myStyle.hue,
+      special: myStyle.special,
+      trail: myStyle.trail,
+    }));
+  }
+}
+
+const SPECIAL_SWATCH_CSS = {
+  sunburst: 'radial-gradient(circle at 35% 35%, #ffe680, #f4a020)',
+  galaxy: 'radial-gradient(circle at 35% 35%, #6a4fc9, #191230)',
+};
+function buildCustomizeUI() {
+  const swatches = document.getElementById('color-swatches');
+  swatches.innerHTML = '';
+  const pick = (mut) => { mut(); saveMyStyle(); sendMyStyle(); buildCustomizeUI(); };
+  for (const hue of CLIENT_HUES) {
+    const b = document.createElement('button');
+    b.className = 'ball-swatch' + (myStyle.special === null && myStyle.hue === hue ? ' is-selected' : '');
+    b.style.background = `hsl(${hue}, 90%, 55%)`;
+    b.title = 'Ball color';
+    b.addEventListener('click', () => pick(() => { myStyle.hue = hue; myStyle.special = null; }));
+    swatches.appendChild(b);
+  }
+  for (const r of unlockedRewards('color')) {
+    const b = document.createElement('button');
+    b.className = 'ball-swatch' + (myStyle.special === r.id ? ' is-selected' : '');
+    b.style.background = SPECIAL_SWATCH_CSS[r.id];
+    b.title = r.label;
+    b.addEventListener('click', () => pick(() => { myStyle.special = r.id; }));
+    swatches.appendChild(b);
+  }
+  const trailRow = document.getElementById('trail-picker');
+  const trails = unlockedRewards('trail');
+  trailRow.classList.toggle('hidden', trails.length === 0);
+  trailRow.innerHTML = '';
+  if (trails.length) {
+    const none = document.createElement('button');
+    none.className = 'trail-chip' + (myStyle.trail === null ? ' is-selected' : '');
+    none.textContent = 'No trail';
+    none.addEventListener('click', () => pick(() => { myStyle.trail = null; }));
+    trailRow.appendChild(none);
+    for (const r of trails) {
+      const chip = document.createElement('button');
+      chip.className = 'trail-chip' + (myStyle.trail === r.id ? ' is-selected' : '');
+      chip.textContent = r.label;
+      chip.addEventListener('click', () => pick(() => { myStyle.trail = r.id; }));
+      trailRow.appendChild(chip);
+    }
+  }
+}
+
 // ---- Multiplayer (lobby) ----
 // Solo file:// play and the hosted multiplayer game are the same index.html/game.js —
 // this just detects which one we are and, in multiplayer mode, connects to the server's
@@ -1007,7 +1178,8 @@ function mpRenderLobby(msg) {
   for (const p of msg.players) {
     const li = document.createElement('li');
     if (!p.connected) li.classList.add('is-disconnected');
-    const dot = `<span class="hue-dot" style="color:hsl(${p.hue},85%,55%);background:hsl(${p.hue},85%,55%)"></span>`;
+    const dotBg = p.special ? SPECIAL_SWATCH_CSS[p.special] : `hsl(${p.hue},85%,55%)`;
+    const dot = `<span class="hue-dot" style="color:hsl(${p.hue},85%,55%);background:${dotBg}"></span>`;
     const hostTag = p.isHost ? '<span class="host-tag">Host</span>' : '';
     li.innerHTML = `${dot}<span>${p.name}</span>${hostTag}`;
     list.appendChild(li);
@@ -1036,14 +1208,33 @@ function mpConnect() {
       localStorage.setItem('pocketPuttReconnectToken', msg.reconnectToken);
       document.getElementById('lobby-join').classList.add('hidden');
       document.getElementById('lobby-joined').classList.remove('hidden');
+      document.getElementById('lobby-rename-input').value = localStorage.getItem('pocketPuttName') || '';
+      buildCustomizeUI();
+      sendMyStyle();
+    } else if (msg.type === 'notice') {
+      mpShowBanner(msg.text);
     } else if (msg.type === 'lobbyState') {
       mpRenderLobby(msg);
+      if (msg.state === 'WAITING_FOR_PLAYERS' && mpInRound) {
+        // Someone hit End Game — everyone back to the lobby.
+        mpInRound = false;
+        gameMenuEl.classList.add('hidden');
+        hud.classList.add('hidden');
+        Game.players.clear();
+        mpSnapBuffer = [];
+        mpClock = null;
+        mpCanPutt = false;
+        showScreen('screen-lobby');
+      }
     } else if (msg.type === 'roundState') {
       Game.currentHoleIndex = msg.holeIndex;
       Game.players.clear();
       mpSnapBuffer = [];
       mpClock = null;
       mpCanPutt = false;
+      resetAchvHoleCounters();
+      mpInRound = true;
+      gameMenuEl.classList.remove('hidden');
       hud.classList.remove('hidden');
       hideAllScreens();
     } else if (msg.type === 'snapshot') {
@@ -1074,6 +1265,8 @@ function mpRenderHoleResults(msg) {
     li.innerHTML = `<span class="standing-rank">${i + 1}</span><span>${s.name}</span><span class="standing-score">${s.totalScore.toFixed(1)}</span>`;
     standings.appendChild(li);
   });
+  const myResult = msg.results.find((r) => r.id === mpPlayerId);
+  if (myResult && !myResult.timedOut && myResult.finishSeconds < 5) unlockAchievement('speed5');
   const isLastHole = msg.holeIndex === HOLES.length - 1;
   document.getElementById('hole-results-next').textContent = isLastHole ? 'Final results coming up…' : 'Next hole starting soon…';
   showScreen('screen-hole-results');
@@ -1087,6 +1280,7 @@ function mpRenderFinalResults(msg) {
     li.innerHTML = `<span class="standing-rank">${i + 1}</span><span>${s.name}</span><span class="standing-score">${s.totalScore.toFixed(1)}</span>`;
     standings.appendChild(li);
   });
+  if (msg.standings.length > 1 && msg.standings[0].id === mpPlayerId) unlockAchievement('champ');
   document.getElementById('btn-play-again').classList.toggle('hidden', !mpIsHost);
   document.getElementById('final-waiting-text').classList.toggle('hidden', mpIsHost);
   hud.classList.add('hidden');
@@ -1188,6 +1382,17 @@ function mpInterpolateBalls() {
     meP.vx = Game.ball.vx;
     meP.vy = Game.ball.vy;
   }
+  // Collect unlockable-trail points from render positions (all balls, any client).
+  const nowT = performance.now();
+  for (const p of Game.players.values()) {
+    if (!p.trail) { p.trailPts = null; continue; }
+    if (!p.trailPts) p.trailPts = [];
+    const lastPt = p.trailPts[p.trailPts.length - 1];
+    if (!lastPt || Math.hypot(p.rx - lastPt.x, p.ry - lastPt.y) > 4) {
+      p.trailPts.push({ x: p.rx, y: p.ry, t: nowT });
+    }
+    while (p.trailPts.length && nowT - p.trailPts[0].t > 600) p.trailPts.shift();
+  }
   // Smooth timer between packets (also during 5Hz idle keepalives).
   setHudText(hudTotal, `Time: ${(mpEstimatedElapsedMs() / 1000).toFixed(1)}s`);
   // Prune history we can no longer render.
@@ -1224,17 +1429,23 @@ function mpHandleEvent(ev, hole) {
       if (mine) {
         soundWater();
         mpShowBanner('SPLASH! +1');
+        achvOnSplash();
       }
       break;
     case 'clash':
       // Ball-on-ball contact: everyone hears the clack and sees the sparks.
       playSfx('bounce', 0.7);
       spawnBoostSpark(ev.x, ev.y, Math.random() * Math.PI * 2);
+      if (ev.a === mpPlayerId || ev.b === mpPlayerId) {
+        achvHole.clashes++;
+        if (achvHole.clashes >= 5) unlockAchievement('menace');
+      }
       break;
     case 'holed': {
       spawnConfetti(hole.cup.x, hole.cup.y);
       const diff = ev.strokes - hole.par;
       soundHole(ev.strokes === 1 || diff <= -2);
+      if (mine && ev.strokes === 1) unlockAchievement('ace');
       if (mine) {
         mpShowBanner(ratingText(diff, ev.strokes));
       } else {
@@ -1251,6 +1462,34 @@ document.getElementById('btn-join').addEventListener('click', () => {
   const name = document.getElementById('lobby-name-input').value.trim() || 'Player';
   localStorage.setItem('pocketPuttName', name);
   mpSocket.send(JSON.stringify({ type: 'join', name }));
+});
+const gameMenuEl = document.getElementById('game-menu');
+let mpInRound = false;
+document.getElementById('btn-menu-restart').addEventListener('click', () => {
+  soundClick();
+  if (MULTIPLAYER) {
+    mpSocket.send(JSON.stringify({ type: 'restartGame' }));
+  } else {
+    startGame();
+  }
+});
+document.getElementById('btn-menu-end').addEventListener('click', () => {
+  soundClick();
+  if (MULTIPLAYER) {
+    mpSocket.send(JSON.stringify({ type: 'endGame' }));
+  } else {
+    gameMenuEl.classList.add('hidden');
+    hud.classList.add('hidden');
+    Game.state = 'START';
+    showScreen('screen-start');
+  }
+});
+document.getElementById('btn-rename').addEventListener('click', () => {
+  const name = document.getElementById('lobby-rename-input').value.trim();
+  if (!name) return;
+  localStorage.setItem('pocketPuttName', name);
+  mpSocket.send(JSON.stringify({ type: 'setName', name }));
+  soundClick();
 });
 document.getElementById('btn-start-round').addEventListener('click', () => {
   unlockAudio();

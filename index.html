@@ -6,6 +6,10 @@
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
+  <div id="game-menu" class="hidden">
+    <button id="btn-menu-restart" class="btn-small">↺ Restart Game</button>
+    <button id="btn-menu-end" class="btn-small btn-danger">✕ End Game</button>
+  </div>
   <div id="stage">
     <canvas id="game" width="800" height="500"></canvas>
 
@@ -40,6 +44,14 @@
       <div id="lobby-joined" class="hidden">
         <p class="lobby-url">Friends on this Wi-Fi, open: <strong id="lobby-join-url" title="Click to copy"></strong></p>
         <ul id="lobby-player-list"></ul>
+        <div id="lobby-customize">
+          <div class="customize-row">
+            <input id="lobby-rename-input" type="text" maxlength="20" autocomplete="off" placeholder="New name">
+            <button id="btn-rename" class="btn-small">Rename</button>
+          </div>
+          <div id="color-swatches" class="swatch-row"></div>
+          <div id="trail-picker" class="swatch-row hidden"></div>
+        </div>
         <button id="btn-start-round" class="hidden">Start Round ▶</button>
         <p id="lobby-waiting-text" class="hidden">Waiting for the host to start…</p>
       </div>

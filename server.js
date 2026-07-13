@@ -79,7 +79,7 @@ function makeId() { return crypto.randomUUID(); }
 
 function publicPlayerList() {
   return [...Lobby.players.values()].map((p) => ({
-    id: p.id, name: p.name, hue: p.hue, connected: p.connected, isHost: p.id === Lobby.hostPlayerId,
+    id: p.id, name: p.name, hue: p.hue, special: p.special || null, connected: p.connected, isHost: p.id === Lobby.hostPlayerId,
   }));
 }
 
@@ -174,6 +174,8 @@ function endHole() {
   broadcast({ type: 'holeResults', holeIndex: Lobby.currentHoleIndex, results, standings });
 
   setTimeout(() => {
+    // A restart/end-game may have changed the state while we showed results — stand down.
+    if (Lobby.state !== 'HOLE_RESULTS') return;
     if (Lobby.currentHoleIndex >= Shared.HOLES.length - 1) {
       Lobby.state = 'FINAL_RESULTS';
       broadcast({ type: 'finalResults', standings });
@@ -250,7 +252,7 @@ function tick() {
           const key = activeNow[i].id + '|' + activeNow[j].id;
           if (!clashedPairs.has(key)) {
             clashedPairs.add(key);
-            tickEvents.push({ kind: 'clash', x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
+            tickEvents.push({ kind: 'clash', a: activeNow[i].id, b: activeNow[j].id, x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
           }
         }
       }
@@ -291,6 +293,7 @@ function tick() {
         .filter((p) => p.connected && p.ball)
         .map((p) => ({
           id: p.id, name: p.name, hue: p.hue, isHost: p.id === Lobby.hostPlayerId,
+          special: p.special || null, trail: p.trail || null, styled: !!p.styled,
           x: r1(p.ball.x), y: r1(p.ball.y), vx: r1(p.ball.vx), vy: r1(p.ball.vy),
           strokes: p.strokes, holedOut: p.holedOut,
         })),
@@ -350,7 +353,7 @@ wss.on('connection', (ws, req) => {
       const id = makeId();
       const hue = PLAYER_HUES[Lobby.players.size % PLAYER_HUES.length];
       player = {
-        id, ws, name: (msg.name || 'Player').slice(0, 20), hue, connected: true, isLocal,
+        id, ws, name: (msg.name || 'Player').slice(0, 20), hue, special: null, trail: null, styled: false, connected: true, isLocal,
         reconnectToken: makeId(),
         strokes: 0, holedOut: false,
         ball: null,
@@ -372,10 +375,38 @@ wss.on('connection', (ws, req) => {
         player.name = msg.name.slice(0, 20);
         broadcastLobbyState();
       }
+    } else if (msg.type === 'setStyle') {
+      // Cosmetics chosen in the lobby (base hue, unlocked special skin, unlocked trail).
+      // Unlock legitimacy is client-side (localStorage achievements) — fine for LAN play.
+      if (player) {
+        if (typeof msg.hue === 'number' && msg.hue >= 0 && msg.hue < 360) {
+          player.hue = Math.round(msg.hue);
+          player.styled = true;
+        }
+        player.special = ['sunburst', 'galaxy'].includes(msg.special) ? msg.special : null;
+        if (player.special) player.styled = true;
+        player.trail = ['comet', 'fire', 'water', 'rainbow'].includes(msg.trail) ? msg.trail : null;
+        broadcastLobbyState();
+      }
     } else if (msg.type === 'startRound') {
       if (player && player.id === Lobby.hostPlayerId &&
           (Lobby.state === 'WAITING_FOR_PLAYERS' || Lobby.state === 'FINAL_RESULTS')) {
         startNewRound();
+      }
+    } else if (msg.type === 'restartGame') {
+      // Any player can restart mid-round — party rules.
+      if (player && Lobby.state !== 'WAITING_FOR_PLAYERS') {
+        broadcast({ type: 'notice', text: `${player.name} restarted the game` });
+        startNewRound();
+      }
+    } else if (msg.type === 'endGame') {
+      // Any player can end the round and send everyone back to the lobby.
+      if (player && Lobby.state !== 'WAITING_FOR_PLAYERS') {
+        Lobby.state = 'WAITING_FOR_PLAYERS';
+        Lobby.holeEnding = false;
+        for (const p of Lobby.players.values()) p.ball = null;
+        broadcast({ type: 'notice', text: `${player.name} ended the game` });
+        broadcastLobbyState();
       }
     } else if (msg.type === 'putt') {
       if (!player || Lobby.state !== 'PLAYING' || !player.ball || player.holedOut) return;
