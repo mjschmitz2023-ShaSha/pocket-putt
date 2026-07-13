@@ -11,6 +11,14 @@
 })(typeof self !== 'undefined' ? self : this, function () {
 
 // ---- Constants ----
+// Fixed sim rate shared by solo, multiplayer host, and (later) event-driven clients.
+// Wall clocks are only for scheduling/UI — physics and multiplayer time use integer ticks.
+const TICK_HZ = 60;
+const TICK_DT = 1 / TICK_HZ;
+const TICK_MS = 1000 / TICK_HZ;
+function tickToElapsedMs(tick) { return Math.round((tick * 1000) / TICK_HZ); }
+function elapsedMsToTick(ms) { return Math.round((ms * TICK_HZ) / 1000); }
+
 const LOGICAL_W = 800, LOGICAL_H = 500;
 const BALL_RADIUS = 7;
 const FRICTION_GRASS = 1.15;
@@ -441,6 +449,16 @@ function advanceHoleObstacles(hole, dt) {
   for (const g of hole.gates) g.phase += dt;
 }
 
+// Absolute obstacle pose from an integer sim tick. Multiplayer host and clients both use
+// this so windmills/pendulums never drift from each other (and never need mid-roll
+// obstacle snapshots that hard-reset phases and fork ball paths).
+function setHoleObstaclesAtTick(hole, tick) {
+  const t = tick * TICK_DT;
+  for (const wm of hole.windmills) wm.angle = wm.rotationSpeed * t;
+  for (const p of hole.pendulums) p.phase = t;
+  for (const g of hole.gates) g.phase = t;
+}
+
 function resetHoleObstacles(hole) {
   for (const wm of hole.windmills) wm.angle = 0;
   for (const p of hole.pendulums) p.phase = 0;
@@ -499,6 +517,7 @@ function computeLaunchVelocity(pointerVec) {
 }
 
 return {
+  TICK_HZ, TICK_DT, TICK_MS, tickToElapsedMs, elapsedMsToTick,
   LOGICAL_W, LOGICAL_H, BALL_RADIUS, FRICTION_GRASS, FRICTION_SAND, STOP_THRESHOLD,
   CUP_GRAVITY_RADIUS,
   WALL_RESTITUTION, BUMPER_RESTITUTION, PENDULUM_RESTITUTION, GATE_RESTITUTION,
@@ -507,7 +526,8 @@ return {
   getSlidingGateSegment, ringBumpers, pointInZone, zoneBounds,
   BOUNDARY_WALLS, HOLES,
   resolveWallCollision, getWindmillBlades,
-  createBallState, stepBallPhysics, advanceHoleObstacles, resetHoleObstacles, computeLaunchVelocity,
+  createBallState, stepBallPhysics, advanceHoleObstacles, setHoleObstaclesAtTick, resetHoleObstacles,
+  computeLaunchVelocity,
   resolveBallBallCollision, teePositionFor,
 };
 

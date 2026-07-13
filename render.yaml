@@ -1,0 +1,16 @@
+# Pocket Putt — Render Blueprint
+# Same pattern as Chess101's render.yaml: Blueprint auto-creates services from this file.
+# Deploy: Render dashboard → New → Blueprint → connect this GitHub repo.
+# Step-by-step: deploy/DEPLOY.md
+services:
+  - type: web
+    name: pocket-putt-server
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    # PORT is injected by Render — do not set it in the dashboard.
+    # Optional: set PUBLIC_URL in the dashboard after adding a custom domain
+    # (e.g. https://play.yourdomain.com) so lobby join links use that host.
+    # See deploy/DEPLOY.md.
