@@ -104,11 +104,15 @@
 }
 
 #editor-canvas {
+  position: absolute;
+  left: 0;
+  top: 0;
   display: block;
   width: 800px;
   height: 500px;
   touch-action: none;
   cursor: crosshair;
+  z-index: 0;
 }
 
 #editor-test-hud {
@@ -124,12 +128,57 @@
   background: linear-gradient(to bottom, rgba(0,0,0,0.5), transparent);
   pointer-events: none;
   text-shadow: 0 1px 2px #000;
+  z-index: 5;
 }
 
 #editor-test-hud .hint {
   font-weight: 500;
   opacity: 0.85;
   font-size: 11px;
+}
+
+/* Same escape hatch as the game — above canvas so clicks land on the button. */
+#editor-respawn-offer {
+  position: absolute;
+  left: 50%;
+  bottom: 22px;
+  transform: translateX(-50%);
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 14px 18px;
+  border-radius: 12px;
+  background: rgba(12, 18, 14, 0.88);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+  pointer-events: auto;
+}
+#editor-respawn-offer.hidden {
+  display: none !important;
+}
+#editor-respawn-offer p {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  opacity: 0.9;
+  color: #eef7ee;
+}
+#editor-respawn-offer button {
+  min-width: 160px;
+  padding: 8px 14px;
+  border-radius: 8px;
+  border: none;
+  font-size: 14px;
+  font-weight: 700;
+  cursor: pointer;
+  background: #3d8f5a;
+  color: #fff;
+  pointer-events: auto;
+}
+#editor-respawn-offer button:hover {
+  background: #48a86a;
 }
 
 #editor-power {

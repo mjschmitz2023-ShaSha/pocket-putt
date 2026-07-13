@@ -14,6 +14,7 @@
     computeLaunchVelocity, clampDragVector, stickyLaunchFactor, latchStickyAfterPutt, noteWetPutt,
     markWetFromWater, ballMayRestForAim, cupHasGravity,
     createSpeedAvgTracker, resetSpeedAvgTracker, noteSpeedSample, isQuasiRest, mayPuttBall,
+    speedAvg, QUASI_REST_WINDOW_S,
     getWindmillBlades, getPendulumSegment, getSlidingGateSegment,
     COURSES, zoneBounds, TICK_DT,
   } = S;
@@ -49,7 +50,15 @@
   const GHOST_TICKS_PER_FRAME = 48;
   /** Quasi-rest: allow putt if avg |v| stays near 0 for ~5s (stuck bumper chatter). */
   let testSpeedTracker = createSpeedAvgTracker();
+  /** 15s unsettled → emergency tee respawn (mirrors game). */
+  const EDITOR_RESPAWN_SEC = 15;
+  let testUnsettledSec = 0;
+  let testSettledSec = 0;
+  let testRespawnVisible = false;
+  let testRespawnDismissed = false;
   let lastTime = 0;
+  const editorRespawnEl = document.getElementById('editor-respawn-offer');
+  const btnEditorRespawn = document.getElementById('btn-editor-respawn');
   /** Fixed-step residual for Test physics (matches Shared.TICK_DT / game TICK_HZ). */
   let testPhysAcc = 0;
   let placeStart = null;
@@ -1159,11 +1168,12 @@
     testSpeedTracker = createSpeedAvgTracker();
     clearGhostTrajectory();
     testPhysAcc = 0;
+    resetEditorUnsettled();
     mode = 'test';
     testHud.classList.remove('hidden');
     document.getElementById('btn-test').classList.add('hidden');
     document.getElementById('btn-stop-test').classList.remove('hidden');
-    setStatus('Test mode — movers freeze only while dragging aim (ghost path)');
+    setStatus('Test mode — movers freeze while aiming · stuck: quasi-rest putt or 15s respawn');
   }
 
   function exitTest() {
@@ -1173,6 +1183,7 @@
     testBall = null;
     clearGhostTrajectory();
     testPhysAcc = 0;
+    resetEditorUnsettled();
     testHud.classList.add('hidden');
     powerEl.classList.add('hidden');
     document.getElementById('btn-test').classList.remove('hidden');
@@ -1183,17 +1194,59 @@
   document.getElementById('btn-test').addEventListener('click', enterTest);
   document.getElementById('btn-stop-test').addEventListener('click', exitTest);
 
+  function hideEditorRespawn() {
+    if (editorRespawnEl) editorRespawnEl.classList.add('hidden');
+    testRespawnVisible = false;
+  }
+  function showEditorRespawn() {
+    if (!editorRespawnEl || testRespawnVisible || testRespawnDismissed) return;
+    editorRespawnEl.classList.remove('hidden');
+    testRespawnVisible = true;
+    setStatus('Stuck? Respawn at tee, or wait for quasi-rest putt (~5s near-zero avg speed)');
+  }
+  function resetEditorUnsettled() {
+    testUnsettledSec = 0;
+    testSettledSec = 0;
+    testRespawnDismissed = false;
+    hideEditorRespawn();
+  }
+  function editorRespawnToTee() {
+    testDrag.active = false;
+    clearGhostTrajectory();
+    powerEl.classList.add('hidden');
+    testBall = createBallState(hole.tee);
+    testState = 'AIMING';
+    testSpeedTracker = createSpeedAvgTracker();
+    resetEditorUnsettled();
+    setStatus('Respawned at tee — aim and putt');
+  }
+  if (btnEditorRespawn) {
+    btnEditorRespawn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      editorRespawnToTee();
+    });
+    btnEditorRespawn.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+    });
+  }
+
   /** @returns {boolean} true if aim drag started (caller should capture pointer) */
   function handleTestPointerDown(p) {
+    const canPutt = mayPuttBall(testBall, hole, testSpeedTracker);
     if (testState !== 'AIMING') {
-      if (!mayPuttBall(testBall, hole, testSpeedTracker)) return false;
+      if (!canPutt) return false;
       testBall.vx = 0;
       testBall.vy = 0;
       testState = 'AIMING';
     }
-    if (Math.hypot(p.x - testBall.x, p.y - testBall.y) > 40) return false;
+    // Generous grab while quasi-rest (ball may have been jittering).
+    const grabR = isQuasiRest(testSpeedTracker) ? 80 : 48;
+    if (Math.hypot(p.x - testBall.x, p.y - testBall.y) > grabR) return false;
     testDrag.active = true;
     testDrag.pointerVec = { x: 0, y: 0 };
+    hideEditorRespawn();
     return true;
   }
   function handleTestPointerMove(p) {
@@ -1222,10 +1275,12 @@
     testBall.vy = launch.vy * factor;
     testBall.z = 0;
     testBall.vz = 0;
+    // Leave-to-rearm boosts: start stroke clean (pads re-arm after exit during coast).
     testBall.firedBoosts = new Set();
     testStrokes++;
     testState = 'BALL_MOVING';
     resetSpeedAvgTracker(testSpeedTracker);
+    resetEditorUnsettled();
     if (testStrokesEl) testStrokesEl.textContent = 'Strokes: ' + testStrokes;
   }
 
@@ -1320,15 +1375,19 @@
       if (!nearCup && (ballMayRestForAim(testBall, hole) || isQuasiRest(testSpeedTracker))) {
         testBall.vx = 0;
         testBall.vy = 0;
-        testBall.firedBoosts = new Set();
+        // Do NOT clear firedBoosts here — leave-to-rearm handles pads; clearing while
+        // still on a pad would re-fire immediately.
         testState = 'AIMING';
+        if (isQuasiRest(testSpeedTracker)) {
+          setStatus('Quasi-rest — ball was stuck; drag to putt');
+        }
       }
       // else stay BALL_MOVING (cup divot / gravity settle)
     } else if (isQuasiRest(testSpeedTracker)) {
       testBall.vx = 0;
       testBall.vy = 0;
-      testBall.firedBoosts = new Set();
       testState = 'AIMING';
+      setStatus('Quasi-rest — avg speed near 0 for ' + QUASI_REST_WINDOW_S + 's; drag to putt');
     }
   }
 
@@ -1340,8 +1399,9 @@
    */
   function updateTest(dt) {
     const hasGravity = (hole.gravityBodies || []).length > 0;
+    const clampedDt = Math.min(Math.max(dt, 0), 0.05); // avoid huge tab-blur samples
 
-    noteSpeedSample(testSpeedTracker, Math.hypot(testBall.vx || 0, testBall.vy || 0), dt);
+    noteSpeedSample(testSpeedTracker, Math.hypot(testBall.vx || 0, testBall.vy || 0), clampedDt);
 
     // Match game.js solo: wake when a field is yanking the ball (cannot rest/aim),
     // unless quasi-rest allows a stuck putt escape.
@@ -1365,14 +1425,32 @@
 
     if (testState === 'BALL_MOVING') {
       // Same order as game.js solo: obstacles then ball, using frame dt.
-      advanceHoleObstacles(hole, dt);
-      applyTestBallPhysics(dt);
+      advanceHoleObstacles(hole, clampedDt);
+      applyTestBallPhysics(clampedDt);
     } else if (testState === 'AIMING' && !freezeMovers) {
       // Ball at rest, not dragging — world keeps moving so timing is visible.
-      advanceHoleObstacles(hole, dt);
+      advanceHoleObstacles(hole, clampedDt);
     }
     // AIMING + testDrag.active: hold obstacle clock; keep extending ghost path.
     if (freezeMovers) updateTrajectory();
+
+    // 15s unsettled escape (same idea as game.js respawn offer).
+    const unsettled =
+      testState === 'BALL_MOVING' ||
+      (testState === 'AIMING' && !mayPuttBall(testBall, hole, testSpeedTracker));
+    if (unsettled && !testDrag.active) {
+      testUnsettledSec += clampedDt;
+      testSettledSec = 0;
+      if (testUnsettledSec >= EDITOR_RESPAWN_SEC) showEditorRespawn();
+    } else if (!unsettled) {
+      testSettledSec += clampedDt;
+      if (testSettledSec >= 0.45) {
+        if (testRespawnVisible || testUnsettledSec > 0) {
+          // Can putt again — drop offer (unless still dismissed flag from... we don't have dismiss)
+          resetEditorUnsettled();
+        }
+      }
+    }
   }
 
   function drawTest() {

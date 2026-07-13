@@ -1634,8 +1634,8 @@ function mpApplyAuthorityPose(p, b, hard) {
   // Absent wet on wire means dry (ballWire only sets the flag when true).
   p.wet = !!b.wet;
   p.wetStroke = !!b.wetStroke;
-  // Boost latch is per-stroke (cleared only on putt / BH). Never re-arm on rest snaps —
-  // that re-fires a pad under a settled ball and can soft/hard ping-pong forever.
+  // Boost latch is leave-to-rearm (cleared when ball exits pad). Wire must preserve
+  // firedBoosts while still on a pad — clearing on rest snaps re-fires and can loop.
   if (Array.isArray(b.firedBoosts)) {
     p.firedBoosts = new Set(b.firedBoosts.filter((i) => typeof i === 'number'));
   }

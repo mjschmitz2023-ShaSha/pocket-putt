@@ -1616,6 +1616,17 @@ function stepBallPhysics(ball, hole, dt) {
     // water, and the cup alike.
     if (ball.z > 0) continue;
 
+    // Boost pads: edge-triggered — fire on enter, re-arm when the ball fully leaves
+    // the pad (so loops/re-crosses work). Not once-per-putt. While still overlapping,
+    // stay latched so resting / soft snaps on the pad cannot re-fire every tick.
+    if (ball.firedBoosts && ball.firedBoosts.size) {
+      for (const bi of [...ball.firedBoosts]) {
+        const z = hole.boost[bi];
+        if (!z || !circleTouchesZone(ball.x, ball.y, BALL_RADIUS, z)) {
+          ball.firedBoosts.delete(bi);
+        }
+      }
+    }
     let inBoost = null;
     let inBoostIndex = -1;
     for (let bi = 0; bi < hole.boost.length; bi++) {
@@ -1625,7 +1636,6 @@ function stepBallPhysics(ball, hole, dt) {
         break;
       }
     }
-    // Each pad fires at most once per stroke (index-keyed so host/client agree).
     if (inBoost && !ball.firedBoosts.has(inBoostIndex)) {
       ball.vx += Math.cos(inBoost.angle) * inBoost.power;
       ball.vy += Math.sin(inBoost.angle) * inBoost.power;
