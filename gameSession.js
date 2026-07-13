@@ -645,8 +645,7 @@ class GameSession {
       const hole = this.currentHoles()[this.currentHoleIndex];
       const factor = Shared.stickyLaunchFactor(player.ball, hole);
       player.ball.firedBoosts = new Set();
-      // Latch to current goo patch (if any) so escape rolls on grass until exit —
-      // do NOT clear the latch or the next microstep re-applies sticky drag and forks.
+      // Goo stays sticky while inside the patch (no grass escape latch).
       Shared.latchStickyAfterPutt(player.ball, hole);
       player.ball.vx = launch.vx * factor;
       player.ball.vy = launch.vy * factor;

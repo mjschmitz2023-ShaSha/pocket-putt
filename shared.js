@@ -52,12 +52,13 @@ const RAMP_VZ_MIN = 260;
 const RAMP_VZ_MAX = 520;
 const RAMP_UPHILL_ACCEL = 900;
 const FRICTION_AIR = 0.1;
-// Sticky goo: drags a ball to a dead stop on entry; the escape putt leaves at reduced power.
-// Original design numbers (d7e080d) — intentionally harsher than sand so wide patches are
-// traps, not speed bumps. Multiplayer uses stuckStickyIndex + matched PHYSICS_SUBTICKS so
-// these values stay deterministic without softening the feel.
-// Escape latch: after a putt while sitting in goo, roll at grass friction until exit
-// (without the latch, no putt could ever cross a wide patch).
+// Sticky goo is *real surface*, not a temporary trap:
+//   - While the ball is inside a goo patch, FRICTION_STICKY always applies (even after a
+//     putt launched from inside). No grass "escape latch" — that made goo feel temporary.
+//   - When speed falls below STICKY_STOP_SPEED, velocity is zeroed (hard stick).
+//   - Putts from inside goo are also weakened by STICKY_LAUNCH_FACTOR.
+// Original numbers (d7e080d). stuckStickyIndex is bookkeeping (which patch last stuck us)
+// for wire/state; it does NOT disable sticky friction.
 const FRICTION_STICKY = 22;
 const STICKY_STOP_SPEED = 50;
 const STICKY_LAUNCH_FACTOR = 0.45;
@@ -591,9 +592,9 @@ const CANYON_HOLES = [
   },
 ];
 
-// Goo numbers: FRICTION_STICKY bleeds ~22 px/s of speed per px, so patches deeper than
-// ~45 px always trap a crossing ball; a ~20 px strip is a speed filter only max-power putts
-// punch through. Escape putts cap at MAX_LAUNCH_SPEED * 0.45 ≈ 427 (~370 px of reach).
+// Goo numbers: FRICTION_STICKY always applies inside a patch (crossing *and* escaping).
+// Deep patches always trap; thin strips (~20 px) can still be punched through at full power.
+// In-goo putts are 0.45× power and still fight sticky drag, so wide blobs need crawl-outs.
 const STICKY_HOLES = [
   {
     name: 'Welcome Mat', par: 2,
@@ -825,9 +826,9 @@ function getWindmillBlades(wm) {
 }
 
 // ---- Per-ball state and stepping (used by both solo game.js and the multiplayer server) ----
-// stuckStickyIndex: -1 = free / re-armed. >=0 = latched to hole.sticky[i] (escape uses grass
-// friction while still inside that patch). MUST be an index, never a zone object reference —
-// host and client each have their own hole.sticky arrays, so object identity never matches.
+// stuckStickyIndex: -1 = free / not stuck. >=0 = last patch that hard-stopped us (wire/state).
+// MUST be an index, never a zone object ref — host/client each have their own hole.sticky[].
+// Friction does NOT depend on this field: any ball inside goo always gets FRICTION_STICKY.
 function createBallState(tee) {
   return {
     x: tee.x, y: tee.y, vx: 0, vy: 0, z: 0, vz: 0,
@@ -845,10 +846,10 @@ function stickyIndexAt(ball, hole) {
   return -1;
 }
 
-// After a putt while sitting in goo: latch to that patch so the escape rolls on grass
-// friction until the ball leaves. Re-arms (index = -1) only once fully clear of goo.
+// Legacy no-op kept so putt sites stay call-compatible. Goo is always sticky while inside
+// the patch — we deliberately do NOT latch to grass friction on escape putts anymore.
 function latchStickyAfterPutt(ball, hole) {
-  ball.stuckStickyIndex = stickyIndexAt(ball, hole);
+  // no-op
 }
 
 // Advances one ball by dt against a hole's current obstacle positions. Mutates `ball` in
@@ -856,7 +857,7 @@ function latchStickyAfterPutt(ball, hole) {
 // react with sound/particles/scoring - this function itself never touches audio/DOM/score.
 //
 // CRITICAL for multiplayer: host and client must call this with the SAME dt schedule per
-// sim tick. Sticky latch thresholds are speed-based and fork hard if one side microsteps more.
+// sim tick. Sticky stop thresholds are speed-based and fork hard if one side microsteps more.
 function stepBallPhysics(ball, hole, dt) {
   let walls = BOUNDARY_WALLS.concat(hole.walls);
   for (const wm of hole.windmills) walls = walls.concat(getWindmillBlades(wm));
@@ -885,7 +886,6 @@ function stepBallPhysics(ball, hole, dt) {
     } else {
       const stickyIdx = stickyIndexAt(ball, hole);
       if (stickyIdx < 0) {
-        // Off the goo entirely: re-arm so the next patch entry traps again.
         ball.stuckStickyIndex = -1;
         for (const z of hole.sand) {
           if (circleTouchesZone(ball.x, ball.y, BALL_RADIUS, z)) {
@@ -894,12 +894,11 @@ function stepBallPhysics(ball, hole, dt) {
             break;
           }
         }
-      } else if (ball.stuckStickyIndex !== stickyIdx) {
-        // Entering goo (or a different patch) without a latch — sticky drag.
+      } else {
+        // Inside goo: always sticky drag, including shots launched from within the patch.
         friction = FRICTION_STICKY;
         trappingIndex = stickyIdx;
       }
-      // stuckStickyIndex === stickyIdx: escape latch — grass friction until exit.
     }
     if (inSand && !inSandLastStep) events.enteredSand = true;
     inSandLastStep = inSand;
