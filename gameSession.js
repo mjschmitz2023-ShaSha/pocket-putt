@@ -10,6 +10,7 @@ const Shared = require('./shared.js');
 const TICK_HZ = Shared.TICK_HZ;
 const TICK_MS = Shared.TICK_MS;
 const TICK_DT = Shared.TICK_DT;
+const COURSES = Shared.COURSES;
 const HOLE_TIMEOUT_MS = Number(process.env.HOLE_TIMEOUT_MS) || 90000;
 const HOLE_TIMEOUT_TICKS = Math.round((HOLE_TIMEOUT_MS / 1000) * TICK_HZ);
 const HOLE_RESULTS_DELAY_MS = Number(process.env.HOLE_RESULTS_DELAY_MS) || 6000;
@@ -36,6 +37,7 @@ class GameSession {
     this.state = 'WAITING_FOR_PLAYERS';
     this.players = new Map();
     this.hostPlayerId = null;
+    this.courseIndex = 0;
     this.currentHoleIndex = 0;
     this.holeStartedAtMs = 0;
     this.simTick = 0;
@@ -67,10 +69,15 @@ class GameSession {
     return Shared.tickToElapsedMs(this.simTick);
   }
 
+  currentHoles() {
+    return COURSES[this.courseIndex].holes;
+  }
+
   roundStatePayload() {
-    const hole = Shared.HOLES[this.currentHoleIndex];
+    const hole = this.currentHoles()[this.currentHoleIndex];
     return {
       type: 'roundState',
+      courseIndex: this.courseIndex,
       holeIndex: this.currentHoleIndex,
       holeName: hole.name,
       par: hole.par,
@@ -112,6 +119,7 @@ class GameSession {
       type: 'lobbyState',
       state: this.state,
       players: this.publicPlayerList(),
+      courseIndex: this.courseIndex,
       joinUrl: this.joinUrl,
       joinUrlFallback: this.joinUrlFallback,
       roomCode: this.code,
@@ -143,7 +151,7 @@ class GameSession {
 
   beginHole(holeIndex) {
     this.currentHoleIndex = holeIndex;
-    const hole = Shared.HOLES[holeIndex];
+    const hole = this.currentHoles()[holeIndex];
     Shared.resetHoleObstacles(hole);
     const roster = [...this.players.values()];
     roster.forEach((p, i) => {
@@ -224,7 +232,7 @@ class GameSession {
       if (this._destroyed) return;
       // Restart/end may have changed state during the results delay.
       if (this.state !== 'HOLE_RESULTS') return;
-      if (this.currentHoleIndex >= Shared.HOLES.length - 1) {
+      if (this.currentHoleIndex >= this.currentHoles().length - 1) {
         this.state = 'FINAL_RESULTS';
         this.broadcastReliable({ type: 'finalResults', standings });
       } else {
@@ -234,7 +242,7 @@ class GameSession {
   }
 
   ballWire(p) {
-    return {
+    const wire = {
       id: p.id,
       name: p.name,
       hue: p.hue,
@@ -249,6 +257,12 @@ class GameSession {
       strokes: p.strokes,
       holedOut: p.holedOut,
     };
+    // Omit grounded z/vz to keep idle packets small.
+    if (p.ball.z > 0) {
+      wire.z = p.ball.z;
+      wire.vz = p.ball.vz;
+    }
+    return wire;
   }
 
   buildCorrection(events, opts) {
@@ -259,9 +273,10 @@ class GameSession {
       opts.hard !== undefined
         ? !!opts.hard
         : reason === 'resync' || reason === 'event' || reason === 'idle';
-    const hole = Shared.HOLES[this.currentHoleIndex];
+    const hole = this.currentHoles()[this.currentHoleIndex];
     const msg = {
       type: 'snapshot',
+      courseIndex: this.courseIndex,
       holeIndex: this.currentHoleIndex,
       tick: this.simTick,
       tickHz: TICK_HZ,
@@ -291,7 +306,7 @@ class GameSession {
     this.simTick += 1;
     this.touch();
 
-    const hole = Shared.HOLES[this.currentHoleIndex];
+    const hole = this.currentHoles()[this.currentHoleIndex];
     // Absolute obstacle pose from tick — same formula clients use.
     Shared.setHoleObstaclesAtTick(hole, this.simTick);
 
@@ -423,7 +438,7 @@ class GameSession {
       roomCode: this.code,
     });
     if (this.state === 'PLAYING') {
-      const hole = Shared.HOLES[this.currentHoleIndex];
+      const hole = this.currentHoles()[this.currentHoleIndex];
       if (!player.ball) {
         player.ball = Shared.createBallState(
           Shared.teePositionFor(this.players.size - 1, this.players.size, hole)
@@ -503,11 +518,29 @@ class GameSession {
       if (player.special) player.styled = true;
       player.trail = ['comet', 'fire', 'water', 'rainbow'].includes(msg.trail) ? msg.trail : null;
       this.broadcastLobbyState();
+    } else if (msg.type === 'selectCourse') {
+      if (
+        player.id === this.hostPlayerId &&
+        this.state === 'WAITING_FOR_PLAYERS' &&
+        typeof msg.courseIndex === 'number' &&
+        msg.courseIndex >= 0 &&
+        msg.courseIndex < COURSES.length
+      ) {
+        this.courseIndex = msg.courseIndex;
+        this.broadcastLobbyState();
+      }
     } else if (msg.type === 'startRound') {
       if (
         player.id === this.hostPlayerId &&
         (this.state === 'WAITING_FOR_PLAYERS' || this.state === 'FINAL_RESULTS')
       ) {
+        if (
+          typeof msg.courseIndex === 'number' &&
+          msg.courseIndex >= 0 &&
+          msg.courseIndex < COURSES.length
+        ) {
+          this.courseIndex = msg.courseIndex;
+        }
         this.startNewRound();
       }
     } else if (msg.type === 'restartGame') {
@@ -535,9 +568,14 @@ class GameSession {
       const clamped = Shared.clampDragVector(v);
       if (!clamped) return;
       const launch = Shared.computeLaunchVelocity(clamped);
+      const hole = this.currentHoles()[this.currentHoleIndex];
+      const factor = Shared.stickyLaunchFactor(player.ball, hole);
       player.ball.firedBoosts.clear();
-      player.ball.vx = launch.vx;
-      player.ball.vy = launch.vy;
+      player.ball.stuckTo = null;
+      player.ball.vx = launch.vx * factor;
+      player.ball.vy = launch.vy * factor;
+      player.ball.z = 0;
+      player.ball.vz = 0;
       player.strokes++;
       // One reliable event — no pose stream while the ball is rolling.
       this.broadcastReliable({
@@ -550,6 +588,8 @@ class GameSession {
         y: player.ball.y,
         vx: player.ball.vx,
         vy: player.ball.vy,
+        z: player.ball.z,
+        vz: player.ball.vz,
       });
     }
   }

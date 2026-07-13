@@ -29,15 +29,19 @@
 
     <div id="screen-start" class="screen">
       <h1>⛳ Pocket Putt</h1>
-      <p class="subtitle">A simple, super fun 19-hole mini golf game</p>
-      <p class="instructions">Click and drag back from the ball to aim, then release to putt.<br>Watch out for sand, water, windmills, pendulums, gates, and boost pads!</p>
+      <p class="subtitle">A simple, super fun mini golf game — three 19-hole courses</p>
+      <p class="instructions">Click and drag back from the ball to aim, then release to putt.<br>Watch out for sand, water, windmills, pendulums, gates, boost pads,<br>jump ramps, and sticky goo!</p>
+      <div class="course-row">
+        <label for="solo-course-select">Course</label>
+        <select id="solo-course-select"></select>
+      </div>
       <button id="btn-play">Play ▶</button>
     </div>
 
     <div id="screen-lobby" class="screen hidden">
       <h1>⛳ Pocket Putt — Multiplayer</h1>
       <div id="lobby-join">
-        <p id="lobby-subtitle" class="subtitle">Create a room and share the link or code with friends. Same 19 holes, heat by heat.</p>
+        <p id="lobby-subtitle" class="subtitle">Create a room and share the link or code with friends. Pick a course, then play heat by heat.</p>
         <input id="lobby-name-input" type="text" placeholder="Your name" maxlength="20" autocomplete="off">
         <div id="lobby-relay-actions">
           <button id="btn-create-room">Create Room</button>
@@ -51,6 +55,11 @@
       <div id="lobby-joined" class="hidden">
         <p class="lobby-url"><span id="lobby-join-label">Share with friends:</span> <strong id="lobby-join-url" title="Click to copy"></strong></p>
         <ul id="lobby-player-list"></ul>
+        <div class="course-row">
+          <label for="course-select">Course</label>
+          <select id="course-select"></select>
+          <span id="course-display" class="hidden"></span>
+        </div>
         <div id="lobby-customize">
           <div class="customize-row">
             <input id="lobby-rename-input" type="text" maxlength="20" autocomplete="off" placeholder="New name">
@@ -107,7 +116,7 @@
     </div>
   </div>
 
-  <script src="shared.js?v=coast2"></script>
-  <script src="game.js?v=coast2"></script>
+  <script src="shared.js?v=unify1"></script>
+  <script src="game.js?v=unify1"></script>
 </body>
 </html>

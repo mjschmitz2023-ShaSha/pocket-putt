@@ -100,13 +100,18 @@
   .par-pill[data-tier="standard"] { color: var(--standard); background: var(--standard-bg); }
   .par-pill[data-tier="long"] { color: var(--long); background: var(--long-bg); }
   canvas { display: block; width: 100%; height: auto; aspect-ratio: 8 / 5; margin: 0 auto 12px; padding: 0 12px; }
+  .course-heading {
+    max-width: 1360px; margin: 34px auto 0; padding: 0 24px;
+    font-size: 22px; font-weight: 800; letter-spacing: -0.01em;
+  }
+  code { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 0.92em; }
 </style>
 </head>
 <body>
   <header>
     <span class="eyebrow">Pocket Putt · Design Review</span>
     <h1>Course Atlas</h1>
-    <p class="sub">Top-down layout of all 19 holes, drawn to scale straight from the live game data — for spotting dead ends, blind loops, and holes that need more (or less) chaos.</p>
+    <p class="sub">Top-down layout of every course's holes, drawn to scale straight from the live game data (shared.js) — for spotting dead ends, blind loops, and holes that need more (or less) chaos. Query params: <code>?course=1</code> for a single course, <code>&amp;hole=7</code> for one hole at 2× scale.</p>
   </header>
   <div class="legend">
     <span><span class="swatch" style="background:#6b4a2b"></span>Wall</span>
@@ -114,170 +119,27 @@
     <span><span class="swatch" style="background:#dcc27a"></span>Sand</span>
     <span><span class="swatch" style="background:#3b82c4"></span>Water (+1 penalty)</span>
     <span><span class="swatch" style="background:linear-gradient(90deg,#8b2fd1,#2fd1c8)"></span>Boost pad</span>
+    <span><span class="swatch" style="background:linear-gradient(90deg,#8a6a3f,#e0c188)"></span>Ramp (jump)</span>
+    <span><span class="swatch" style="background:#d99a1f"></span>Sticky goo</span>
     <span><span class="swatch" style="background:#8a8a8a"></span>Windmill</span>
     <span><span class="swatch" style="background:#e6483f"></span>Pendulum</span>
     <span><span class="swatch" style="background:#c9a24b"></span>Sliding gate</span>
   </div>
-  <div class="grid" id="grid"></div>
+  <div id="courses"></div>
 
+<script src="shared.js"></script>
 <script>
-// ---- snapshot of hole data from game.js, for layout review only ----
-function wall(x1,y1,x2,y2,opts){ opts=opts||{}; return {x1,y1,x2,y2,bumper:!!opts.bumper}; }
-function sandRect(x1,y1,x2,y2){ return {shape:'rect',x1,y1,x2,y2}; }
-function waterRect(x1,y1,x2,y2,dropPoint){ return {shape:'rect',x1,y1,x2,y2,dropPoint}; }
-function boostRect(x1,y1,x2,y2,angle,power){ return {shape:'rect',x1,y1,x2,y2,angle,power}; }
-function pendulum(cx,cy,length,angleCenter,amplitude,period,phaseOffset){
-  return {cx,cy,length,angleCenter,amplitude,period,phase:phaseOffset||0};
-}
-function slidingGate(x1,y1,x2,y2,axis,amplitude,period,phaseOffset){
-  return {x1,y1,x2,y2,axis,amplitude,period,phase:phaseOffset||0};
-}
-function ringBumpers(cx,cy,r,n,gapIndex){
-  const walls=[];
-  for(let i=0;i<n;i++){
-    if(i===gapIndex) continue;
-    const a1=i*(2*Math.PI/n), a2=(i+1)*(2*Math.PI/n);
-    walls.push(wall(cx+Math.cos(a1)*r, cy+Math.sin(a1)*r, cx+Math.cos(a2)*r, cy+Math.sin(a2)*r, {bumper:true}));
-  }
-  return walls;
-}
-const BOUND = { left: 20, top: 20, right: 780, bottom: 480 };
-const BOUNDARY_WALLS = [
-  wall(BOUND.left, BOUND.top, BOUND.right, BOUND.top),
-  wall(BOUND.right, BOUND.top, BOUND.right, BOUND.bottom),
-  wall(BOUND.right, BOUND.bottom, BOUND.left, BOUND.bottom),
-  wall(BOUND.left, BOUND.bottom, BOUND.left, BOUND.top),
-];
+// Hole data, geometry, and physics constants come straight from the live game engine —
+// this page can never drift out of sync with what the game actually plays.
+const { COURSES, BOUNDARY_WALLS, LOGICAL_W, LOGICAL_H,
+        RAMP_GRAVITY, RAMP_VZ_SCALE, RAMP_VZ_MIN, RAMP_VZ_MAX, MAX_LAUNCH_SPEED } = window.Shared;
 
-const HOLES = [
-  { name: 'The Green Mile', par: 2,
-    tee: {x:90,y:250}, cup:{x:710,y:250,radius:11},
-    walls: [], sand: [ sandRect(300,320,400,400) ], water: [], boost: [], pendulums: [], gates: [], windmills: [] },
-  { name: 'Bumper Alley', par: 3,
-    tee: {x:70,y:250}, cup:{x:730,y:250,radius:11},
-    walls: [ wall(340,140,520,210,{bumper:true}), wall(340,360,520,290,{bumper:true}) ],
-    sand: [ sandRect(580,220,660,280) ], water: [], boost: [], pendulums: [], gates: [], windmills: [] },
-  { name: 'The Dogleg', par: 4,
-    tee: {x:60,y:60}, cup:{x:720,y:420,radius:11},
-    walls: [ wall(400,20,400,300) ],
-    sand: [ sandRect(320,320,420,390) ],
-    water: [ waterRect(60,400,220,460,{x:80,y:340}) ], boost: [], pendulums: [], gates: [], windmills: [] },
-  { name: 'Sandy Pass', par: 3,
-    tee: {x:70,y:250}, cup:{x:730,y:250,radius:11},
-    walls: [], sand: [ sandRect(350,150,500,350) ],
-    water: [ waterRect(340,60,510,130,{x:320,y:140}) ], boost: [], pendulums: [], gates: [], windmills: [] },
-  { name: "Water's Edge", par: 4,
-    tee: {x:70,y:250}, cup:{x:730,y:250,radius:11},
-    walls: [], sand: [ sandRect(580,340,680,430) ],
-    water: [ waterRect(380,20,420,320,{x:350,y:400}), waterRect(600,420,660,470,{x:580,y:400}) ],
-    boost: [], pendulums: [], gates: [], windmills: [] },
-  { name: 'Pinball Corner', par: 4,
-    tee: {x:60,y:60}, cup:{x:730,y:430,radius:11},
-    walls: [
-      wall(260,130,400,210,{bumper:true}),
-      wall(410,250,300,330,{bumper:true}),
-      wall(480,180,610,250,{bumper:true}),
-    ],
-    sand: [ sandRect(560,340,680,440) ],
-    water: [ waterRect(300,380,400,440,{x:260,y:340}) ],
-    boost: [ boostRect(60,90,150,150, Math.atan2(1,2), 600) ], pendulums: [], gates: [], windmills: [] },
-  { name: 'The Windmill', par: 5,
-    tee: {x:70,y:250}, cup:{x:730,y:250,radius:11},
-    walls: [], sand: [ sandRect(590,330,690,420) ],
-    water: [ waterRect(660,20,710,140,{x:640,y:160}), waterRect(660,360,710,480,{x:640,y:340}) ],
-    boost: [], pendulums: [], gates: [],
-    windmills: [ { cx:400, cy:250, armLength:90, blades:4 } ] },
-  { name: 'Serpentine', par: 4,
-    tee: {x:60,y:60}, cup:{x:730,y:430,radius:11},
-    walls: [ wall(260,20,260,320), wall(520,180,520,480) ],
-    sand: [ sandRect(280,340,380,440), sandRect(560,260,640,340) ],
-    water: [],
-    boost: [ boostRect(350,40,430,100, Math.PI/4, 700) ], pendulums: [], gates: [], windmills: [] },
-  { name: 'The Crater', par: 5,
-    tee: {x:60,y:60}, cup:{x:720,y:420,radius:11},
-    walls: [ wall(340,20,340,260), ...ringBumpers(720,420,55,8,4) ],
-    sand: [ sandRect(400,300,500,400) ],
-    water: [ waterRect(560,280,650,380,{x:540,y:320}) ],
-    boost: [ boostRect(580,390,640,450, 0, 500) ], pendulums: [], gates: [], windmills: [] },
-  { name: 'The Pendulum', par: 3,
-    tee: {x:70,y:250}, cup:{x:730,y:250,radius:11},
-    walls: [], sand: [ sandRect(620,300,700,370) ], water: [], boost: [], gates: [], windmills: [],
-    pendulums: [ pendulum(400,20,235,Math.PI/2,0.85,2.2) ] },
-  { name: 'Sliding Doors', par: 3,
-    tee: {x:70,y:250}, cup:{x:730,y:250,radius:11},
-    walls: [ wall(380,20,380,220), wall(380,280,380,480) ],
-    sand: [ sandRect(500,330,600,410) ], water: [], boost: [], pendulums: [], windmills: [],
-    gates: [ slidingGate(380,220,380,280,'y',70,2.0) ] },
-  { name: 'Twin Mills', par: 4,
-    tee: {x:60,y:60}, cup:{x:730,y:430,radius:11},
-    walls: [], sand: [ sandRect(420,250,500,320) ],
-    water: [ waterRect(600,380,680,450,{x:560,y:340}) ],
-    boost: [], pendulums: [], gates: [],
-    windmills: [
-      { cx:280, cy:170, armLength:70, blades:2 },
-      { cx:520, cy:330, armLength:70, blades:2 },
-    ] },
-  { name: 'The Gauntlet Gate', par: 4,
-    tee: {x:60,y:250}, cup:{x:730,y:430,radius:11},
-    walls: [
-      wall(300,20,300,200),
-      wall(300,280,300,480),
-      wall(520,20,520,320),
-      wall(520,400,520,480),
-    ],
-    sand: [ sandRect(360,300,460,400) ], water: [], boost: [], pendulums: [], windmills: [],
-    gates: [
-      slidingGate(300,200,300,280,'y',90,2.6,0),
-      slidingGate(520,320,520,400,'y',90,2.6,1.3),
-    ] },
-  { name: 'Whirlwind', par: 3,
-    tee: {x:70,y:250}, cup:{x:730,y:250,radius:11},
-    walls: [], sand: [], water: [], boost: [], pendulums: [], gates: [],
-    windmills: [ { cx:400, cy:250, armLength:130, blades:6 } ] },
-  { name: 'The Vault', par: 4,
-    tee: {x:60,y:60}, cup:{x:730,y:430,radius:11},
-    walls: [
-      wall(340,20,340,260),
-      wall(600,340,600,380),
-      wall(600,430,600,480),
-      ...ringBumpers(730,430,50,8,4),
-    ],
-    sand: [ sandRect(420,300,520,380) ],
-    water: [ waterRect(460,380,560,440,{x:420,y:340}) ],
-    boost: [], pendulums: [], windmills: [],
-    gates: [ slidingGate(600,380,600,430,'y',60,2.5) ] },
-  { name: 'Bar Fight', par: 3,
-    tee: {x:70,y:250}, cup:{x:730,y:250,radius:11},
-    walls: [], sand: [], water: [], boost: [], gates: [], windmills: [],
-    pendulums: [
-      pendulum(300,20,230,Math.PI/2,0.8,2.0,0),
-      pendulum(500,480,230,-Math.PI/2,0.8,2.0,1.0),
-    ] },
-  { name: 'Sand Trap Symphony', par: 3,
-    tee: {x:70,y:250}, cup:{x:730,y:250,radius:11},
-    walls: [],
-    sand: [ sandRect(250,180,340,320), sandRect(450,150,540,250), sandRect(550,300,650,420) ],
-    water: [], boost: [], pendulums: [], gates: [],
-    windmills: [ { cx:400, cy:400, armLength:60, blades:3 } ] },
-  { name: 'Drawbridge', par: 4,
-    tee: {x:70,y:250}, cup:{x:730,y:250,radius:11},
-    walls: [], sand: [ sandRect(580,340,680,430) ],
-    water: [ waterRect(370,20,450,215,{x:340,y:250}), waterRect(370,285,450,480,{x:340,y:250}) ],
-    boost: [ boostRect(240,212,310,248, 0, 650) ],
-    pendulums: [ pendulum(410,20,250,Math.PI/2,0.55,2.2) ],
-    windmills: [], gates: [] },
-  { name: 'The 19th Hole', par: 5,
-    tee: {x:60,y:60}, cup:{x:720,y:420,radius:11},
-    walls: [ wall(340,20,340,260), ...ringBumpers(720,420,55,8,4) ],
-    sand: [ sandRect(400,300,500,400) ],
-    water: [ waterRect(560,280,650,380,{x:540,y:320}) ],
-    boost: [ boostRect(580,390,640,450, 0, 500) ], pendulums: [], gates: [],
-    windmills: [ { cx:520, cy:200, armLength:80, blades:4 } ] },
-];
-
-const LOGICAL_W = 800, LOGICAL_H = 500;
-
-function zoneBounds(z){ return {x1:z.x1,y1:z.y1,x2:z.x2,y2:z.y2}; }
+// Horizontal carry distance for a ball entering a ramp at `speed` (matches stepBallPhysics:
+// vz = clamp(speed*scale, min, max), airtime = 2*vz/g, air drag ignored — close enough).
+function rampCarry(speed) {
+  const vz = Math.min(Math.max(speed * RAMP_VZ_SCALE, RAMP_VZ_MIN), RAMP_VZ_MAX);
+  return speed * (2 * vz / RAMP_GRAVITY);
+}
 
 function drawHole(ctx, hole, s) {
   ctx.clearRect(0,0,LOGICAL_W*s,LOGICAL_H*s);
@@ -298,6 +160,20 @@ function drawHole(ctx, hole, s) {
     ctx.beginPath(); ctx.arc(z.dropPoint.x*s, z.dropPoint.y*s, 4*s, 0, Math.PI*2); ctx.fill();
     ctx.fillStyle = '#3b82c4';
   }
+  // sticky goo
+  for (const z of hole.sticky) {
+    ctx.fillStyle = '#d99a1f';
+    ctx.fillRect(z.x1*s,z.y1*s,(z.x2-z.x1)*s,(z.y2-z.y1)*s);
+    // deterministic blob speckles so reloads look identical
+    ctx.fillStyle = 'rgba(120,70,10,0.45)';
+    const w = z.x2-z.x1, h = z.y2-z.y1;
+    const n = Math.max(4, Math.floor(w*h/2600));
+    for (let i=0;i<n;i++){
+      const fx = z.x1 + ((i*127.3+19)%97)/97*w;
+      const fy = z.y1 + ((i*311.7+53)%89)/89*h;
+      ctx.beginPath(); ctx.arc(fx*s, fy*s, (2.5+((i*7)%3))*s, 0, Math.PI*2); ctx.fill();
+    }
+  }
   // boost pads
   for (const z of hole.boost) {
     const grad = ctx.createLinearGradient(z.x1*s,z.y1*s,z.x2*s,z.y2*s);
@@ -315,6 +191,53 @@ function drawHole(ctx, hole, s) {
     ctx.lineTo(cx+dx-10*s*Math.cos(ang-0.4), cy+dy-10*s*Math.sin(ang-0.4));
     ctx.lineTo(cx+dx-10*s*Math.cos(ang+0.4), cy+dy-10*s*Math.sin(ang+0.4));
     ctx.closePath(); ctx.fillStyle='#fff'; ctx.fill();
+  }
+
+  // ramps — gradient wedge (dark = low edge, light = high edge/lip), arrow along launch
+  // angle, min entry speed, and a dashed flight corridor with carry ticks
+  for (const z of hole.ramps) {
+    const cx=(z.x1+z.x2)/2, cy=(z.y1+z.y2)/2;
+    const hw=(z.x2-z.x1)/2, hh=(z.y2-z.y1)/2;
+    const ext = Math.abs(Math.cos(z.angle))*hw + Math.abs(Math.sin(z.angle))*hh;
+    const dx=Math.cos(z.angle), dy=Math.sin(z.angle);
+    const grad = ctx.createLinearGradient((cx-dx*ext)*s,(cy-dy*ext)*s,(cx+dx*ext)*s,(cy+dy*ext)*s);
+    grad.addColorStop(0,'#8a6a3f'); grad.addColorStop(1,'#e0c188');
+    ctx.fillStyle = grad;
+    ctx.fillRect(z.x1*s,z.y1*s,(z.x2-z.x1)*s,(z.y2-z.y1)*s);
+    // lip line across the high edge
+    const lipX=cx+dx*ext, lipY=cy+dy*ext;
+    ctx.strokeStyle='#fff'; ctx.lineWidth=3*s; ctx.lineCap='round';
+    ctx.beginPath();
+    ctx.moveTo((lipX-dy*Math.min(hw,hh))*s,(lipY+dx*Math.min(hw,hh))*s);
+    ctx.lineTo((lipX+dy*Math.min(hw,hh))*s,(lipY-dx*Math.min(hw,hh))*s);
+    ctx.stroke();
+    // launch arrow
+    ctx.lineWidth=2*s;
+    ctx.beginPath(); ctx.moveTo(cx*s,cy*s); ctx.lineTo((cx+dx*26)*s,(cy+dy*26)*s); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo((cx+dx*32)*s,(cy+dy*32)*s);
+    ctx.lineTo((cx+dx*22-dy*6)*s,(cy+dy*22+dx*6)*s);
+    ctx.lineTo((cx+dx*22+dy*6)*s,(cy+dy*22-dx*6)*s);
+    ctx.closePath(); ctx.fillStyle='#fff'; ctx.fill();
+    // min entry speed label
+    ctx.fillStyle='rgba(0,0,0,0.65)';
+    ctx.font=`${9*s}px ui-monospace, Menlo, monospace`;
+    ctx.textAlign='center'; ctx.textBaseline='top';
+    ctx.fillText(`≥${z.minSpeed}`, cx*s, (Math.max(z.y1,z.y2)+3)*s);
+    // flight corridor: dashed line with carry ticks at min-speed and max-speed. Physics
+    // launches at first zone touch, so flight begins at the ENTRY (low) edge, not the lip.
+    const entryX=cx-dx*ext, entryY=cy-dy*ext;
+    ctx.strokeStyle='rgba(255,255,255,0.55)'; ctx.lineWidth=1.5*s; ctx.setLineDash([5*s,5*s]);
+    const carryMin = rampCarry(z.minSpeed), carryMax = rampCarry(MAX_LAUNCH_SPEED);
+    ctx.beginPath(); ctx.moveTo(entryX*s,entryY*s); ctx.lineTo((entryX+dx*carryMax)*s,(entryY+dy*carryMax)*s); ctx.stroke();
+    ctx.setLineDash([]);
+    for (const [carry,label] of [[carryMin,'min'],[carryMax,'max']]) {
+      const tx=entryX+dx*carry, ty=entryY+dy*carry;
+      ctx.beginPath(); ctx.moveTo((tx-dy*7)*s,(ty+dx*7)*s); ctx.lineTo((tx+dy*7)*s,(ty-dx*7)*s); ctx.stroke();
+      ctx.fillStyle='rgba(255,255,255,0.8)';
+      ctx.font=`${8*s}px ui-monospace, Menlo, monospace`;
+      ctx.fillText(label, tx*s, (ty+10)*s);
+    }
   }
 
   // walls (boundary + hole)
@@ -400,34 +323,54 @@ function drawHole(ctx, hole, s) {
 
 function parTier(par) { return par <= 3 ? 'easy' : par === 4 ? 'standard' : 'long'; }
 
-const grid = document.getElementById('grid');
-HOLES.forEach((hole, i) => {
-  const card = document.createElement('div');
-  card.className = 'card';
-  const s = 1;
-  const tags = [
-    hole.boost.length ? '<span class="tag">Boost</span>' : '',
-    hole.windmills.length ? `<span class="tag">${hole.windmills.length > 1 ? hole.windmills.length + ' windmills' : 'Windmill'}</span>` : '',
-    hole.pendulums.length ? `<span class="tag">${hole.pendulums.length > 1 ? hole.pendulums.length + ' pendulums' : 'Pendulum'}</span>` : '',
-    hole.gates.length ? '<span class="tag">Sliding gate</span>' : '',
-    hole.sand.length ? `<span class="tag">${hole.sand.length} sand</span>` : '',
-    hole.water.length ? `<span class="tag">${hole.water.length} water</span>` : '',
-  ].join('');
-  card.innerHTML = `
-    <div class="card-head">
-      <span class="hole-badge">${i + 1}</span>
-      <div class="card-title">
-        <h2>${hole.name}</h2>
-        <div class="card-tags">${tags}</div>
+const params = new URLSearchParams(location.search);
+const onlyCourse = params.has('course') ? Number(params.get('course')) : null;
+const onlyHole = params.has('hole') ? Number(params.get('hole')) : null; // 1-based
+
+const root = document.getElementById('courses');
+COURSES.forEach((course, ci) => {
+  if (onlyCourse !== null && ci !== onlyCourse) return;
+
+  const heading = document.createElement('h2');
+  heading.className = 'course-heading';
+  heading.textContent = `${ci}. ${course.name} — par ${course.holes.reduce((t, h) => t + h.par, 0)}`;
+  root.appendChild(heading);
+  const grid = document.createElement('div');
+  grid.className = 'grid';
+  root.appendChild(grid);
+
+  course.holes.forEach((hole, i) => {
+    if (onlyHole !== null && i !== onlyHole - 1) return;
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.id = `c${ci}h${i + 1}`;
+    const s = onlyHole !== null ? 2 : 1;
+    const tags = [
+      hole.ramps.length ? `<span class="tag">${hole.ramps.length > 1 ? hole.ramps.length + ' ramps' : 'Ramp'}</span>` : '',
+      hole.sticky.length ? `<span class="tag">${hole.sticky.length > 1 ? hole.sticky.length + ' goo' : 'Goo'}</span>` : '',
+      hole.boost.length ? '<span class="tag">Boost</span>' : '',
+      hole.windmills.length ? `<span class="tag">${hole.windmills.length > 1 ? hole.windmills.length + ' windmills' : 'Windmill'}</span>` : '',
+      hole.pendulums.length ? `<span class="tag">${hole.pendulums.length > 1 ? hole.pendulums.length + ' pendulums' : 'Pendulum'}</span>` : '',
+      hole.gates.length ? '<span class="tag">Sliding gate</span>' : '',
+      hole.sand.length ? `<span class="tag">${hole.sand.length} sand</span>` : '',
+      hole.water.length ? `<span class="tag">${hole.water.length} water</span>` : '',
+    ].join('');
+    card.innerHTML = `
+      <div class="card-head">
+        <span class="hole-badge">${i + 1}</span>
+        <div class="card-title">
+          <h2>${hole.name}</h2>
+          <div class="card-tags">${tags}</div>
+        </div>
+        <span class="par-pill" data-tier="${parTier(hole.par)}">PAR ${hole.par}</span>
       </div>
-      <span class="par-pill" data-tier="${parTier(hole.par)}">PAR ${hole.par}</span>
-    </div>
-  `;
-  const canvas = document.createElement('canvas');
-  canvas.width = LOGICAL_W*s; canvas.height = LOGICAL_H*s;
-  card.appendChild(canvas);
-  grid.appendChild(card);
-  drawHole(canvas.getContext('2d'), hole, s);
+    `;
+    const canvas = document.createElement('canvas');
+    canvas.width = LOGICAL_W*s; canvas.height = LOGICAL_H*s;
+    card.appendChild(canvas);
+    grid.appendChild(card);
+    drawHole(canvas.getContext('2d'), hole, s);
+  });
 });
 </script>
 </body>

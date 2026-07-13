@@ -42,6 +42,20 @@ const MIN_DRAG_DIST = 8;
 const POWER_MULTIPLIER = 6.5;
 const MAX_LAUNCH_SPEED = 950;
 const BOOST_MAX_SPEED = 1250;
+// Ramps: a ball rolling up the ramp fast enough launches airborne along the ramp's angle
+// (fake z-height — it flies over interior walls/hazards); slower balls stall on the slope
+// and roll back down.
+const RAMP_MIN_SPEED = 300;
+const RAMP_GRAVITY = 1400;
+const RAMP_VZ_SCALE = 0.55;
+const RAMP_VZ_MIN = 260;
+const RAMP_VZ_MAX = 520;
+const RAMP_UPHILL_ACCEL = 900;
+const FRICTION_AIR = 0.1;
+// Sticky goo: drags a ball to a dead stop on entry; the escape putt leaves at reduced power.
+const FRICTION_STICKY = 22;
+const STICKY_STOP_SPEED = 50;
+const STICKY_LAUNCH_FACTOR = 0.45;
 const BOUND = { left: 20, top: 20, right: 780, bottom: 480 };
 
 // ---- Small geometry / data helpers ----
@@ -52,6 +66,10 @@ function wall(x1, y1, x2, y2, opts) {
 function sandRect(x1, y1, x2, y2) { return { shape: 'rect', x1, y1, x2, y2 }; }
 function waterRect(x1, y1, x2, y2, dropPoint) { return { shape: 'rect', x1, y1, x2, y2, dropPoint }; }
 function boostRect(x1, y1, x2, y2, angle, power) { return { shape: 'rect', x1, y1, x2, y2, angle, power }; }
+function rampRect(x1, y1, x2, y2, angle, minSpeed) {
+  return { shape: 'rect', x1, y1, x2, y2, angle, minSpeed: minSpeed || RAMP_MIN_SPEED };
+}
+function stickyRect(x1, y1, x2, y2) { return { shape: 'rect', x1, y1, x2, y2 }; }
 function pendulum(cx, cy, length, angleCenter, amplitude, period, phaseOffset) {
   return { cx, cy, length, angleCenter, amplitude, period, phase: phaseOffset || 0 };
 }
@@ -340,6 +358,408 @@ const HOLES = [
   },
 ];
 
+// ---- Courses ----
+// Design numbers for jump holes: a rolling ball loses ~1.15 px/s of speed per px of grass,
+// and a ramp entered at speed v carries roughly 400→150, 500→200, 600→280, 700→390,
+// 800→500, 900+→700 px (launch fires at the ramp's ENTRY edge). Landings keep their
+// horizontal speed, so sand/goo pads downrange are the brakes.
+const CANYON_HOLES = [
+  {
+    name: 'First Flight', par: 2,
+    tee: { x: 80, y: 250 }, cup: { x: 700, y: 250, radius: 11 },
+    walls: [], sand: [],
+    water: [ waterRect(390, 140, 510, 360, { x: 240, y: 250 }) ],
+    boost: [], pendulums: [], gates: [], windmills: [],
+    ramps: [ rampRect(300, 200, 360, 300, 0) ],
+    sticky: [],
+  },
+  {
+    name: 'Over the Hedge', par: 3,
+    tee: { x: 70, y: 250 }, cup: { x: 720, y: 250, radius: 11 },
+    walls: [ wall(430, 120, 430, 380) ],
+    sand: [ sandRect(500, 190, 640, 310) ],
+    water: [], boost: [], pendulums: [], gates: [], windmills: [],
+    ramps: [ rampRect(280, 205, 340, 295, 0) ],
+    sticky: [],
+  },
+  {
+    name: 'Commitment', par: 3,
+    tee: { x: 70, y: 250 }, cup: { x: 710, y: 250, radius: 11 },
+    walls: [ wall(240, 140, 330, 205), wall(240, 360, 330, 295) ],
+    sand: [ sandRect(420, 160, 560, 340) ],
+    water: [], boost: [], pendulums: [], gates: [], windmills: [],
+    ramps: [ rampRect(330, 205, 390, 295, 0, 450) ],
+    sticky: [],
+  },
+  {
+    name: 'The Long Way', par: 4,
+    tee: { x: 70, y: 420 }, cup: { x: 720, y: 420, radius: 11 },
+    walls: [ wall(650, 160, 650, 370) ],
+    sand: [],
+    water: [ waterRect(260, 160, 620, 480, { x: 180, y: 420 }) ],
+    boost: [], pendulums: [], gates: [], windmills: [],
+    ramps: [ rampRect(190, 370, 250, 470, 0) ],
+    sticky: [],
+  },
+  {
+    name: 'Skee Ball', par: 3,
+    tee: { x: 70, y: 250 }, cup: { x: 680, y: 250, radius: 11 },
+    walls: [ ...ringBumpers(680, 250, 60, 8, 4) ],
+    sand: [],
+    water: [ waterRect(300, 60, 480, 170, { x: 240, y: 250 }), waterRect(300, 330, 480, 440, { x: 240, y: 250 }) ],
+    boost: [], pendulums: [], gates: [], windmills: [],
+    ramps: [ rampRect(340, 210, 400, 290, 0) ],
+    sticky: [],
+  },
+  {
+    name: 'Double Dare', par: 4,
+    tee: { x: 60, y: 250 }, cup: { x: 730, y: 250, radius: 11 },
+    walls: [], sand: [],
+    water: [ waterRect(310, 150, 410, 350, { x: 180, y: 250 }), waterRect(550, 150, 650, 350, { x: 430, y: 250 }) ],
+    boost: [], pendulums: [], gates: [], windmills: [],
+    ramps: [ rampRect(220, 205, 280, 295, 0), rampRect(460, 205, 520, 295, 0) ],
+    sticky: [],
+  },
+  {
+    name: 'Windmill Hop', par: 3,
+    tee: { x: 70, y: 250 }, cup: { x: 730, y: 250, radius: 11 },
+    walls: [],
+    sand: [ sandRect(560, 190, 660, 310) ],
+    water: [], boost: [], pendulums: [], gates: [],
+    windmills: [ { cx: 420, cy: 250, armLength: 90, blades: 4, rotationSpeed: 1.6, angle: 0 } ],
+    ramps: [ rampRect(280, 210, 340, 290, 0) ],
+    sticky: [],
+  },
+  {
+    name: 'The Moat', par: 3,
+    tee: { x: 70, y: 250 }, cup: { x: 640, y: 250, radius: 11 },
+    walls: [],
+    sand: [],
+    water: [
+      waterRect(520, 130, 760, 210, { x: 460, y: 250 }),
+      waterRect(520, 290, 760, 370, { x: 460, y: 250 }),
+      waterRect(520, 210, 570, 290, { x: 460, y: 250 }),
+      waterRect(710, 210, 760, 290, { x: 460, y: 250 }),
+    ],
+    boost: [], pendulums: [], gates: [], windmills: [],
+    ramps: [ rampRect(330, 210, 390, 290, 0) ],
+    // Goo island: landings come in hot (~600 px/s) and the goo stops them dead — with
+    // sand instead, every playable jump rolled off the far side into the moat.
+    sticky: [ stickyRect(575, 215, 705, 285) ],
+  },
+  {
+    name: 'Pinball Flight', par: 4,
+    tee: { x: 60, y: 60 }, cup: { x: 720, y: 430, radius: 11 },
+    walls: [ wall(560, 120, 660, 200, { bumper: true }), wall(150, 300, 250, 380, { bumper: true }) ],
+    sand: [ sandRect(540, 340, 660, 440) ],
+    water: [ waterRect(360, 200, 560, 360, { x: 300, y: 180 }) ],
+    boost: [], pendulums: [], gates: [], windmills: [],
+    ramps: [ rampRect(240, 90, 300, 170, Math.PI / 4) ],
+    sticky: [],
+  },
+  {
+    name: 'Halfpipe', par: 3,
+    tee: { x: 70, y: 440 }, cup: { x: 700, y: 120, radius: 11 },
+    walls: [],
+    sand: [ sandRect(620, 60, 760, 220) ],
+    water: [], boost: [],
+    pendulums: [ pendulum(350, 480, 180, -Math.PI / 2, 0.7, 2.0) ],
+    gates: [], windmills: [],
+    ramps: [ rampRect(560, 360, 620, 440, -Math.PI / 4) ],
+    sticky: [],
+  },
+  {
+    name: 'Gate Crasher', par: 3,
+    tee: { x: 70, y: 250 }, cup: { x: 730, y: 250, radius: 11 },
+    walls: [ wall(450, 20, 450, 200), wall(450, 300, 450, 480) ],
+    sand: [ sandRect(560, 200, 660, 300) ],
+    water: [ waterRect(480, 60, 560, 180, { x: 420, y: 120 }), waterRect(480, 320, 560, 440, { x: 420, y: 380 }) ],
+    boost: [], pendulums: [],
+    gates: [ slidingGate(450, 200, 450, 300, 'y', 100, 2.2) ],
+    windmills: [],
+    ramps: [ rampRect(300, 205, 360, 295, 0) ],
+    sticky: [],
+  },
+  {
+    name: 'Boost & Soar', par: 4,
+    tee: { x: 60, y: 250 }, cup: { x: 710, y: 100, radius: 11 },
+    walls: [],
+    sand: [ sandRect(640, 40, 760, 160) ],
+    water: [ waterRect(420, 300, 650, 470, { x: 380, y: 250 }) ],
+    boost: [ boostRect(140, 220, 220, 280, 0, 500) ],
+    pendulums: [], gates: [], windmills: [],
+    ramps: [ rampRect(300, 205, 360, 295, -0.35) ],
+    sticky: [],
+  },
+  {
+    name: 'Leap of Faith', par: 3,
+    tee: { x: 70, y: 250 }, cup: { x: 730, y: 250, radius: 11 },
+    walls: [],
+    sand: [ sandRect(580, 190, 680, 310) ],
+    water: [ waterRect(400, 20, 540, 230, { x: 340, y: 120 }), waterRect(400, 270, 540, 480, { x: 340, y: 380 }) ],
+    boost: [], pendulums: [], gates: [], windmills: [],
+    ramps: [ rampRect(260, 205, 320, 295, 0) ],
+    sticky: [],
+  },
+  {
+    name: 'Pendulum Vault', par: 4,
+    tee: { x: 70, y: 250 }, cup: { x: 730, y: 250, radius: 11 },
+    walls: [], sand: [], water: [], boost: [],
+    pendulums: [ pendulum(400, 20, 235, Math.PI / 2, 0.85, 2.2) ],
+    gates: [], windmills: [],
+    ramps: [ rampRect(250, 205, 310, 295, 0) ],
+    sticky: [ stickyRect(600, 200, 690, 300) ],
+  },
+  {
+    name: 'Twin Flyover', par: 4,
+    tee: { x: 60, y: 60 }, cup: { x: 720, y: 420, radius: 11 },
+    walls: [
+      wall(300, 20, 300, 180), wall(300, 260, 300, 480),
+      wall(540, 20, 540, 240), wall(540, 320, 540, 480),
+    ],
+    sand: [ sandRect(580, 320, 680, 440) ],
+    water: [], boost: [], pendulums: [],
+    gates: [
+      slidingGate(300, 180, 300, 260, 'y', 80, 2.4, 0),
+      slidingGate(540, 240, 540, 320, 'y', 80, 2.4, 1.2),
+    ],
+    windmills: [],
+    ramps: [ rampRect(180, 30, 240, 110, Math.PI / 6) ],
+    sticky: [],
+  },
+  {
+    name: 'Stepping Stones', par: 4,
+    tee: { x: 70, y: 250 }, cup: { x: 730, y: 250, radius: 11 },
+    walls: [],
+    sand: [ sandRect(395, 215, 445, 285), sandRect(535, 215, 585, 285) ],
+    water: [
+      waterRect(300, 100, 660, 210, { x: 150, y: 250 }),
+      waterRect(300, 290, 660, 400, { x: 150, y: 250 }),
+      waterRect(300, 210, 390, 290, { x: 150, y: 250 }),
+      waterRect(450, 210, 530, 290, { x: 150, y: 250 }),
+      waterRect(590, 210, 660, 290, { x: 150, y: 250 }),
+    ],
+    boost: [], pendulums: [], gates: [], windmills: [],
+    ramps: [ rampRect(210, 205, 270, 295, 0) ],
+    sticky: [],
+  },
+  {
+    name: 'Ricochet Range', par: 4,
+    tee: { x: 70, y: 100 }, cup: { x: 710, y: 440, radius: 11 },
+    walls: [ wall(640, 60, 720, 160, { bumper: true }) ],
+    sand: [ sandRect(650, 300, 760, 410) ],
+    water: [ waterRect(400, 40, 560, 160, { x: 350, y: 200 }) ],
+    boost: [], pendulums: [], gates: [], windmills: [],
+    ramps: [ rampRect(300, 60, 360, 140, 0) ],
+    sticky: [],
+  },
+  {
+    name: 'The Gauntlet', par: 4,
+    tee: { x: 60, y: 250 }, cup: { x: 730, y: 250, radius: 11 },
+    walls: [],
+    sand: [],
+    water: [ waterRect(470, 130, 590, 370, { x: 350, y: 250 }) ],
+    boost: [], pendulums: [], gates: [],
+    windmills: [ { cx: 250, cy: 250, armLength: 80, blades: 3, rotationSpeed: 2.2, angle: 0 } ],
+    ramps: [ rampRect(380, 205, 440, 295, 0) ],
+    sticky: [ stickyRect(620, 200, 700, 300) ],
+  },
+  {
+    name: 'Canyon Grande', par: 5,
+    tee: { x: 60, y: 250 }, cup: { x: 730, y: 250, radius: 11 },
+    walls: [ ...ringBumpers(730, 250, 45, 8, 4) ],
+    sand: [],
+    water: [ waterRect(360, 20, 620, 480, { x: 220, y: 250 }) ],
+    boost: [ boostRect(120, 215, 190, 285, 0, 450) ],
+    pendulums: [], gates: [], windmills: [],
+    ramps: [ rampRect(260, 200, 330, 300, 0, 350) ],
+    sticky: [ stickyRect(625, 205, 680, 295) ],
+  },
+];
+
+// Goo numbers: FRICTION_STICKY bleeds ~22 px/s of speed per px, so patches deeper than
+// ~45 px always trap a crossing ball; a ~20 px strip is a speed filter only max-power putts
+// punch through. Escape putts cap at MAX_LAUNCH_SPEED * 0.45 ≈ 427 (~370 px of reach).
+const STICKY_HOLES = [
+  {
+    name: 'Welcome Mat', par: 2,
+    tee: { x: 80, y: 250 }, cup: { x: 700, y: 250, radius: 11 },
+    walls: [], sand: [], water: [], boost: [], pendulums: [], gates: [], windmills: [],
+    ramps: [],
+    sticky: [ stickyRect(360, 140, 440, 360) ],
+  },
+  {
+    name: 'The Brake Pad', par: 2,
+    tee: { x: 70, y: 250 }, cup: { x: 620, y: 250, radius: 11 },
+    walls: [], sand: [],
+    water: [ waterRect(680, 150, 760, 350, { x: 600, y: 250 }) ],
+    boost: [], pendulums: [], gates: [], windmills: [],
+    ramps: [],
+    sticky: [ stickyRect(520, 180, 580, 320) ],
+  },
+  {
+    name: 'Half Power', par: 2,
+    tee: { x: 70, y: 250 }, cup: { x: 560, y: 250, radius: 11 },
+    walls: [], sand: [], water: [], boost: [], pendulums: [], gates: [], windmills: [],
+    ramps: [],
+    sticky: [ stickyRect(300, 150, 420, 350) ],
+  },
+  {
+    name: 'Goo Corridors', par: 3,
+    tee: { x: 70, y: 250 }, cup: { x: 730, y: 250, radius: 11 },
+    walls: [], sand: [], water: [], boost: [], pendulums: [], gates: [], windmills: [],
+    ramps: [],
+    sticky: [ stickyRect(250, 20, 310, 330), stickyRect(450, 170, 510, 480) ],
+  },
+  {
+    name: 'The Filter', par: 3,
+    tee: { x: 70, y: 250 }, cup: { x: 720, y: 250, radius: 11 },
+    walls: [], sand: [], water: [], boost: [], pendulums: [], gates: [], windmills: [],
+    ramps: [],
+    sticky: [ stickyRect(400, 60, 420, 440) ],
+  },
+  {
+    name: 'Moat of Goo', par: 3,
+    tee: { x: 70, y: 250 }, cup: { x: 650, y: 250, radius: 11 },
+    walls: [], sand: [], water: [], boost: [], pendulums: [], gates: [], windmills: [],
+    ramps: [],
+    sticky: [ stickyRect(560, 160, 740, 340) ],
+  },
+  {
+    name: 'Boost Trap', par: 3,
+    tee: { x: 70, y: 250 }, cup: { x: 730, y: 250, radius: 11 },
+    walls: [], sand: [], water: [],
+    boost: [ boostRect(240, 220, 310, 280, 0, 600) ],
+    pendulums: [], gates: [], windmills: [],
+    ramps: [],
+    sticky: [ stickyRect(480, 180, 560, 320) ],
+  },
+  {
+    name: 'Sticky Windmill', par: 3,
+    tee: { x: 70, y: 250 }, cup: { x: 730, y: 250, radius: 11 },
+    walls: [], sand: [], water: [], boost: [], pendulums: [], gates: [],
+    windmills: [ { cx: 415, cy: 250, armLength: 85, blades: 3, rotationSpeed: 2.0, angle: 0 } ],
+    ramps: [],
+    sticky: [ stickyRect(380, 20, 450, 200), stickyRect(380, 300, 450, 480) ],
+  },
+  {
+    name: 'Pendulum Rescue', par: 3,
+    tee: { x: 70, y: 250 }, cup: { x: 730, y: 250, radius: 11 },
+    walls: [], sand: [], water: [], boost: [],
+    pendulums: [ pendulum(400, 20, 240, Math.PI / 2, 0.8, 2.0) ],
+    gates: [], windmills: [],
+    ramps: [],
+    sticky: [ stickyRect(340, 220, 460, 330) ],
+  },
+  {
+    name: 'The Narrows', par: 4,
+    tee: { x: 60, y: 60 }, cup: { x: 730, y: 430, radius: 11 },
+    walls: [ wall(260, 20, 260, 320), wall(520, 180, 520, 480) ],
+    sand: [], water: [], boost: [], pendulums: [], gates: [], windmills: [],
+    ramps: [],
+    sticky: [ stickyRect(270, 380, 380, 460), stickyRect(530, 50, 640, 120) ],
+  },
+  {
+    name: 'Gate & Goo', par: 3,
+    tee: { x: 70, y: 250 }, cup: { x: 730, y: 250, radius: 11 },
+    walls: [ wall(480, 20, 480, 200), wall(480, 300, 480, 480) ],
+    sand: [], water: [], boost: [], pendulums: [],
+    gates: [ slidingGate(480, 200, 480, 300, 'y', 90, 2.3) ],
+    windmills: [],
+    ramps: [],
+    sticky: [ stickyRect(370, 190, 450, 310) ],
+  },
+  {
+    name: 'Twin Ponds', par: 3,
+    tee: { x: 70, y: 250 }, cup: { x: 730, y: 250, radius: 11 },
+    walls: [], sand: [],
+    water: [ waterRect(360, 20, 560, 200, { x: 300, y: 250 }), waterRect(360, 300, 560, 480, { x: 300, y: 250 }) ],
+    boost: [], pendulums: [], gates: [], windmills: [],
+    ramps: [],
+    sticky: [ stickyRect(360, 200, 560, 300) ],
+  },
+  {
+    name: 'Sticky Shortcut', par: 4,
+    tee: { x: 60, y: 420 }, cup: { x: 720, y: 60, radius: 11 },
+    walls: [ wall(560, 20, 560, 300) ],
+    sand: [], water: [], boost: [], pendulums: [], gates: [], windmills: [],
+    ramps: [],
+    sticky: [ stickyRect(300, 180, 520, 420) ],
+  },
+  {
+    name: 'Honey Pot', par: 3,
+    tee: { x: 70, y: 250 }, cup: { x: 660, y: 250, radius: 11 },
+    walls: [ ...ringBumpers(660, 250, 70, 8, 4) ],
+    sand: [], water: [], boost: [], pendulums: [], gates: [], windmills: [],
+    ramps: [],
+    sticky: [ stickyRect(610, 215, 715, 285) ],
+  },
+  {
+    name: 'Minefield', par: 4,
+    tee: { x: 60, y: 250 }, cup: { x: 740, y: 250, radius: 11 },
+    walls: [], sand: [], water: [], boost: [], pendulums: [], gates: [], windmills: [],
+    ramps: [],
+    sticky: [
+      stickyRect(220, 120, 290, 190), stickyRect(300, 60, 370, 130),
+      stickyRect(400, 190, 460, 250), stickyRect(350, 300, 420, 370),
+      stickyRect(480, 120, 550, 190), stickyRect(560, 330, 630, 400),
+    ],
+  },
+  {
+    name: 'Ramp the Lagoon', par: 4,
+    tee: { x: 60, y: 250 }, cup: { x: 730, y: 250, radius: 11 },
+    walls: [], sand: [], water: [], boost: [], pendulums: [], gates: [], windmills: [],
+    ramps: [ rampRect(260, 205, 320, 295, 0) ],
+    sticky: [ stickyRect(360, 140, 600, 360) ],
+  },
+  {
+    name: 'Ledge Landing', par: 4,
+    tee: { x: 70, y: 250 }, cup: { x: 730, y: 250, radius: 11 },
+    walls: [], sand: [],
+    water: [ waterRect(310, 20, 450, 480, { x: 160, y: 250 }), waterRect(510, 60, 650, 440, { x: 480, y: 250 }) ],
+    boost: [], pendulums: [], gates: [], windmills: [],
+    ramps: [ rampRect(220, 205, 280, 295, 0) ],
+    sticky: [ stickyRect(450, 180, 510, 320) ],
+  },
+  {
+    name: 'Pinball Goo', par: 4,
+    tee: { x: 60, y: 60 }, cup: { x: 720, y: 420, radius: 11 },
+    walls: [ wall(300, 140, 420, 220, { bumper: true }), wall(480, 260, 600, 340, { bumper: true }) ],
+    sand: [],
+    water: [ waterRect(360, 380, 480, 460, { x: 320, y: 340 }) ],
+    boost: [], pendulums: [], gates: [], windmills: [],
+    ramps: [],
+    sticky: [ stickyRect(200, 300, 280, 380), stickyRect(620, 120, 700, 200) ],
+  },
+  {
+    name: 'The Final Boss', par: 5,
+    tee: { x: 60, y: 250 }, cup: { x: 730, y: 250, radius: 11 },
+    walls: [], sand: [],
+    water: [ waterRect(430, 130, 560, 370, { x: 310, y: 250 }) ],
+    boost: [],
+    pendulums: [ pendulum(650, 20, 180, Math.PI / 2, 0.75, 2.1) ],
+    gates: [],
+    windmills: [ { cx: 230, cy: 250, armLength: 70, blades: 4, rotationSpeed: 2.4, angle: 0 } ],
+    ramps: [ rampRect(340, 205, 400, 295, 0, 400) ],
+    sticky: [ stickyRect(590, 190, 670, 310) ],
+  },
+];
+
+const COURSES = [
+  { id: 'classic', name: 'Classic', holes: HOLES },
+  { id: 'canyon', name: 'Canyon Jumps', holes: CANYON_HOLES },
+  { id: 'goo', name: 'Goo Lagoon', holes: STICKY_HOLES },
+];
+
+// Classic's hole literals predate ramps/sticky — fill the two new arrays in one pass so the
+// "every hole carries every array" invariant keeps holding without editing 19 literals.
+for (const c of COURSES) {
+  for (const h of c.holes) {
+    h.ramps = h.ramps || [];
+    h.sticky = h.sticky || [];
+  }
+}
+
 // ---- Physics ----
 function resolveWallCollision(ball, w) {
   const dx = w.x2 - w.x1, dy = w.y2 - w.y1;
@@ -392,7 +812,7 @@ function getWindmillBlades(wm) {
 
 // ---- Per-ball state and stepping (used by both solo game.js and the multiplayer server) ----
 function createBallState(tee) {
-  return { x: tee.x, y: tee.y, vx: 0, vy: 0, squash: 0, spin: 0, angleDir: 0, firedBoosts: new Set() };
+  return { x: tee.x, y: tee.y, vx: 0, vy: 0, z: 0, vz: 0, squash: 0, spin: 0, angleDir: 0, firedBoosts: new Set(), stuckTo: null };
 }
 
 // Advances one ball by dt against a hole's current obstacle positions. Mutates `ball` in
@@ -407,12 +827,29 @@ function stepBallPhysics(ball, hole, dt) {
   const substeps = 4;
   const subDt = dt / substeps;
   let inSandLastStep = false;
-  const events = { holed: false, water: null, boosts: [], bounced: false, enteredSand: false };
+  const events = { holed: false, water: null, boosts: [], bounced: false, enteredSand: false, launched: false, landed: false, stuck: false };
 
   for (let s = 0; s < substeps; s++) {
+    const airborne = ball.z > 0;
     let friction = FRICTION_GRASS;
     let inSand = false;
-    for (const z of hole.sand) { if (circleTouchesZone(ball.x, ball.y, BALL_RADIUS, z)) { friction = FRICTION_SAND; inSand = true; break; } }
+    let trapZone = null; // sticky zone actively dragging the ball toward a dead stop
+    if (airborne) {
+      friction = FRICTION_AIR;
+    } else {
+      let stickyZone = null;
+      for (const z of hole.sticky) { if (circleTouchesZone(ball.x, ball.y, BALL_RADIUS, z)) { stickyZone = z; break; } }
+      if (!stickyZone) {
+        // Off the goo entirely: re-arm so the next patch entry (even this same one) traps again.
+        ball.stuckTo = null;
+        for (const z of hole.sand) { if (circleTouchesZone(ball.x, ball.y, BALL_RADIUS, z)) { friction = FRICTION_SAND; inSand = true; break; } }
+      } else if (ball.stuckTo !== stickyZone) {
+        friction = FRICTION_STICKY;
+        trapZone = stickyZone;
+      }
+      // stuckTo === stickyZone: the escape putt rolls at grass friction until it exits the
+      // patch — without this latch, no putt could ever cross a wide patch.
+    }
     if (inSand && !inSandLastStep) events.enteredSand = true;
     inSandLastStep = inSand;
 
@@ -420,7 +857,7 @@ function stepBallPhysics(ball, hole, dt) {
     const dcx = hole.cup.x - ball.x, dcy = hole.cup.y - ball.y;
     const dCup0 = Math.hypot(dcx, dcy);
     const speedNow = Math.hypot(ball.vx, ball.vy);
-    if (dCup0 < CUP_GRAVITY_RADIUS && dCup0 > 0.001 && speedNow < CUP_CAPTURE_MAX_SPEED) {
+    if (!airborne && dCup0 < CUP_GRAVITY_RADIUS && dCup0 > 0.001 && speedNow < CUP_CAPTURE_MAX_SPEED) {
       const pull = CUP_GRAVITY_PULL * (1 - dCup0 / CUP_GRAVITY_RADIUS);
       ball.vx += (dcx / dCup0) * pull * subDt;
       ball.vy += (dcy / dCup0) * pull * subDt;
@@ -431,17 +868,62 @@ function stepBallPhysics(ball, hole, dt) {
     ball.vy *= decay;
     // Rolling resistance at crawl speeds (outside the divot) so the ball settles fast
     // instead of trickling on forever.
-    if (dCup0 >= CUP_GRAVITY_RADIUS && Math.hypot(ball.vx, ball.vy) < LOW_SPEED_CUTOFF) {
+    if (!airborne && dCup0 >= CUP_GRAVITY_RADIUS && Math.hypot(ball.vx, ball.vy) < LOW_SPEED_CUTOFF) {
       const extra = Math.exp(-LOW_SPEED_DRAG * subDt);
       ball.vx *= extra;
       ball.vy *= extra;
     }
+    if (trapZone && Math.hypot(ball.vx, ball.vy) < STICKY_STOP_SPEED) {
+      ball.vx = 0;
+      ball.vy = 0;
+      ball.stuckTo = trapZone;
+      events.stuck = true;
+    }
     ball.x += ball.vx * subDt;
     ball.y += ball.vy * subDt;
 
-    for (const w of walls) {
+    if (airborne) {
+      ball.z += ball.vz * subDt;
+      ball.vz -= RAMP_GRAVITY * subDt;
+      if (ball.z <= 0) { ball.z = 0; ball.vz = 0; events.landed = true; }
+    }
+
+    // Airborne balls fly over interior walls and moving obstacles; only the perimeter
+    // fence is "tall" enough to knock them back in.
+    const wallList = ball.z > 0 ? BOUNDARY_WALLS : walls;
+    for (const w of wallList) {
       if (resolveWallCollision(ball, w)) events.bounced = true;
     }
+
+    if (ball.z <= 0) {
+      for (const z of hole.ramps) {
+        if (!circleTouchesZone(ball.x, ball.y, BALL_RADIUS, z)) continue;
+        // Launch only fires for balls moving UP the slope fast enough — the dot-product
+        // gate means a ball rolling back down (or crossing against the ramp's direction)
+        // can never launch.
+        const along = ball.vx * Math.cos(z.angle) + ball.vy * Math.sin(z.angle);
+        const speed = Math.hypot(ball.vx, ball.vy);
+        if (along > 0 && speed >= z.minSpeed) {
+          // Snap the direction fully to the ramp's angle so landing corridors are designable.
+          ball.vx = Math.cos(z.angle) * speed;
+          ball.vy = Math.sin(z.angle) * speed;
+          ball.vz = Math.min(Math.max(speed * RAMP_VZ_SCALE, RAMP_VZ_MIN), RAMP_VZ_MAX);
+          ball.z = 0.001;
+          ball.angleDir = z.angle;
+          events.launched = true;
+        } else {
+          // Constant downhill slope force: too-slow climbers stall AND roll back off the
+          // ramp (a ball can never come to rest on the slope).
+          ball.vx -= Math.cos(z.angle) * RAMP_UPHILL_ACCEL * subDt;
+          ball.vy -= Math.sin(z.angle) * RAMP_UPHILL_ACCEL * subDt;
+        }
+        break;
+      }
+    }
+
+    // Grounded-only interactions from here down: an airborne ball sails over boost pads,
+    // water, and the cup alike.
+    if (ball.z > 0) continue;
 
     let inBoost = null;
     for (const z of hole.boost) { if (circleTouchesZone(ball.x, ball.y, BALL_RADIUS, z)) { inBoost = z; break; } }
@@ -501,6 +983,9 @@ function resetHoleObstacles(hole) {
 // velocity component along the contact normal. Returns true when an impulse was applied
 // (i.e. a real hit, not just resting contact) so the caller can play a clack sound.
 function resolveBallBallCollision(a, b) {
+  // Airborne balls pass clean over grounded ones (and each other at different heights is
+  // close enough to never matter). `|| 0` guards older ball objects without a z field.
+  if ((a.z || 0) > 0 || (b.z || 0) > 0) return false;
   const dx = b.x - a.x, dy = b.y - a.y;
   const dist = Math.hypot(dx, dy);
   const minDist = BALL_RADIUS * 2;
@@ -538,6 +1023,17 @@ function teePositionFor(index, count, hole) {
   };
 }
 
+// Launch-power multiplier for a ball sitting in sticky goo — every launch site (server putt
+// handler, solo launch, client prediction) applies this identically so the authoritative and
+// predicted escape shots match. Deliberately keyed off position, not `stuckTo`, so even a
+// ball that rolled into goo and stopped short of "stuck" putts out weakened.
+function stickyLaunchFactor(ball, hole) {
+  for (const z of hole.sticky) {
+    if (circleTouchesZone(ball.x, ball.y, BALL_RADIUS, z)) return STICKY_LAUNCH_FACTOR;
+  }
+  return 1;
+}
+
 // Given a raw drag vector (pull-back from the ball), returns the launch velocity. Shared so
 // the server can independently (and authoritatively) recompute it from a client's raw drag
 // rather than ever trusting a client-sent speed.
@@ -563,12 +1059,14 @@ return {
   CUP_GRAVITY_RADIUS,
   WALL_RESTITUTION, BUMPER_RESTITUTION, PENDULUM_RESTITUTION, GATE_RESTITUTION,
   MAX_DRAG_DIST, MIN_DRAG_DIST, POWER_MULTIPLIER, MAX_LAUNCH_SPEED, BOOST_MAX_SPEED, BOUND,
-  wall, sandRect, waterRect, boostRect, pendulum, getPendulumSegment, slidingGate,
+  RAMP_MIN_SPEED, RAMP_GRAVITY, RAMP_VZ_SCALE, RAMP_VZ_MIN, RAMP_VZ_MAX,
+  FRICTION_STICKY, STICKY_STOP_SPEED, STICKY_LAUNCH_FACTOR,
+  wall, sandRect, waterRect, boostRect, rampRect, stickyRect, pendulum, getPendulumSegment, slidingGate,
   getSlidingGateSegment, ringBumpers, pointInZone, circleTouchesZone, zoneBounds,
-  BOUNDARY_WALLS, HOLES,
+  BOUNDARY_WALLS, HOLES, COURSES,
   resolveWallCollision, getWindmillBlades,
   createBallState, stepBallPhysics, advanceHoleObstacles, setHoleObstaclesAtTick, resetHoleObstacles,
-  computeLaunchVelocity, clampDragVector,
+  computeLaunchVelocity, clampDragVector, stickyLaunchFactor,
   resolveBallBallCollision, teePositionFor,
 };
 
