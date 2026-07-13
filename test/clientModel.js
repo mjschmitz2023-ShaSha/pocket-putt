@@ -158,7 +158,10 @@ class ClientModel {
     if (typeof b.stuckStickyIndex === 'number') p.stuckStickyIndex = b.stuckStickyIndex;
     p.wet = !!b.wet;
     p.wetStroke = !!b.wetStroke;
-    if (Math.hypot(p.vx, p.vy) < STOP && p.z === 0) p.firedBoosts = new Set();
+    // Match game.js: boost latch is per-stroke only (not re-armed on rest snaps).
+    if (Array.isArray(b.firedBoosts)) {
+      p.firedBoosts = new Set(b.firedBoosts.filter((i) => typeof i === 'number'));
+    }
 
     const visGap = dist(visX, visY, p.x, p.y);
     const forceHard =

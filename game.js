@@ -1542,7 +1542,11 @@ function mpApplyAuthorityPose(p, b, hard) {
   // Absent wet on wire means dry (ballWire only sets the flag when true).
   p.wet = !!b.wet;
   p.wetStroke = !!b.wetStroke;
-  if (Math.hypot(p.vx, p.vy) < STOP_THRESHOLD && p.z === 0) p.firedBoosts = new Set();
+  // Boost latch is per-stroke (cleared only on putt / BH). Never re-arm on rest snaps —
+  // that re-fires a pad under a settled ball and can soft/hard ping-pong forever.
+  if (Array.isArray(b.firedBoosts)) {
+    p.firedBoosts = new Set(b.firedBoosts.filter((i) => typeof i === 'number'));
+  }
 
   const visGap = Math.hypot(visX - p.x, visY - p.y);
   // Hard / hole-out / catastrophic / already aligned → clean snap.

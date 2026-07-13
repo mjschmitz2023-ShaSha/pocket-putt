@@ -304,6 +304,10 @@ class GameSession {
       // Index latch (not object ref) so clients keep escape-grass vs trap-sticky correct.
       stuckStickyIndex: typeof p.ball.stuckStickyIndex === 'number' ? p.ball.stuckStickyIndex : -1,
     };
+    // Per-stroke boost latch — clients must not re-arm on idle snaps while still on a pad.
+    if (p.ball.firedBoosts instanceof Set && p.ball.firedBoosts.size > 0) {
+      wire.firedBoosts = [...p.ball.firedBoosts];
+    }
     // Only send wet flags when armed (keeps idle packets small).
     if (p.ball.wet) {
       wire.wet = true;
