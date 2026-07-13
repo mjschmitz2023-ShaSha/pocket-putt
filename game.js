@@ -404,13 +404,10 @@ function updateBallPhysics(dt) {
     // On goo-guarded holes the magnet is off, so never hold the ball "live" near the cup.
     // Never freeze mid-air in a field, or when a moving well (moon) is pulling hard enough
     // that a "stationary" ball should start rolling again.
+    // Clean rest only → AIMING. Crawl/quasi-rest putts interrupt from handlePointerDown
+    // while still BALL_MOVING (do not freeze AIMING or gravity wake breaks).
     const nearCup = cupHasGravity(hole) && Math.hypot(Game.ball.x - hole.cup.x, Game.ball.y - hole.cup.y) < CUP_GRAVITY_RADIUS;
     if (!nearCup && ballMayRestForAim(Game.ball, hole)) {
-      Game.ball.vx = 0;
-      Game.ball.vy = 0;
-      Game.state = 'AIMING';
-    } else if (!nearCup && isQuasiRest(Game.speedTracker)) {
-      // Endless soft-bounce / crawl in a field: allow aim after sustained near-zero avg speed.
       Game.ball.vx = 0;
       Game.ball.vy = 0;
       Game.state = 'AIMING';
@@ -418,11 +415,6 @@ function updateBallPhysics(dt) {
       // Keep simulating (e.g. moon field just overlapped a resting ball).
       Game.state = 'BALL_MOVING';
     }
-  } else if (isQuasiRest(Game.speedTracker)) {
-    // Still slightly moving (e.g. bumper chatter) but avg |v| has been tiny for ~5s.
-    Game.ball.vx = 0;
-    Game.ball.vy = 0;
-    Game.state = 'AIMING';
   }
 }
 
@@ -1026,26 +1018,25 @@ function update(dt) {
   if (!MULTIPLAYER) {
     noteSpeedSample(Game.speedTracker, Math.hypot(Game.ball.vx, Game.ball.vy), dt);
   }
-  // Orbit: while AIMING, only wake physics when a field is actually yanking the ball
-  // and the player is not allowed to putt / not mid-drag. Never clear Game.drag.active
-  // on wake — that cancelled crawl/quasi-rest putts the frame after pointerdown.
+  // Orbit gravity wake vs aim:
+  // - AIMING without drag + field yank (!ballMayRestForAim) → BALL_MOVING (roll again)
+  // - drag.active = user is lining up a shot → hold still, never clear the drag
+  // "Can click the ball" (mayPuttBall) is independent and must NOT suppress wake.
   const hasGravity = (hole.gravityBodies || []).length > 0;
   if (Game.state === 'BALL_MOVING') {
     updateBallPhysics(dt);
+  } else if (Game.state === 'AIMING' && Game.drag.active) {
+    // Actively lining up: freeze pose for a clean aim (crawl/quasi-rest interrupt).
+    Game.ball.vx = 0;
+    Game.ball.vy = 0;
   } else if (
     Game.state === 'AIMING' &&
     !Game.drag.active &&
     hasGravity &&
-    !ballMayRestForAim(Game.ball, hole) &&
-    !mayPuttBall(Game.ball, hole, Game.speedTracker)
+    !ballMayRestForAim(Game.ball, hole)
   ) {
     Game.state = 'BALL_MOVING';
     updateBallPhysics(dt);
-  } else if (Game.state === 'AIMING' && (isQuasiRest(Game.speedTracker) || Game.drag.active)) {
-    if (!Game.drag.active) {
-      Game.ball.vx = 0;
-      Game.ball.vy = 0;
-    }
   }
   if (Game.state === 'HAZARD_RESET') {
     Game.hazardTimer -= dt;

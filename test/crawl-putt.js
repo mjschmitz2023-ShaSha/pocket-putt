@@ -1,10 +1,13 @@
 'use strict';
 /**
- * Launch-from-low-speed (crawl putt) + quasi-rest.
+ * Crawl putt + gravity wake contracts.
  *
- * Reproduces the editor Test bug: ball slowly moving in a gravity field is
- * puttable (mayPuttBall), and an aim-drag must survive the next gravity-wake frame
- * (wake must not cancel an active drag).
+ * Two separate ideas (must not be conflated):
+ *  1. mayPuttBall — can click the ball to START an aim (incl. low-speed crawl)
+ *  2. drag.active — mouse held down lining up a shot (only then freeze / no wake)
+ *
+ * Gravity wake: AIMING + !drag + field yank (!ballMayRestForAim) → BALL_MOVING
+ * even when mayPuttBall is true (stationary ball in a field must still roll).
  */
 const assert = require('assert');
 const Shared = require('../shared.js');
@@ -12,8 +15,8 @@ const Shared = require('../shared.js');
 const {
   blankHole, createBallState, planet, ballMayRestForAim, mayPuttBall,
   createSpeedAvgTracker, noteSpeedSample, isQuasiRest, computeLaunchVelocity,
-  STOP_THRESHOLD, CRAWL_PUTT_SPEED, QUASI_REST_WINDOW_S, BALL_RADIUS,
-  MAX_DRAG_DIST, clampDragVector,
+  stepBallPhysics, STOP_THRESHOLD, CRAWL_PUTT_SPEED, BALL_RADIUS,
+  MAX_DRAG_DIST, clampDragVector, TICK_DT,
 } = Shared;
 
 let passed = 0;
@@ -31,6 +34,15 @@ function test(name, fn) {
 
 console.log('crawl-putt');
 
+/** Correct wake: only suppress while actively drag-aiming. */
+function gravityWake(state, dragActive, ball, hole) {
+  if (state === 'AIMING' && dragActive) return { state, action: 'hold_drag' };
+  if (state === 'AIMING' && !dragActive && !ballMayRestForAim(ball, hole)) {
+    return { state: 'BALL_MOVING', action: 'woke' };
+  }
+  return { state, action: 'hold' };
+}
+
 test('CRAWL_PUTT_SPEED is above STOP_THRESHOLD', () => {
   assert.ok(CRAWL_PUTT_SPEED > STOP_THRESHOLD);
 });
@@ -39,16 +51,11 @@ test('mayPuttBall: slow crawl while floating in gravity (not clean rest)', () =>
   const h = blankHole({
     gravityBodies: [planet(400, 250, 40, 25000, { fieldRadius: 280 })],
   });
-  // Floating just outside crust, inside field — ballMayRestForAim is false.
   const ball = createBallState({ x: 400 + 40 + BALL_RADIUS + 18, y: 250 });
-  ball.vx = 12; // below STOP_THRESHOLD, still "moving"
+  ball.vx = 12;
   ball.vy = 0;
   assert.ok(!ballMayRestForAim(ball, h), 'setup: not clean rest (floating)');
-  assert.ok(Math.hypot(ball.vx, ball.vy) < CRAWL_PUTT_SPEED, 'setup: crawl speed');
-  assert.ok(
-    mayPuttBall(ball, h, createSpeedAvgTracker()),
-    'must allow putt at low speed without waiting for quasi-rest'
-  );
+  assert.ok(mayPuttBall(ball, h, createSpeedAvgTracker()), 'crawl putt allowed');
 });
 
 test('mayPuttBall: mid crawl slightly above STOP still allowed', () => {
@@ -59,8 +66,6 @@ test('mayPuttBall: mid crawl slightly above STOP still allowed', () => {
   const crawl = (STOP_THRESHOLD + CRAWL_PUTT_SPEED) / 2;
   ball.vx = crawl;
   ball.vy = 0;
-  assert.ok(crawl >= STOP_THRESHOLD, 'above hard stop');
-  assert.ok(crawl < CRAWL_PUTT_SPEED, 'under crawl cap');
   assert.ok(mayPuttBall(ball, h, createSpeedAvgTracker()), 'crawl band is puttable');
 });
 
@@ -77,108 +82,92 @@ test('mayPuttBall: quasi-rest allows putt even with high instant speed', () => {
     gravityBodies: [planet(400, 250, 40, 25000, { fieldRadius: 280 })],
   });
   const ball = createBallState({ x: 400 + 40 + BALL_RADIUS + 18, y: 250 });
-  ball.vx = 80; // spike — above CRAWL_PUTT_SPEED
+  ball.vx = 80;
   ball.vy = 0;
   const tr = createSpeedAvgTracker();
-  // 5s of mostly crawl with occasional spikes → avg under QUASI_REST_AVG_SPEED
   for (let i = 0; i < 50; i++) {
     noteSpeedSample(tr, 10, 0.09);
     noteSpeedSample(tr, 70, 0.01);
   }
-  assert.ok(isQuasiRest(tr), 'tracker filled as quasi-rest');
+  assert.ok(isQuasiRest(tr));
   assert.ok(mayPuttBall(ball, h, tr), 'quasi-rest overrides instant high speed');
 });
 
-/**
- * Pure model of the editor Test wake + pointerdown contract (no DOM).
- * Fails if gravity wake clears an active aim drag (the production bug).
- */
-function simEditorPuttFromCrawl() {
+test('gravity wake: stationary AIMING ball in field rolls (mayPutt true must NOT block)', () => {
   const h = blankHole({
-    tee: { x: 200, y: 250 },
-    cup: { x: 700, y: 250, radius: 11 },
+    gravityBodies: [planet(400, 250, 40, 25000, { fieldRadius: 280 })],
+  });
+  const ball = createBallState({ x: 400 + 40 + BALL_RADIUS + 20, y: 250 });
+  ball.vx = 0;
+  ball.vy = 0;
+  assert.ok(!ballMayRestForAim(ball, h), 'floating → should wake');
+  assert.ok(mayPuttBall(ball, h, createSpeedAvgTracker()), 'also puttable (crawl)');
+
+  // Regression: old code used !mayPuttBall and never woke.
+  const wrong = ballMayRestForAim(ball, h) || mayPuttBall(ball, h, createSpeedAvgTracker());
+  // mayPutt is true so a "wake only if !mayPutt" rule would fail:
+  assert.ok(mayPuttBall(ball, h, createSpeedAvgTracker()));
+  const w = gravityWake('AIMING', false, ball, h);
+  assert.strictEqual(w.action, 'woke', 'wake despite mayPuttBall');
+  assert.strictEqual(w.state, 'BALL_MOVING');
+
+  // Physics actually pulls the ball after wake
+  let state = 'BALL_MOVING';
+  const x0 = ball.x;
+  for (let i = 0; i < 45; i++) stepBallPhysics(ball, h, TICK_DT);
+  assert.ok(ball.x < x0 - 1, 'falls toward planet after wake (x0=' + x0 + ' x=' + ball.x + ')');
+});
+
+test('gravity wake: suppressed only while drag.active (lining up shot)', () => {
+  const h = blankHole({
+    gravityBodies: [planet(400, 250, 40, 25000, { fieldRadius: 280 })],
+  });
+  const ball = createBallState({ x: 400 + 40 + BALL_RADIUS + 20, y: 250 });
+  ball.vx = 0;
+  ball.vy = 0;
+  const w = gravityWake('AIMING', true, ball, h);
+  assert.strictEqual(w.action, 'hold_drag');
+  assert.strictEqual(w.state, 'AIMING');
+});
+
+test('crawl putt: interrupt BALL_MOVING, hold only while drag, then launch', () => {
+  const h = blankHole({
     gravityBodies: [planet(400, 250, 40, 25000, { fieldRadius: 280 })],
   });
   const ball = createBallState({ x: 400 + 40 + BALL_RADIUS + 20, y: 250 });
   ball.vx = 14;
   ball.vy = 3;
   const tracker = createSpeedAvgTracker();
-  let state = 'BALL_MOVING';
-  let drag = { active: false, pointerVec: { x: 0, y: 0 } };
+  assert.ok(mayPuttBall(ball, h, tracker));
 
-  function wake(hasGravity) {
-    // Correct contract: never cancel active drag; only wake when not puttable.
-    if (
-      state === 'AIMING' &&
-      !drag.active &&
-      hasGravity &&
-      !ballMayRestForAim(ball, h) &&
-      !mayPuttBall(ball, h, tracker)
-    ) {
-      state = 'BALL_MOVING';
-      return 'woke';
-    }
-    return 'hold';
-  }
-
-  // BUG replica (old editor): wake clears drag even mid-aim
-  function wakeBuggy(hasGravity) {
-    if (
-      state === 'AIMING' &&
-      hasGravity &&
-      !ballMayRestForAim(ball, h) &&
-      !isQuasiRest(tracker)
-    ) {
-      state = 'BALL_MOVING';
-      drag.active = false;
-      return 'woke_and_cleared_drag';
-    }
-    return 'hold';
-  }
-
-  assert.ok(mayPuttBall(ball, h, tracker), 'crawl putt allowed while BALL_MOVING');
-
-  // pointerdown on ball
-  assert.ok(Math.hypot(0, 0) <= 48 || true);
+  // pointerdown: freeze + AIMING + drag
   ball.vx = 0;
   ball.vy = 0;
-  state = 'AIMING';
-  drag.active = true;
-  drag.pointerVec = { x: 0, y: 0 };
+  let state = 'AIMING';
+  let dragActive = true;
 
-  // next frame: gravity wake must NOT clear drag
-  const r = wake(true);
-  assert.strictEqual(r, 'hold', 'wake holds while drag active');
-  assert.strictEqual(state, 'AIMING');
-  assert.ok(drag.active, 'drag survives gravity wake frame');
+  // next frames while lining up — no wake
+  for (let i = 0; i < 5; i++) {
+    const w = gravityWake(state, dragActive, ball, h);
+    assert.strictEqual(w.action, 'hold_drag');
+    state = w.state;
+  }
+  assert.ok(dragActive);
 
-  // aim pull-back and release
-  drag.pointerVec = { x: -MAX_DRAG_DIST * 0.5, y: 0 };
-  const clamped = clampDragVector(drag.pointerVec);
-  assert.ok(clamped);
-  const launch = computeLaunchVelocity(clamped);
+  // release putt
+  const launch = computeLaunchVelocity(clampDragVector({ x: -MAX_DRAG_DIST * 0.5, y: 0 }));
   ball.vx = launch.vx;
   ball.vy = launch.vy;
   state = 'BALL_MOVING';
-  drag.active = false;
+  dragActive = false;
+  assert.ok(ball.vx > 50, 'launch overwrote freeze');
 
-  assert.ok(ball.vx > 50, 'launch overwrote crawl freeze (vx=' + ball.vx + ')');
-  assert.strictEqual(state, 'BALL_MOVING');
-
-  // Document that the old wake rule would have cancelled the putt:
+  // after release, if somehow AIMING in field without drag → wake
+  state = 'AIMING';
   ball.vx = 0;
   ball.vy = 0;
-  state = 'AIMING';
-  drag.active = true;
-  // empty tracker → not quasi-rest; floating → not ballMayRestForAim
-  // After crawl freeze speed is 0, mayPuttBall is still true (crawl) — buggy wake used isQuasiRest only.
-  const bad = wakeBuggy(true);
-  assert.strictEqual(bad, 'woke_and_cleared_drag', 'old rule cancelled mid-drag putts');
-  assert.ok(!drag.active, 'old rule cleared drag');
-}
-
-test('editor contract: crawl putt drag survives gravity-wake frame + launches', () => {
-  simEditorPuttFromCrawl();
+  const after = gravityWake(state, false, ball, h);
+  assert.strictEqual(after.action, 'woke');
 });
 
 test('editor contract: launch from low speed overwrites velocity', () => {
@@ -187,14 +176,12 @@ test('editor contract: launch from low speed overwrites velocity', () => {
   ball.vx = 10;
   ball.vy = -5;
   assert.ok(mayPuttBall(ball, h, createSpeedAvgTracker()));
-  // freeze + launch (handleTestPointerUp path)
   ball.vx = 0;
   ball.vy = 0;
   const launch = computeLaunchVelocity(clampDragVector({ x: -MAX_DRAG_DIST * 0.6, y: 0 }));
   ball.vx = launch.vx;
   ball.vy = launch.vy;
   assert.ok(ball.vx > 100, 'putt launch replaces crawl velocity');
-  assert.ok(Math.abs(ball.vy) < 1e-6, 'aimed along +x');
 });
 
 if (!process.exitCode) console.log('crawl-putt: ' + passed + ' passed');

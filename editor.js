@@ -1369,26 +1369,19 @@
     }
     const speed = Math.hypot(testBall.vx, testBall.vy);
     if (speed < STOP_THRESHOLD) {
-      // Match game.js: keep simulating inside cup magnet or when a well is yanking.
+      // Clean rest only → AIMING. Do NOT force AIMING for quasi-rest/crawl: that
+      // conflated "can putt" with "frozen at rest" and blocked gravity wake.
+      // Crawl/quasi-rest putts interrupt BALL_MOVING from handleTestPointerDown.
       const nearCup =
         cupHasGravity(hole) &&
         Math.hypot(testBall.x - hole.cup.x, testBall.y - hole.cup.y) < CUP_GRAVITY_RADIUS;
-      if (!nearCup && (ballMayRestForAim(testBall, hole) || isQuasiRest(testSpeedTracker))) {
+      if (!nearCup && ballMayRestForAim(testBall, hole)) {
         testBall.vx = 0;
         testBall.vy = 0;
-        // Do NOT clear firedBoosts here — leave-to-rearm handles pads; clearing while
-        // still on a pad would re-fire immediately.
+        // Do NOT clear firedBoosts here — leave-to-rearm handles pads.
         testState = 'AIMING';
-        if (isQuasiRest(testSpeedTracker)) {
-          setStatus('Quasi-rest — ball was stuck; drag to putt');
-        }
       }
-      // else stay BALL_MOVING (cup divot / gravity settle)
-    } else if (isQuasiRest(testSpeedTracker)) {
-      testBall.vx = 0;
-      testBall.vy = 0;
-      testState = 'AIMING';
-      setStatus('Quasi-rest — avg speed near 0 for ' + QUASI_REST_WINDOW_S + 's; drag to putt');
+      // else stay BALL_MOVING (cup divot / gravity settle / crawl in field)
     }
   }
 
@@ -1404,28 +1397,25 @@
 
     noteSpeedSample(testSpeedTracker, Math.hypot(testBall.vx || 0, testBall.vy || 0), clampedDt);
 
-    // Gravity wake: only when NOT mid-aim-drag. Cancelling testDrag.active here was the
-    // bug that made low-speed / quasi-rest putts impossible — pointerdown entered AIMING,
-    // then the next frame re-woke BALL_MOVING and cleared the drag.
-    if (
+    // Gravity wake vs aim (same contract as game.js solo):
+    // - mayPuttBall ("can click to putt") does NOT suppress wake
+    // - only testDrag.active (mouse held, lining up) freezes the ball / movers
+    // - never clear testDrag.active on wake
+    if (testState === 'AIMING' && testDrag.active) {
+      testBall.vx = 0;
+      testBall.vy = 0;
+    } else if (
       testState === 'AIMING' &&
       !testDrag.active &&
       hasGravity &&
-      !ballMayRestForAim(testBall, hole) &&
-      !mayPuttBall(testBall, hole, testSpeedTracker)
+      !ballMayRestForAim(testBall, hole)
     ) {
       testState = 'BALL_MOVING';
       clearGhostTrajectory();
       powerEl.classList.add('hidden');
-    } else if (testState === 'AIMING' && (isQuasiRest(testSpeedTracker) || testDrag.active)) {
-      // Hold still while aiming (crawl putt / quasi-rest / active drag).
-      if (!testDrag.active) {
-        testBall.vx = 0;
-        testBall.vy = 0;
-      }
     }
 
-    // Freeze only while human is dragging aim (trajectory ghost), not all of AIMING.
+    // Freeze movers only while human is drag-aiming (ghost path), not whole AIMING rest.
     const freezeMovers = testState === 'AIMING' && testDrag.active;
 
     if (testState === 'BALL_MOVING') {
