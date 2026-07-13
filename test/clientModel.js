@@ -115,21 +115,27 @@ class ClientModel {
   applyAuthorityPose(p, b, hard) {
     const visX = p.rx;
     const visY = p.ry;
-    const d = dist(p.x, p.y, b.x, b.y);
+    const dBefore = dist(p.x, p.y, b.x, b.y);
     const moving = Math.hypot(b.vx || 0, b.vy || 0) >= STOP || Math.hypot(p.vx, p.vy) >= STOP;
+    const skipSimSnap = !hard && moving && dBefore < SOFT_ERR_PX * 2 && !b.holedOut;
 
-    p.strokes = b.strokes;
-    p.holedOut = !!b.holedOut;
-    p.x = b.x;
-    p.y = b.y;
-    p.vx = b.vx;
-    p.vy = b.vy;
-    p.z = b.z || 0;
-    p.vz = b.vz || 0;
-    if (typeof b.stuckStickyIndex === 'number') p.stuckStickyIndex = b.stuckStickyIndex;
-    if (Math.hypot(b.vx, b.vy) < STOP && p.z === 0) p.firedBoosts = new Set();
+    if (!skipSimSnap) {
+      p.strokes = b.strokes;
+      p.holedOut = !!b.holedOut;
+      p.x = b.x;
+      p.y = b.y;
+      p.vx = b.vx;
+      p.vy = b.vy;
+      p.z = b.z || 0;
+      p.vz = b.vz || 0;
+      if (typeof b.stuckStickyIndex === 'number') p.stuckStickyIndex = b.stuckStickyIndex;
+      if (Math.hypot(b.vx, b.vy) < STOP && p.z === 0) p.firedBoosts = new Set();
+    } else {
+      if (b.holedOut) p.holedOut = true;
+      if (typeof b.strokes === 'number' && b.strokes > p.strokes) p.strokes = b.strokes;
+    }
 
-    // Mirror game.js: while moving, prefer soft visual blend unless error is huge.
+    const d = skipSimSnap ? dBefore : dist(p.x, p.y, b.x, b.y);
     const forceHard =
       b.holedOut ||
       d >= HARD_ERR_PX ||
@@ -138,8 +144,8 @@ class ClientModel {
     if (forceHard) {
       p.errX = 0;
       p.errY = 0;
-      p.rx = b.x;
-      p.ry = b.y;
+      p.rx = p.x;
+      p.ry = p.y;
       this.metrics.hardSnaps++;
       if (moving && d > 0.5) {
         this.metrics.hardSnapsWhileMoving++;
@@ -151,15 +157,18 @@ class ClientModel {
         });
       }
     } else {
-      p.errX = visX - b.x;
-      p.errY = visY - b.y;
+      p.errX = visX - p.x;
+      p.errY = visY - p.y;
       const elen = Math.hypot(p.errX, p.errY);
       this.metrics.softApplies++;
       if (elen < SOFT_ERR_PX) {
         p.errX = 0;
         p.errY = 0;
-        p.rx = b.x;
-        p.ry = b.y;
+        p.rx = p.x;
+        p.ry = p.y;
+      } else {
+        p.rx = p.x + p.errX;
+        p.ry = p.y + p.errY;
       }
       if (elen > 2) {
         this.metrics.rubberBands.push({

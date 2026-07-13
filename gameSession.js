@@ -44,10 +44,12 @@ class GameSession {
     this.holeStartedAtMs = 0;
     this.simTick = 0;
     this.holeEnding = false;
+    this.holeEndingAtMs = 0;
+    this.holeResultsAtMs = 0;
     this.pendingEvents = [];
     this.wasIdle = false;
     this.lastActivity = Date.now();
-    this._holeAdvanceTimer = null;
+    this._holeAdvanceTimer = null; // legacy; progression is wall-clock in tickDriver
     this._destroyed = false;
   }
 
@@ -165,6 +167,8 @@ class GameSession {
     this.holeStartedAtMs = Date.now();
     this.simTick = 0;
     this.holeEnding = false;
+    this.holeEndingAtMs = 0;
+    this.holeResultsAtMs = 0;
     this.pendingEvents = [];
     this.wasIdle = false;
     this.state = 'PLAYING';
@@ -202,6 +206,9 @@ class GameSession {
   endHole() {
     if (this._destroyed) return;
     this.state = 'HOLE_RESULTS';
+    this.holeEnding = false;
+    this.holeEndingAtMs = 0;
+    this.holeResultsAtMs = Date.now();
     const connected = [...this.players.values()].filter((p) => p.connected);
     for (const p of connected) {
       const last = p.perHoleScores[p.perHoleScores.length - 1];
@@ -218,29 +225,34 @@ class GameSession {
         timedOut: last.timedOut,
       };
     });
-    const standings = connected
+    this._standingsSnapshot = connected
       .map((p) => ({ id: p.id, name: p.name, totalScore: p.totalScore }))
       .sort((a, b) => a.totalScore - b.totalScore);
     this.broadcastReliable({
       type: 'holeResults',
       holeIndex: this.currentHoleIndex,
       results,
-      standings,
+      standings: this._standingsSnapshot,
     });
+    // Next-hole / final advancement is driven by tickDriver wall clock (not setTimeout),
+    // so free-tier freezes or a blocked event loop can't drop the transition forever.
+  }
 
-    if (this._holeAdvanceTimer) clearTimeout(this._holeAdvanceTimer);
-    this._holeAdvanceTimer = setTimeout(() => {
-      this._holeAdvanceTimer = null;
-      if (this._destroyed) return;
-      // Restart/end may have changed state during the results delay.
-      if (this.state !== 'HOLE_RESULTS') return;
-      if (this.currentHoleIndex >= this.currentHoles().length - 1) {
-        this.state = 'FINAL_RESULTS';
-        this.broadcastReliable({ type: 'finalResults', standings });
-      } else {
-        this.beginHole(this.currentHoleIndex + 1);
-      }
-    }, HOLE_RESULTS_DELAY_MS);
+  /** Advance HOLE_RESULTS → next hole or FINAL_RESULTS once the results delay has elapsed. */
+  maybeAdvanceFromResults() {
+    if (this.state !== 'HOLE_RESULTS' || this._destroyed) return;
+    if (!this.holeResultsAtMs) return;
+    if (Date.now() - this.holeResultsAtMs < HOLE_RESULTS_DELAY_MS) return;
+    this.holeResultsAtMs = 0;
+    if (this.currentHoleIndex >= this.currentHoles().length - 1) {
+      this.state = 'FINAL_RESULTS';
+      this.broadcastReliable({
+        type: 'finalResults',
+        standings: this._standingsSnapshot || [],
+      });
+    } else {
+      this.beginHole(this.currentHoleIndex + 1);
+    }
   }
 
   ballWire(p) {
@@ -432,26 +444,37 @@ class GameSession {
       this.sendCorrectionNow([], { reason: 'idle', includeObstacles: true, hard: false });
     }
 
-    const allHoledOut = connected.length > 0 && connected.every((p) => p.holedOut);
+    // Treat ball-less connected players as done so a glitched join can't block forever.
+    const allHoledOut =
+      connected.length > 0 &&
+      connected.every((p) => p.holedOut || !p.ball);
     const timedOut = this.simTick >= HOLE_TIMEOUT_TICKS;
     if ((allHoledOut || timedOut) && !this.holeEnding) {
       this.holeEnding = true;
+      this.holeEndingAtMs = Date.now();
       if (timedOut) {
         for (const p of connected) {
           if (!p.holedOut) this.finishPlayerHole(p, true);
         }
       }
       this.sendCorrectionNow(this.pendingEvents, { reason: 'resync', includeObstacles: true, hard: true });
-      setTimeout(() => {
-        if (this._destroyed) return;
-        this.holeEnding = false;
-        this.endHole();
-      }, 1400);
     }
+    // Celebration pause then results — wall-clock in tickDriver (see maybeEndHoleAfterPause).
+  }
+
+  maybeEndHoleAfterPause() {
+    if (!this.holeEnding || this.state !== 'PLAYING' || this._destroyed) return;
+    if (!this.holeEndingAtMs) return;
+    if (Date.now() - this.holeEndingAtMs < 1400) return;
+    this.endHole();
   }
 
   tickDriver() {
-    if (this.state !== 'PLAYING' || this._destroyed) return;
+    if (this._destroyed) return;
+    // Always drive hole-results progression even when not PLAYING.
+    this.maybeEndHoleAfterPause();
+    this.maybeAdvanceFromResults();
+    if (this.state !== 'PLAYING') return;
     const wallTarget = Math.floor((Date.now() - this.holeStartedAtMs) / TICK_MS);
     let steps = 0;
     while (this.simTick < wallTarget && steps < MAX_CATCH_UP_TICKS) {
@@ -592,6 +615,8 @@ class GameSession {
       if (this.state !== 'WAITING_FOR_PLAYERS') {
         this.state = 'WAITING_FOR_PLAYERS';
         this.holeEnding = false;
+        this.holeEndingAtMs = 0;
+        this.holeResultsAtMs = 0;
         if (this._holeAdvanceTimer) {
           clearTimeout(this._holeAdvanceTimer);
           this._holeAdvanceTimer = null;

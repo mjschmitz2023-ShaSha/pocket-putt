@@ -1250,6 +1250,8 @@ let mpIsHost = false;
 let mpCanPutt = false;
 let mpPlaying = false;
 let mpRoomCode = null;
+// Frozen hole clock while results / lobby (hostTargetTick free-runs with wall time).
+let mpFrozenTimerMs = 0;
 // Local sim tick (integer). Host clock sample drives how far we may advance.
 let mpSimTick = 0;
 let mpHostTick = 0;
@@ -1450,6 +1452,7 @@ function mpConnect(opts = {}) {
       if (msg.state === 'WAITING_FOR_PLAYERS' && mpInRound) {
         mpInRound = false;
         mpPlaying = false;
+        mpFrozenTimerMs = 0;
         gameMenuEl.classList.add('hidden');
         hud.classList.add('hidden');
         Game.players.clear();
@@ -1459,14 +1462,20 @@ function mpConnect(opts = {}) {
     } else if (msg.type === 'roundState') {
       mpBeginHole(msg);
     } else if (msg.type === 'puttApplied') {
+      if (!mpPlaying) return; // ignore late putts while on results/lobby
       mpOnPuttApplied(msg);
     } else if (msg.type === 'snapshot') {
+      // Never resurrect "playing" from a stale snapshot during results — that left the
+      // timer free-running and blocked feeling like the next hole would never start.
+      if (!mpPlaying) return;
       mpApplyCorrection(msg);
     } else if (msg.type === 'holeResults') {
       mpPlaying = false;
+      mpFrozenTimerMs = mpEstimatedElapsedMs();
       mpRenderHoleResults(msg);
     } else if (msg.type === 'finalResults') {
       mpPlaying = false;
+      mpFrozenTimerMs = mpEstimatedElapsedMs();
       mpRenderFinalResults(msg);
     }
   });
@@ -1484,11 +1493,15 @@ function mpBeginHole(msg) {
   setHoleObstaclesAtTick(hole, startTick);
   mpCanPutt = false;
   mpPlaying = true;
+  mpFrozenTimerMs = 0;
   resetAchvHoleCounters();
   mpInRound = true;
   gameMenuEl.classList.remove('hidden');
   hud.classList.remove('hidden');
   hideAllScreens();
+  setHudText(hudTotal, `Time: 0.0s`);
+  setHudText(hudHole, `Hole ${msg.holeIndex + 1}/${currentHoles().length} — ${hole.name}`);
+  setHudText(hudPar, `Par ${hole.par}`);
 }
 
 function mpNoteHostTick(tick) {
@@ -1501,6 +1514,8 @@ function mpHostTargetTick() {
 }
 
 function mpEstimatedElapsedMs() {
+  // Between holes the host clock sample is frozen but wall time isn't — freeze the HUD.
+  if (!mpPlaying) return mpFrozenTimerMs;
   return tickToElapsedMs(Math.max(mpSimTick, mpHostTargetTick()));
 }
 
@@ -1547,22 +1562,31 @@ function mpSyncSelfFromPlayer(p) {
 
 function mpApplyAuthorityPose(p, b, hard) {
   const visX = p.rx, visY = p.ry;
-  const dist = Math.hypot((p.x - b.x), (p.y - b.y));
-  const clientMoving = Math.hypot(p.vx, p.vy) >= STOP_THRESHOLD || Math.hypot(b.vx || 0, b.vy || 0) >= STOP_THRESHOLD;
-  p.strokes = b.strokes;
-  p.holedOut = !!b.holedOut;
-  p.x = b.x;
-  p.y = b.y;
-  p.vx = b.vx;
-  p.vy = b.vy;
-  p.z = b.z || 0;
-  p.vz = b.vz || 0;
-  if (typeof b.stuckStickyIndex === 'number') p.stuckStickyIndex = b.stuckStickyIndex;
-  if (Math.hypot(b.vx, b.vy) < STOP_THRESHOLD && p.z === 0) p.firedBoosts = new Set();
+  const distBefore = Math.hypot((p.x - b.x), (p.y - b.y));
+  const clientMoving =
+    Math.hypot(p.vx, p.vy) >= STOP_THRESHOLD || Math.hypot(b.vx || 0, b.vy || 0) >= STOP_THRESHOLD;
 
-  // Rubber-band guard: while the ball is still moving, prefer soft visual blend unless
-  // the error is huge or the ball is holed. Host `hard` still snaps sim state (x/y/v)
-  // above; this only protects the *render* pose (rx/ry).
+  // Soft + small error while coasting: leave sim alone (coast is truth until a real hard
+  // event). Overwriting x/v on every bounce soft-event was the "rubber band at putt start".
+  const skipSimSnap = !hard && clientMoving && distBefore < MP_SOFT_ERR_PX * 2 && !b.holedOut;
+  if (!skipSimSnap) {
+    p.strokes = b.strokes;
+    p.holedOut = !!b.holedOut;
+    p.x = b.x;
+    p.y = b.y;
+    p.vx = b.vx;
+    p.vy = b.vy;
+    p.z = b.z || 0;
+    p.vz = b.vz || 0;
+    if (typeof b.stuckStickyIndex === 'number') p.stuckStickyIndex = b.stuckStickyIndex;
+    if (Math.hypot(b.vx, b.vy) < STOP_THRESHOLD && p.z === 0) p.firedBoosts = new Set();
+  } else {
+    // Still adopt discrete flags that don't yank pose.
+    if (b.holedOut) p.holedOut = true;
+    if (typeof b.strokes === 'number' && b.strokes > p.strokes) p.strokes = b.strokes;
+  }
+
+  const dist = skipSimSnap ? distBefore : Math.hypot((p.x - b.x), (p.y - b.y));
   const forceHard =
     b.holedOut ||
     dist >= MP_HARD_ERR_PX ||
@@ -1571,18 +1595,22 @@ function mpApplyAuthorityPose(p, b, hard) {
   if (forceHard) {
     p.errX = 0;
     p.errY = 0;
-    p.rx = b.x;
-    p.ry = b.y;
+    p.rx = p.x;
+    p.ry = p.y;
     p.rz = p.z;
   } else {
-    p.errX = visX - b.x;
-    p.errY = visY - b.y;
+    // Keep visual continuous; error decays toward sim each frame.
+    p.errX = visX - p.x;
+    p.errY = visY - p.y;
     const elen = Math.hypot(p.errX, p.errY);
     if (elen < MP_SOFT_ERR_PX) {
       p.errX = 0;
       p.errY = 0;
-      p.rx = b.x;
-      p.ry = b.y;
+      p.rx = p.x;
+      p.ry = p.y;
+    } else {
+      p.rx = p.x + p.errX;
+      p.ry = p.y + p.errY;
     }
     p.rz = p.z;
   }
@@ -1747,7 +1775,8 @@ function mpStepOneTick() {
 
 function mpUpdateLocalSim(dt) {
   if (!mpPlaying) {
-    setHudText(hudTotal, `Time: ${(mpEstimatedElapsedMs() / 1000).toFixed(1)}s`);
+    // Frozen clock on results / between holes — do not free-run hostTargetTick.
+    setHudText(hudTotal, `Time: ${(mpFrozenTimerMs / 1000).toFixed(1)}s`);
     return;
   }
   const targetTick = mpHostTargetTick();
@@ -1794,7 +1823,8 @@ function mpApplyCorrection(msg) {
   const reason = msg.reason || 'heartbeat';
   // Trust host hard flag (idle keepalives / juice events are soft). Always hard on resync.
   const hard = reason === 'resync' ? true : !!msg.hard;
-  mpPlaying = true;
+  // Do NOT set mpPlaying here — only roundState / mpBeginHole starts a hole. Snapshots
+  // during holeEnding celebration stay in the active hole; after holeResults we ignore them.
   mpNoteHostTick(tick);
 
   if (msg.obstacles) {
