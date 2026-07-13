@@ -398,6 +398,34 @@ button:active {
   padding: 7px 16px;
 }
 
+/* Anchors use .btn-small but do not match the `button` selector — give them the same chrome. */
+a.btn-small {
+  display: inline-block;
+  font-family: inherit;
+  font-weight: 700;
+  border: none;
+  border-radius: 30px;
+  background: #f4c542;
+  color: #1b2a1f;
+  cursor: pointer;
+  text-decoration: none;
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.35);
+  transition: transform 0.08s ease, box-shadow 0.08s ease;
+  line-height: 1.2;
+}
+a.btn-small:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.4);
+  color: #1b2a1f;
+  text-decoration: none;
+}
+a.btn-small:active {
+  transform: translateY(0) scale(0.97);
+}
+a.btn-small:visited {
+  color: #1b2a1f;
+}
+
 .swatch-row {
   display: flex;
   flex-wrap: wrap;
