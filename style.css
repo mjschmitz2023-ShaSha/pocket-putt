@@ -244,6 +244,44 @@ button:active {
   gap: 14px;
 }
 
+.course-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.course-row label {
+  font-size: 13px;
+  font-weight: 600;
+  opacity: 0.85;
+}
+
+.course-row select {
+  font-family: inherit;
+  font-size: 14px;
+  padding: 8px 14px;
+  border-radius: 24px;
+  border: 1px solid rgba(255,255,255,0.25);
+  background: rgba(255,255,255,0.08);
+  color: #eef7ee;
+  cursor: pointer;
+}
+
+.course-row select:focus {
+  outline: 2px solid #f4c542;
+  outline-offset: 1px;
+}
+
+.course-row select option {
+  color: #1c2a20;
+}
+
+#course-display {
+  font-size: 14px;
+  font-weight: 700;
+  color: #f4c542;
+}
+
 .lobby-url {
   font-size: 13px;
   opacity: 0.85;

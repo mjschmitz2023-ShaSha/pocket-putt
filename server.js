@@ -67,6 +67,7 @@ const Lobby = {
   state: 'WAITING_FOR_PLAYERS', // WAITING_FOR_PLAYERS | PLAYING | HOLE_RESULTS | FINAL_RESULTS
   players: new Map(), // id -> PlayerSession
   hostPlayerId: null,
+  courseIndex: 0,
   currentHoleIndex: 0,
   holeStartedAtMs: 0,
   holeEnding: false,
@@ -74,6 +75,12 @@ const Lobby = {
   tickCounter: 0,
   wasIdle: false,
 };
+
+function currentHoles() { return Shared.COURSES[Lobby.courseIndex].holes; }
+
+function isValidCourseIndex(i) {
+  return Number.isInteger(i) && i >= 0 && i < Shared.COURSES.length;
+}
 
 function makeId() { return crypto.randomUUID(); }
 
@@ -95,7 +102,7 @@ function broadcast(msg) {
 }
 
 function broadcastLobbyState() {
-  broadcast({ type: 'lobbyState', state: Lobby.state, players: publicPlayerList(), joinUrl, joinUrlFallback });
+  broadcast({ type: 'lobbyState', state: Lobby.state, players: publicPlayerList(), courseIndex: Lobby.courseIndex, joinUrl, joinUrlFallback });
 }
 
 // Keeps hostPlayerId valid at all times. Priority: a connected player on the server's own
@@ -117,7 +124,7 @@ function ensureHost() {
 // ---- Round / hole progression (all 19 holes, per-hole heats) ----
 function beginHole(holeIndex) {
   Lobby.currentHoleIndex = holeIndex;
-  const hole = Shared.HOLES[holeIndex];
+  const hole = currentHoles()[holeIndex];
   Shared.resetHoleObstacles(hole);
   // Line players up across the tee, perpendicular to the play line, with real spacing.
   // The line order rotates by one slot every hole so nobody keeps the center-line
@@ -135,7 +142,7 @@ function beginHole(holeIndex) {
   Lobby.tickCounter = 0;
   Lobby.wasIdle = false;
   Lobby.state = 'PLAYING';
-  broadcast({ type: 'roundState', holeIndex, holeName: hole.name, par: hole.par });
+  broadcast({ type: 'roundState', courseIndex: Lobby.courseIndex, holeIndex, holeName: hole.name, par: hole.par });
 }
 
 function startNewRound() {
@@ -174,7 +181,7 @@ function endHole() {
   broadcast({ type: 'holeResults', holeIndex: Lobby.currentHoleIndex, results, standings });
 
   setTimeout(() => {
-    if (Lobby.currentHoleIndex >= Shared.HOLES.length - 1) {
+    if (Lobby.currentHoleIndex >= currentHoles().length - 1) {
       Lobby.state = 'FINAL_RESULTS';
       broadcast({ type: 'finalResults', standings });
     } else {
@@ -199,7 +206,7 @@ function broadcastSnapshot(msg) {
 // ---- Authoritative tick loop ----
 function tick() {
   if (Lobby.state !== 'PLAYING') return;
-  const hole = Shared.HOLES[Lobby.currentHoleIndex];
+  const hole = currentHoles()[Lobby.currentHoleIndex];
   const dt = TICK_MS / 1000;
   Shared.advanceHoleObstacles(hole, dt);
 
@@ -227,6 +234,9 @@ function tick() {
         tickEvents.push({ id: p.id, kind: 'sand' });
       }
       for (const z of events.boosts) tickEvents.push({ id: p.id, kind: 'boost', x: p.ball.x, y: p.ball.y, angle: p.ball.angleDir });
+      if (events.launched) tickEvents.push({ id: p.id, kind: 'ramp', x: p.ball.x, y: p.ball.y, angle: p.ball.angleDir });
+      if (events.landed) tickEvents.push({ id: p.id, kind: 'land', x: p.ball.x, y: p.ball.y });
+      if (events.stuck) tickEvents.push({ id: p.id, kind: 'stick', x: p.ball.x, y: p.ball.y });
       if (events.water) {
         p.strokes++;
         tickEvents.push({ id: p.id, kind: 'water', x: p.ball.x, y: p.ball.y });
@@ -234,6 +244,8 @@ function tick() {
         p.ball.y = events.water.dropPoint.y;
         p.ball.vx = 0;
         p.ball.vy = 0;
+        p.ball.z = 0;
+        p.ball.vz = 0;
       }
       if (events.holed) {
         finishPlayerHole(p, false);
@@ -279,6 +291,7 @@ function tick() {
     const r3 = (v) => Math.round(v * 1000) / 1000;
     broadcastSnapshot({
       type: 'snapshot',
+      courseIndex: Lobby.courseIndex,
       holeIndex: Lobby.currentHoleIndex,
       elapsedMs: elapsed,
       events: tickEvents,
@@ -293,6 +306,8 @@ function tick() {
           id: p.id, name: p.name, hue: p.hue, isHost: p.id === Lobby.hostPlayerId,
           x: r1(p.ball.x), y: r1(p.ball.y), vx: r1(p.ball.vx), vy: r1(p.ball.vy),
           strokes: p.strokes, holedOut: p.holedOut,
+          // z only while airborne so grounded (and idle-keepalive) snapshots stay small
+          ...(p.ball.z > 0 ? { z: r1(p.ball.z), vz: r1(p.ball.vz) } : {}),
         })),
     });
     Lobby.pendingEvents = [];
@@ -339,9 +354,9 @@ wss.on('connection', (ws, req) => {
           // re-send roundState so it rejoins the hole in progress (with a ball if their
           // session never had one for this hole).
           if (Lobby.state === 'PLAYING') {
-            const hole = Shared.HOLES[Lobby.currentHoleIndex];
+            const hole = currentHoles()[Lobby.currentHoleIndex];
             if (!player.ball) player.ball = Shared.createBallState(Shared.teePositionFor(Lobby.players.size - 1, Lobby.players.size, hole));
-            send(ws, { type: 'roundState', holeIndex: Lobby.currentHoleIndex, holeName: hole.name, par: hole.par });
+            send(ws, { type: 'roundState', courseIndex: Lobby.courseIndex, holeIndex: Lobby.currentHoleIndex, holeName: hole.name, par: hole.par });
           }
           broadcastLobbyState();
           return;
@@ -362,9 +377,9 @@ wss.on('connection', (ws, req) => {
       // Late joiner while a hole is underway: drop them in at the tee so they can play
       // along right away instead of sitting ball-less until the next hole.
       if (Lobby.state === 'PLAYING') {
-        const hole = Shared.HOLES[Lobby.currentHoleIndex];
+        const hole = currentHoles()[Lobby.currentHoleIndex];
         player.ball = Shared.createBallState(Shared.teePositionFor(Lobby.players.size - 1, Lobby.players.size, hole));
-        send(ws, { type: 'roundState', holeIndex: Lobby.currentHoleIndex, holeName: hole.name, par: hole.par });
+        send(ws, { type: 'roundState', courseIndex: Lobby.courseIndex, holeIndex: Lobby.currentHoleIndex, holeName: hole.name, par: hole.par });
       }
       broadcastLobbyState();
     } else if (msg.type === 'setName') {
@@ -372,13 +387,24 @@ wss.on('connection', (ws, req) => {
         player.name = msg.name.slice(0, 20);
         broadcastLobbyState();
       }
+    } else if (msg.type === 'selectCourse') {
+      if (player && player.id === Lobby.hostPlayerId &&
+          (Lobby.state === 'WAITING_FOR_PLAYERS' || Lobby.state === 'FINAL_RESULTS') &&
+          isValidCourseIndex(msg.courseIndex)) {
+        Lobby.courseIndex = msg.courseIndex;
+        broadcastLobbyState();
+      }
     } else if (msg.type === 'startRound') {
       if (player && player.id === Lobby.hostPlayerId &&
           (Lobby.state === 'WAITING_FOR_PLAYERS' || Lobby.state === 'FINAL_RESULTS')) {
+        // The start message carries the host's current selection too, so the round can
+        // never start on a stale course if a selectCourse was dropped.
+        if (isValidCourseIndex(msg.courseIndex)) Lobby.courseIndex = msg.courseIndex;
         startNewRound();
       }
     } else if (msg.type === 'putt') {
       if (!player || Lobby.state !== 'PLAYING' || !player.ball || player.holedOut) return;
+      if (player.ball.z > 0) return; // no putting mid-flight
       const v = msg.dragVector;
       if (!v || typeof v.x !== 'number' || typeof v.y !== 'number') return;
       const dragLen = Math.hypot(v.x, v.y);
@@ -386,9 +412,10 @@ wss.on('connection', (ws, req) => {
       const clampedLen = Math.min(dragLen, Shared.MAX_DRAG_DIST);
       const clamped = { x: (v.x / dragLen) * clampedLen, y: (v.y / dragLen) * clampedLen };
       const launch = Shared.computeLaunchVelocity(clamped);
+      const factor = Shared.stickyLaunchFactor(player.ball, currentHoles()[Lobby.currentHoleIndex]);
       player.ball.firedBoosts.clear();
-      player.ball.vx = launch.vx;
-      player.ball.vy = launch.vy;
+      player.ball.vx = launch.vx * factor;
+      player.ball.vy = launch.vy * factor;
       player.strokes++;
     }
   });

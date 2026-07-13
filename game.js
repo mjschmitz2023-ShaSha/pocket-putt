@@ -6,10 +6,13 @@ const {
   CUP_GRAVITY_RADIUS,
   WALL_RESTITUTION, BUMPER_RESTITUTION, PENDULUM_RESTITUTION, GATE_RESTITUTION,
   MAX_DRAG_DIST, MIN_DRAG_DIST, POWER_MULTIPLIER, MAX_LAUNCH_SPEED, BOOST_MAX_SPEED, BOUND,
-  BOUNDARY_WALLS, HOLES, pointInZone, zoneBounds, resolveWallCollision, getWindmillBlades,
+  BOUNDARY_WALLS, COURSES, pointInZone, zoneBounds, resolveWallCollision, getWindmillBlades,
   getPendulumSegment, getSlidingGateSegment,
   createBallState, stepBallPhysics, advanceHoleObstacles, resetHoleObstacles, computeLaunchVelocity,
+  stickyLaunchFactor,
 } = window.Shared;
+// Deliberately NOT destructuring HOLES: every hole lookup must go through the selected
+// course, so a stale reference throws instead of silently playing Classic.
 
 const BOOST_COLOR_A = '#8b2fd1';
 const BOOST_COLOR_B = '#2fd1c8';
@@ -17,6 +20,7 @@ const BOOST_COLOR_B = '#2fd1c8';
 // ---- Game state ----
 const Game = {
   state: 'START',
+  courseIndex: 0,
   currentHoleIndex: 0,
   strokes: 0,
   totalStrokes: 0,
@@ -31,6 +35,8 @@ const Game = {
   lastBounceSoundAt: 0,
   players: new Map(), // multiplayer only: id -> latest snapshot ball {x,y,vx,vy,hue,name,strokes,holedOut}
 };
+
+function currentHoles() { return COURSES[Game.courseIndex].holes; }
 
 // ---- Canvas setup ----
 const canvas = document.getElementById('game');
@@ -176,6 +182,16 @@ function soundHole(special) {
   }
 }
 function soundClick() { playTone({ freq: 700, duration: 0.05, type: 'square', vol: 0.1 }); }
+function soundRamp() {
+  playTone({ freq: 200, duration: 0.35, type: 'sawtooth', vol: 0.25, sweepTo: 900 });
+}
+function soundLand() {
+  playNoiseBurst({ duration: 0.18, vol: 0.3, filterFreq: 300 });
+}
+function soundStick() {
+  playTone({ freq: 220, duration: 0.3, type: 'sine', vol: 0.3, sweepTo: 60 });
+  playNoiseBurst({ duration: 0.12, vol: 0.18, filterFreq: 500, delay: 0.02 });
+}
 function soundBoost() {
   playTone({ freq: 180, duration: 0.28, type: 'sawtooth', vol: 0.28, sweepTo: 1100 });
   playNoiseBurst({ duration: 0.15, vol: 0.15, filterFreq: 2000 });
@@ -210,7 +226,7 @@ function handleWaterHazard(zone) {
 // the multiplayer server runs, this just reacts to the returned events with solo-mode
 // sound/particles/scoring so the two never have to agree on anything beyond ball motion.
 function updateBallPhysics(dt) {
-  const hole = HOLES[Game.currentHoleIndex];
+  const hole = currentHoles()[Game.currentHoleIndex];
   const events = stepBallPhysics(Game.ball, hole, dt);
 
   if (events.bounced) maybePlayBounceSound();
@@ -218,6 +234,19 @@ function updateBallPhysics(dt) {
   for (const z of events.boosts) {
     spawnBoostSpark(Game.ball.x, Game.ball.y, Game.ball.angleDir);
     soundBoost();
+  }
+  if (events.launched) {
+    Game.ball.squash = 0.5;
+    soundRamp();
+  }
+  if (events.landed) {
+    Game.ball.squash = 0.6;
+    spawnLandDust(Game.ball.x, Game.ball.y);
+    soundLand();
+  }
+  if (events.stuck) {
+    spawnGooSplat(Game.ball.x, Game.ball.y);
+    soundStick();
   }
   if (events.water) { handleWaterHazard(events.water); return; }
   if (events.holed) { onHoleComplete(); return; }
@@ -229,7 +258,7 @@ function updateBallPhysics(dt) {
     Game.trail.push({ x: Game.ball.x, y: Game.ball.y, age: 0 });
     if (Game.trail.length > 14) Game.trail.shift();
   }
-  if (speed < STOP_THRESHOLD) {
+  if (speed < STOP_THRESHOLD && Game.ball.z <= 0) {
     // Inside the cup divot, let gravity keep working instead of freezing the ball on the lip.
     const nearCup = Math.hypot(Game.ball.x - hole.cup.x, Game.ball.y - hole.cup.y) < CUP_GRAVITY_RADIUS;
     if (!nearCup) {
@@ -280,6 +309,30 @@ function spawnBoostSpark(x, y, angle) {
       life: 0.25 + Math.random() * 0.25, maxLife: 0.5,
       color: colors[Math.floor(Math.random() * colors.length)],
       size: 2 + Math.random() * 2.5,
+    });
+  }
+}
+function spawnLandDust(x, y) {
+  for (let i = 0; i < 12; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 40 + Math.random() * 80;
+    Game.particles.push({
+      type: 'splash', x, y,
+      vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed * 0.4 - 30,
+      life: 0.3 + Math.random() * 0.25, maxLife: 0.55,
+      color: 'rgba(210,190,150,0.9)', size: 2 + Math.random() * 2.5,
+    });
+  }
+}
+function spawnGooSplat(x, y) {
+  for (let i = 0; i < 16; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 30 + Math.random() * 90;
+    Game.particles.push({
+      type: 'splash', x, y,
+      vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed - 40,
+      life: 0.4 + Math.random() * 0.3, maxLife: 0.7,
+      color: i % 3 === 0 ? '#b47a10' : '#d99a1f', size: 2.5 + Math.random() * 3,
     });
   }
 }
@@ -398,6 +451,76 @@ function drawBoostZone(z) {
     ctx.stroke();
   }
   ctx.restore();
+}
+function drawStickyZone(z) {
+  ctx.fillStyle = '#d99a1f';
+  drawZonePath(z);
+  ctx.fill();
+  if (!z._speckles) {
+    z._speckles = [];
+    const b = zoneBounds(z);
+    const n = Math.max(6, Math.floor((b.x2 - b.x1) * (b.y2 - b.y1) / 2200));
+    for (let i = 0; i < n; i++) {
+      z._speckles.push({ x: b.x1 + Math.random() * (b.x2 - b.x1), y: b.y1 + Math.random() * (b.y2 - b.y1), r: 2 + Math.random() * 3 });
+    }
+  }
+  ctx.fillStyle = 'rgba(120,70,10,0.4)';
+  for (const d of z._speckles) {
+    ctx.beginPath();
+    ctx.arc(d.x, d.y, d.r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  // slow-drifting specular sheen so the goo reads as wet
+  const b = zoneBounds(z);
+  const t = performance.now() / 1000;
+  const sheenY = b.y1 + ((t * 12) % (b.y2 - b.y1));
+  ctx.strokeStyle = 'rgba(255,230,160,0.35)';
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo(b.x1 + 6, sheenY);
+  ctx.lineTo(b.x2 - 6, sheenY);
+  ctx.stroke();
+}
+function drawRampZone(z) {
+  const b = zoneBounds(z);
+  const cx = (b.x1 + b.x2) / 2, cy = (b.y1 + b.y2) / 2;
+  const hw = (b.x2 - b.x1) / 2, hh = (b.y2 - b.y1) / 2;
+  const dx = Math.cos(z.angle), dy = Math.sin(z.angle);
+  const ext = Math.abs(dx) * hw + Math.abs(dy) * hh;
+  const grad = ctx.createLinearGradient(cx - dx * ext, cy - dy * ext, cx + dx * ext, cy + dy * ext);
+  grad.addColorStop(0, '#8a6a3f');
+  grad.addColorStop(1, '#e0c188');
+  ctx.fillStyle = grad;
+  roundRectPath(ctx, b.x1, b.y1, b.x2 - b.x1, b.y2 - b.y1, 6);
+  ctx.fill();
+  // static chevrons pointing up the slope
+  ctx.save();
+  roundRectPath(ctx, b.x1, b.y1, b.x2 - b.x1, b.y2 - b.y1, 6);
+  ctx.clip();
+  ctx.strokeStyle = 'rgba(255,255,255,0.75)';
+  ctx.lineWidth = 3;
+  ctx.lineCap = 'round';
+  const perpX = -dy, perpY = dx;
+  for (let d = -ext + 14; d < ext - 4; d += 22) {
+    const bx = cx + dx * d, by = cy + dy * d;
+    const wing = 8;
+    ctx.beginPath();
+    ctx.moveTo(bx - dx * wing + perpX * wing, by - dy * wing + perpY * wing);
+    ctx.lineTo(bx + dx * wing, by + dy * wing);
+    ctx.lineTo(bx - dx * wing - perpX * wing, by - dy * wing - perpY * wing);
+    ctx.stroke();
+  }
+  ctx.restore();
+  // bold lip line across the high edge
+  const lipX = cx + dx * ext, lipY = cy + dy * ext;
+  const lipHalf = Math.min(hw, hh);
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 4;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(lipX - perpX * lipHalf, lipY - perpY * lipHalf);
+  ctx.lineTo(lipX + perpX * lipHalf, lipY + perpY * lipHalf);
+  ctx.stroke();
 }
 function drawWallSegment(w) {
   ctx.lineCap = 'round';
@@ -555,13 +678,28 @@ function drawTrail() {
     ctx.fill();
   }
 }
+// Fake-3D flight: shadow stays at the true (x,y) while the ball body lifts and grows
+// with z, so jumps read instantly even from across the room.
+function drawBallShadow(x, y, z) {
+  const shrink = Math.max(0.45, 1 - z / 600);
+  ctx.fillStyle = 'rgba(0,0,0,0.28)';
+  ctx.beginPath();
+  ctx.ellipse(x, y + 2, BALL_RADIUS * shrink, BALL_RADIUS * 0.55 * shrink, 0, 0, Math.PI * 2);
+  ctx.fill();
+}
 function drawBall() {
   const b = Game.ball;
   const t = performance.now() / 1000;
   const baseHue = (t * 130) % 360;
+  const zh = b.z || 0;
+  if (zh > 0) drawBallShadow(b.x, b.y, zh);
 
   ctx.save();
-  ctx.translate(b.x, b.y);
+  ctx.translate(b.x, b.y - zh * 0.35);
+  if (zh > 0) {
+    const airScale = 1 + zh / 260;
+    ctx.scale(airScale, airScale);
+  }
   ctx.rotate(b.angleDir || 0);
   const stretch = b.squash || 0;
   ctx.scale(1 + stretch * 0.5, 1 - stretch * 0.35);
@@ -653,8 +791,14 @@ function drawAimLine() {
 }
 function drawMultiplayerBall(b, isSelf) {
   const bx = b.rx, by = b.ry;
+  const zh = b.rz || 0;
+  if (zh > 0) drawBallShadow(bx, by, zh);
   ctx.save();
-  ctx.translate(bx, by);
+  ctx.translate(bx, by - zh * 0.35);
+  if (zh > 0) {
+    const airScale = 1 + zh / 260;
+    ctx.scale(airScale, airScale);
+  }
   if (isSelf) {
     ctx.fillStyle = 'rgba(255,255,255,0.25)';
     ctx.beginPath();
@@ -691,23 +835,26 @@ function drawMultiplayerBall(b, isSelf) {
   ctx.restore();
 
   const label = b.holedOut ? `${b.name} ⛳` : b.name;
+  const labelY = by - zh * 0.35; // name tag rises with the ball
   ctx.font = '11px -apple-system, BlinkMacSystemFont, sans-serif';
   const textW = ctx.measureText(label).width;
   const boxW = textW + 12;
   ctx.fillStyle = 'rgba(0,0,0,0.55)';
-  roundRectPath(ctx, bx - boxW / 2, by - BALL_RADIUS - 22, boxW, 16, 8);
+  roundRectPath(ctx, bx - boxW / 2, labelY - BALL_RADIUS - 22, boxW, 16, 8);
   ctx.fill();
   ctx.fillStyle = '#ffffff';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillText(label, bx, by - BALL_RADIUS - 14);
+  ctx.fillText(label, bx, labelY - BALL_RADIUS - 14);
 }
 function drawWorld() {
-  const hole = HOLES[Game.currentHoleIndex];
+  const hole = currentHoles()[Game.currentHoleIndex];
   drawGrass();
   for (const z of hole.sand) drawSandZone(z);
   for (const z of hole.water) drawWaterZone(z);
+  for (const z of hole.sticky) drawStickyZone(z);
   for (const z of hole.boost) drawBoostZone(z);
+  for (const z of hole.ramps) drawRampZone(z);
   for (const w of BOUNDARY_WALLS) drawWallSegment(w);
   for (const w of hole.walls) drawWallSegment(w);
   for (const wm of hole.windmills) drawWindmill(wm);
@@ -736,8 +883,8 @@ const SCREEN_IDS = ['screen-start', 'screen-lobby', 'screen-hole-complete', 'scr
 function hideAllScreens() { SCREEN_IDS.forEach((id) => document.getElementById(id).classList.add('hidden')); }
 function showScreen(id) { hideAllScreens(); document.getElementById(id).classList.remove('hidden'); }
 function updateHUD() {
-  const hole = HOLES[Game.currentHoleIndex];
-  hudHole.textContent = `Hole ${Game.currentHoleIndex + 1}/${HOLES.length} — ${hole.name}`;
+  const hole = currentHoles()[Game.currentHoleIndex];
+  hudHole.textContent = `Hole ${Game.currentHoleIndex + 1}/${currentHoles().length} — ${hole.name}`;
   hudPar.textContent = `Par ${hole.par}`;
   hudStrokes.textContent = `Strokes: ${Game.strokes}`;
   hudTotal.textContent = `Total: ${Game.totalStrokes}`;
@@ -752,9 +899,9 @@ function setHudText(el, text) {
   }
 }
 function mpUpdateHUD(msg) {
-  const hole = HOLES[msg.holeIndex];
+  const hole = currentHoles()[msg.holeIndex];
   const me = Game.players.get(mpPlayerId);
-  setHudText(hudHole, `Hole ${msg.holeIndex + 1}/${HOLES.length} — ${hole.name}`);
+  setHudText(hudHole, `Hole ${msg.holeIndex + 1}/${currentHoles().length} — ${hole.name}`);
   setHudText(hudPar, `Par ${hole.par}`);
   setHudText(hudStrokes, `Strokes: ${me ? me.strokes : 0}`);
   // Timer text is driven per-frame by mpInterpolateBalls' extrapolated clock instead.
@@ -779,7 +926,7 @@ function ratingLine(totalDiff) {
 // ---- Game flow ----
 function loadHole(i) {
   Game.currentHoleIndex = i;
-  const hole = HOLES[i];
+  const hole = currentHoles()[i];
   Game.strokes = 0;
   Game.ball = createBallState(hole.tee);
   Game.trail = [];
@@ -796,14 +943,14 @@ function startGame() {
   loadHole(0);
 }
 function onHoleComplete() {
-  const hole = HOLES[Game.currentHoleIndex];
+  const hole = currentHoles()[Game.currentHoleIndex];
   const diff = Game.strokes - hole.par;
   Game.scorecard.push({ hole: Game.currentHoleIndex + 1, name: hole.name, par: hole.par, strokes: Game.strokes });
   spawnConfetti(hole.cup.x, hole.cup.y);
   soundHole(Game.strokes === 1 || diff <= -2);
   document.getElementById('banner-text').textContent = ratingText(diff, Game.strokes);
   document.getElementById('hole-complete-strokes').textContent = `${Game.strokes} stroke${Game.strokes === 1 ? '' : 's'} (Par ${hole.par})`;
-  document.getElementById('btn-next').textContent = Game.currentHoleIndex === HOLES.length - 1 ? 'See Scorecard →' : 'Next Hole →';
+  document.getElementById('btn-next').textContent = Game.currentHoleIndex === currentHoles().length - 1 ? 'See Scorecard →' : 'Next Hole →';
   Game.state = 'HOLE_COMPLETE';
   showScreen('screen-hole-complete');
 }
@@ -849,8 +996,10 @@ function handlePointerMove(x, y) {
 function launchBall(dragLen, pointerVec) {
   Game.ball.firedBoosts.clear();
   const v = computeLaunchVelocity(pointerVec);
-  Game.ball.vx = v.vx;
-  Game.ball.vy = v.vy;
+  // Putting out of goo leaves at reduced power (same rule the multiplayer server applies).
+  const factor = stickyLaunchFactor(Game.ball, currentHoles()[Game.currentHoleIndex]);
+  Game.ball.vx = v.vx * factor;
+  Game.ball.vy = v.vy * factor;
   Game.ball.squash = 0.6;
   Game.ball.angleDir = Math.atan2(v.vy, v.vx);
   Game.strokes++;
@@ -871,9 +1020,10 @@ function handlePointerUp(x, y) {
     // Client-side prediction: launch the local copy of our ball immediately so the shot
     // responds with zero perceived latency; server snapshots blend-correct any drift.
     const lv = computeLaunchVelocity(v);
+    const factor = stickyLaunchFactor(Game.ball, currentHoles()[Game.currentHoleIndex]);
     Game.ball.firedBoosts.clear();
-    Game.ball.vx = lv.vx;
-    Game.ball.vy = lv.vy;
+    Game.ball.vx = lv.vx * factor;
+    Game.ball.vy = lv.vy * factor;
     Game.ball.squash = 0.6;
     Game.ball.angleDir = Math.atan2(lv.vy, lv.vx);
     soundPutt(lv.speed / MAX_LAUNCH_SPEED);
@@ -907,17 +1057,22 @@ window.addEventListener('touchend', (e) => {
   handlePointerUp(p.x, p.y);
 });
 
-document.getElementById('btn-play').addEventListener('click', () => { unlockAudio(); soundClick(); startGame(); });
+document.getElementById('btn-play').addEventListener('click', () => {
+  unlockAudio();
+  soundClick();
+  Game.courseIndex = Number(document.getElementById('solo-course-select').value) || 0;
+  startGame();
+});
 document.getElementById('btn-next').addEventListener('click', () => {
   soundClick();
-  if (Game.currentHoleIndex === HOLES.length - 1) showRoundComplete();
+  if (Game.currentHoleIndex === currentHoles().length - 1) showRoundComplete();
   else loadHole(Game.currentHoleIndex + 1);
 });
 document.getElementById('btn-replay').addEventListener('click', () => { soundClick(); startGame(); });
 
 // ---- Main loop ----
 function update(dt) {
-  const hole = HOLES[Game.currentHoleIndex];
+  const hole = currentHoles()[Game.currentHoleIndex];
   // Obstacles advance locally every frame in BOTH modes (they're deterministic functions
   // of time); in multiplayer the server's snapshot values overwrite ours on arrival, so
   // everyone stays corrected to the authoritative timeline while animating smoothly
@@ -935,6 +1090,20 @@ function update(dt) {
       for (const z of evs.boosts) {
         spawnBoostSpark(Game.ball.x, Game.ball.y, Game.ball.angleDir);
         soundBoost();
+      }
+      if (evs.launched) {
+        Game.ball.squash = 0.5;
+        soundRamp();
+      }
+      if (evs.landed) {
+        Game.ball.squash = 0.6;
+        spawnLandDust(Game.ball.x, Game.ball.y);
+        soundLand();
+      }
+      if (evs.stuck) {
+        spawnGooSplat(Game.ball.x, Game.ball.y);
+        soundStick();
+        mpShowBanner('STUCK!');
       }
       if (evs.water || evs.holed) {
         Game.ball.vx = 0;
@@ -986,12 +1155,34 @@ const MP_INTERP_DELAY_MS = 100;
 let mpSnapBuffer = [];
 let mpClock = null; // { elapsedMs, at } — server hole-clock sample for extrapolation
 
+let mpCourseIndex = 0; // last course selection seen from the server, echoed on startRound
+
+function populateCourseSelect(el) {
+  if (el.options.length) return;
+  COURSES.forEach((c, i) => {
+    const opt = document.createElement('option');
+    opt.value = i;
+    opt.textContent = c.name;
+    el.appendChild(opt);
+  });
+}
+
 function mpRenderLobby(msg) {
   // The server may promote a new host after the original host disconnects - re-derive
   // mpIsHost from the current player list every time rather than trusting the one-time
   // value from 'welcome', so the newly-promoted player actually sees the Start button.
   const me = msg.players.find((p) => p.id === mpPlayerId);
   if (me) mpIsHost = me.isHost;
+
+  mpCourseIndex = msg.courseIndex ?? 0;
+  const courseSelect = document.getElementById('course-select');
+  const courseDisplay = document.getElementById('course-display');
+  populateCourseSelect(courseSelect);
+  // Don't clobber the dropdown while the host is mid-choice in it.
+  if (document.activeElement !== courseSelect) courseSelect.value = String(mpCourseIndex);
+  courseSelect.classList.toggle('hidden', !mpIsHost);
+  courseDisplay.classList.toggle('hidden', mpIsHost);
+  courseDisplay.textContent = COURSES[mpCourseIndex].name;
 
   const joinUrlEl = document.getElementById('lobby-join-url');
   joinUrlEl.textContent = msg.joinUrl;
@@ -1039,8 +1230,12 @@ function mpConnect() {
     } else if (msg.type === 'lobbyState') {
       mpRenderLobby(msg);
     } else if (msg.type === 'roundState') {
+      Game.courseIndex = msg.courseIndex ?? 0;
       Game.currentHoleIndex = msg.holeIndex;
       Game.players.clear();
+      // Fresh local ball: clears stale z/vz/stuckTo/firedBoosts from the previous hole;
+      // the first snapshot's big-divergence snap places it on the correct tee spot.
+      Game.ball = createBallState(currentHoles()[msg.holeIndex].tee);
       mpSnapBuffer = [];
       mpClock = null;
       mpCanPutt = false;
@@ -1057,7 +1252,7 @@ function mpConnect() {
 }
 
 function mpRenderHoleResults(msg) {
-  const hole = HOLES[msg.holeIndex];
+  const hole = currentHoles()[msg.holeIndex];
   document.getElementById('hole-results-title').textContent = `${hole.name} — Results`;
   const body = document.getElementById('hole-results-body');
   body.innerHTML = '';
@@ -1074,7 +1269,7 @@ function mpRenderHoleResults(msg) {
     li.innerHTML = `<span class="standing-rank">${i + 1}</span><span>${s.name}</span><span class="standing-score">${s.totalScore.toFixed(1)}</span>`;
     standings.appendChild(li);
   });
-  const isLastHole = msg.holeIndex === HOLES.length - 1;
+  const isLastHole = msg.holeIndex === currentHoles().length - 1;
   document.getElementById('hole-results-next').textContent = isLastHole ? 'Final results coming up…' : 'Next hole starting soon…';
   showScreen('screen-hole-results');
 }
@@ -1094,7 +1289,8 @@ function mpRenderFinalResults(msg) {
 }
 
 function mpApplySnapshot(msg) {
-  const hole = HOLES[msg.holeIndex];
+  if (msg.courseIndex !== undefined) Game.courseIndex = msg.courseIndex;
+  const hole = currentHoles()[msg.holeIndex];
   msg.obstacles.windmillAngles.forEach((a, i) => { hole.windmills[i].angle = a; });
   msg.obstacles.pendulumPhases.forEach((ph, i) => { hole.pendulums[i].phase = ph; });
   msg.obstacles.gatePhases.forEach((ph, i) => { hole.gates[i].phase = ph; });
@@ -1105,11 +1301,15 @@ function mpApplySnapshot(msg) {
   const seen = new Set();
   for (const b of msg.balls) {
     seen.add(b.id);
+    // The server omits z/vz for grounded balls to keep packets small — normalize to 0 so
+    // a stale airborne value can never linger on the snapshot entry.
+    b.z = b.z || 0;
+    b.vz = b.vz || 0;
     const existing = Game.players.get(b.id);
     if (existing) {
       Object.assign(existing, b);
     } else {
-      Game.players.set(b.id, { ...b, rx: b.x, ry: b.y });
+      Game.players.set(b.id, { ...b, rx: b.x, ry: b.y, rz: b.z });
     }
   }
   for (const id of Game.players.keys()) {
@@ -1134,14 +1334,18 @@ function mpApplySnapshot(msg) {
       Game.ball.y = me.y;
       Game.ball.vx = me.vx;
       Game.ball.vy = me.vy;
+      Game.ball.z = me.z;
+      Game.ball.vz = me.vz;
     } else {
       Game.ball.x += errX * 0.15;
       Game.ball.y += errY * 0.15;
       Game.ball.vx += (me.vx - Game.ball.vx) * 0.15;
       Game.ball.vy += (me.vy - Game.ball.vy) * 0.15;
+      Game.ball.z += (me.z - Game.ball.z) * 0.25;
+      if (Game.ball.z < 0.5 && me.z === 0) Game.ball.z = 0;
     }
     const speed = Math.hypot(me.vx, me.vy);
-    mpCanPutt = !me.holedOut && speed < STOP_THRESHOLD;
+    mpCanPutt = !me.holedOut && speed < STOP_THRESHOLD && me.z === 0;
     mpUpdateHUD(msg);
   }
 }
@@ -1171,13 +1375,16 @@ function mpInterpolateBalls() {
       if (Math.hypot(b1.x - b0.x, b1.y - b0.y) > 150) {
         p.rx = b1.x;
         p.ry = b1.y;
+        p.rz = b1.z || 0;
       } else {
         p.rx = b0.x + (b1.x - b0.x) * f;
         p.ry = b0.y + (b1.y - b0.y) * f;
+        p.rz = (b0.z || 0) + ((b1.z || 0) - (b0.z || 0)) * f;
       }
     } else if (b1) {
       p.rx = b1.x;
       p.ry = b1.y;
+      p.rz = b1.z || 0;
     }
   }
   // Our own ball renders from the local prediction, not the delayed interp buffer.
@@ -1185,6 +1392,7 @@ function mpInterpolateBalls() {
   if (meP && !meP.holedOut) {
     meP.rx = Game.ball.x;
     meP.ry = Game.ball.y;
+    meP.rz = Game.ball.z || 0;
     meP.vx = Game.ball.vx;
     meP.vy = Game.ball.vy;
   }
@@ -1219,6 +1427,23 @@ function mpHandleEvent(ev, hole) {
     case 'boost':
       if (!mine) spawnBoostSpark(ev.x, ev.y, ev.angle);
       break;
+    // Own ramp/land/stick juice comes from the local prediction sim (same pattern as
+    // bounce/sand) — only spectators react to the server copies.
+    case 'ramp':
+      if (!mine) soundRamp();
+      break;
+    case 'land':
+      if (!mine) {
+        spawnLandDust(ev.x, ev.y);
+        soundLand();
+      }
+      break;
+    case 'stick':
+      if (!mine) {
+        spawnGooSplat(ev.x, ev.y);
+        soundStick();
+      }
+      break;
     case 'water':
       spawnSplash(ev.x, ev.y);
       if (mine) {
@@ -1252,23 +1477,29 @@ document.getElementById('btn-join').addEventListener('click', () => {
   localStorage.setItem('pocketPuttName', name);
   mpSocket.send(JSON.stringify({ type: 'join', name }));
 });
+document.getElementById('course-select').addEventListener('change', (e) => {
+  const courseIndex = Number(e.target.value);
+  mpCourseIndex = courseIndex;
+  if (mpSocket) mpSocket.send(JSON.stringify({ type: 'selectCourse', courseIndex }));
+});
 document.getElementById('btn-start-round').addEventListener('click', () => {
   unlockAudio();
   soundClick();
-  mpSocket.send(JSON.stringify({ type: 'startRound' }));
+  mpSocket.send(JSON.stringify({ type: 'startRound', courseIndex: mpCourseIndex }));
 });
 document.getElementById('btn-play-again').addEventListener('click', () => {
   unlockAudio();
   soundClick();
-  mpSocket.send(JSON.stringify({ type: 'startRound' }));
+  mpSocket.send(JSON.stringify({ type: 'startRound', courseIndex: mpCourseIndex }));
 });
 
 // ---- Init ----
 setupCanvasDPR();
 fitStage();
 window.addEventListener('resize', fitStage);
-Game.ball.x = HOLES[0].tee.x;
-Game.ball.y = HOLES[0].tee.y;
+populateCourseSelect(document.getElementById('solo-course-select'));
+Game.ball.x = currentHoles()[0].tee.x;
+Game.ball.y = currentHoles()[0].tee.y;
 if (MULTIPLAYER) {
   showScreen('screen-lobby');
   mpConnect();

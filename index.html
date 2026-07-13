@@ -25,21 +25,30 @@
 
     <div id="screen-start" class="screen">
       <h1>⛳ Pocket Putt</h1>
-      <p class="subtitle">A simple, super fun 19-hole mini golf game</p>
-      <p class="instructions">Click and drag back from the ball to aim, then release to putt.<br>Watch out for sand, water, windmills, pendulums, gates, and boost pads!</p>
+      <p class="subtitle">A simple, super fun mini golf game — three 19-hole courses</p>
+      <p class="instructions">Click and drag back from the ball to aim, then release to putt.<br>Watch out for sand, water, windmills, pendulums, gates, boost pads,<br>jump ramps, and sticky goo!</p>
+      <div class="course-row">
+        <label for="solo-course-select">Course</label>
+        <select id="solo-course-select"></select>
+      </div>
       <button id="btn-play">Play ▶</button>
     </div>
 
     <div id="screen-lobby" class="screen hidden">
       <h1>⛳ Pocket Putt — Multiplayer</h1>
       <div id="lobby-join">
-        <p class="subtitle">Everyone on this Wi-Fi plays the same 19 holes together, heat by heat.</p>
+        <p class="subtitle">Everyone on this Wi-Fi plays the same course together, heat by heat.</p>
         <input id="lobby-name-input" type="text" placeholder="Your name" maxlength="20" autocomplete="off">
         <button id="btn-join">Join Lobby</button>
       </div>
       <div id="lobby-joined" class="hidden">
         <p class="lobby-url">Friends on this Wi-Fi, open: <strong id="lobby-join-url" title="Click to copy"></strong></p>
         <ul id="lobby-player-list"></ul>
+        <div class="course-row">
+          <label for="course-select">Course</label>
+          <select id="course-select"></select>
+          <span id="course-display" class="hidden"></span>
+        </div>
         <button id="btn-start-round" class="hidden">Start Round ▶</button>
         <p id="lobby-waiting-text" class="hidden">Waiting for the host to start…</p>
       </div>
