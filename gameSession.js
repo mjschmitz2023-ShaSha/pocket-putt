@@ -190,6 +190,7 @@ class GameSession {
       p.ball = Shared.createBallState(Shared.teePositionFor(slot, roster.length, hole));
       p.strokes = 0;
       p.holedOut = false;
+      p.speedTracker = Shared.createSpeedAvgTracker();
     });
     this.holeStartedAtMs = Date.now();
     this.simTick = 0;
@@ -402,6 +403,12 @@ class GameSession {
       for (const p of this.players.values()) {
         if (!p.connected || p.holedOut || !p.ball) continue;
         const events = Shared.stepBallPhysics(p.ball, hole, TICK_DT / PHYSICS_SUBTICKS);
+        if (!p.speedTracker) p.speedTracker = Shared.createSpeedAvgTracker();
+        Shared.noteSpeedSample(
+          p.speedTracker,
+          Math.hypot(p.ball.vx, p.ball.vy),
+          TICK_DT / PHYSICS_SUBTICKS
+        );
         if (events.bounced && !bouncedThisTick.has(p.id)) {
           bouncedThisTick.add(p.id);
           tickEvents.push({ id: p.id, kind: 'bounce' });
@@ -610,6 +617,7 @@ class GameSession {
       strokes: 0,
       holedOut: false,
       ball: null,
+      speedTracker: Shared.createSpeedAvgTracker(),
       perHoleScores: [],
       totalScore: 0,
     };
@@ -719,16 +727,22 @@ class GameSession {
       player.ball.wet = false;
       player.ball.wetStroke = false;
       player.ball.firedBoosts = new Set();
-      this.sendCorrectionNow([], { reason: 'resync', includeObstacles: true, hard: true });
+      player.speedTracker = Shared.createSpeedAvgTracker();
+      // Always deliver — do not use broadcastCorrection's buffer skip (respawn is rare + critical).
+      this.broadcastReliable(
+        this.buildCorrection([], { reason: 'resync', includeObstacles: true, hard: true })
+      );
     } else if (msg.type === 'putt') {
       if (this.state !== 'PLAYING' || !player.ball || player.holedOut) return;
-      if (Math.hypot(player.ball.vx, player.ball.vy) >= Shared.STOP_THRESHOLD) return;
+      const hole = this.currentHoles()[this.currentHoleIndex];
+      if (!player.speedTracker) player.speedTracker = Shared.createSpeedAvgTracker();
+      // Clean rest, or quasi-rest (avg |v| near 0 for ~5s) e.g. bumper chatter in gravity.
+      if (!Shared.mayPuttBall(player.ball, hole, player.speedTracker)) return;
       const v = msg.dragVector;
       if (!v || typeof v.x !== 'number' || typeof v.y !== 'number') return;
       const clamped = Shared.clampDragVector(v);
       if (!clamped) return;
       const launch = Shared.computeLaunchVelocity(clamped);
-      const hole = this.currentHoles()[this.currentHoleIndex];
       const factor = Shared.stickyLaunchFactor(player.ball, hole);
       player.ball.firedBoosts = new Set();
       // Goo stays sticky while inside the patch (no grass escape latch).
@@ -739,6 +753,7 @@ class GameSession {
       player.ball.z = 0;
       player.ball.vz = 0;
       player.strokes++;
+      Shared.resetSpeedAvgTracker(player.speedTracker);
       // One reliable event — no pose stream while the ball is rolling.
       const puttMsg = {
         type: 'puttApplied',

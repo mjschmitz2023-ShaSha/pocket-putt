@@ -2,15 +2,16 @@
 /**
  * P5: Editor Test-mode physics contracts (no DOM).
  * - Gravity pulls via stepBallPhysics (rolling) and simulateTrajectory (ghost).
- * - advanceMovers:false freezes windmill angle across ghost sim;
- *   live advanceHoleObstacles changes angle.
+ * - Ghost may freeze or advance movers; editor uses advanceMovers:true so
+ *   the path includes future mill/gate motion from the aim snapshot.
  */
 const assert = require('assert');
 const Shared = require('../shared.js');
 
 const {
   blankHole, createBallState, stepBallPhysics, advanceHoleObstacles,
-  simulateTrajectory, planet, computeLaunchVelocity, ballMayRestForAim,
+  simulateTrajectory, createTrajectorySim, stepTrajectorySim,
+  planet, computeLaunchVelocity, ballMayRestForAim,
   MAX_DRAG_DIST, TICK_DT, TICK_HZ, STOP_THRESHOLD,
 } = Shared;
 
@@ -107,6 +108,51 @@ test('simulateTrajectory: empty hole ghost is straight-ish (+x coast)', () => {
   assert.ok(dy < 2, 'no lateral bend without gravity');
 });
 
+test('progressive ghost: soft budget continues until natural end (not stuck at first budget)', () => {
+  // Gentle putt that coasts to rest without holing (cup far + low power).
+  const h = blankHole({
+    tee: { x: 120, y: 250 },
+    cup: { x: 760, y: 80, radius: 11 },
+  });
+  const ball = createBallState(h.tee);
+  const launch = computeLaunchVelocity({ x: -MAX_DRAG_DIST * 0.35, y: 0 });
+  const sim = createTrajectorySim(h, ball, launch.vx, launch.vy, {
+    advanceMovers: false,
+    sampleEvery: 3,
+  });
+  const soft = 20; // well under a full coast
+  stepTrajectorySim(sim, soft);
+  assert.ok(!sim.done, 'after first soft budget still rolling');
+  const lenAfterSoft = sim.pts.length;
+  let frames = 0;
+  while (!sim.done && frames < 500) {
+    stepTrajectorySim(sim, soft);
+    frames++;
+  }
+  assert.ok(sim.done, 'eventually finishes');
+  assert.ok(
+    sim.endReason === 'rest' || sim.endReason === 'holed',
+    'natural end, not safety (got ' + sim.endReason + ')'
+  );
+  assert.ok(sim.pts.length > lenAfterSoft, 'path grows across frames');
+  assert.ok(sim.ticksRun > soft, 'ran more than one soft budget');
+});
+
+test('progressive ghost: aim change is a new sim; same key continues one sim', () => {
+  const h = blankHole();
+  const ball = createBallState(h.tee);
+  const a = computeLaunchVelocity({ x: -MAX_DRAG_DIST * 0.8, y: 0 });
+  const sim1 = createTrajectorySim(h, ball, a.vx, a.vy, { advanceMovers: false, sampleEvery: 2 });
+  stepTrajectorySim(sim1, 30);
+  const ticks1 = sim1.ticksRun;
+  stepTrajectorySim(sim1, 30);
+  assert.ok(sim1.ticksRun > ticks1, 'same sim continues');
+  const b = computeLaunchVelocity({ x: -MAX_DRAG_DIST * 0.4, y: 20 });
+  const sim2 = createTrajectorySim(h, ball, b.vx, b.vy, { advanceMovers: false, sampleEvery: 2 });
+  assert.strictEqual(sim2.ticksRun, 0, 'new aim restarts at 0');
+  assert.ok(sim2.pts.length === 1, 'new path starts at ball');
+});
+
 // --- Freeze movers on ghost; live advance moves mills ---
 test('simulateTrajectory advanceMovers:false freezes windmill angle on input + clone path', () => {
   const h = blankHole({
@@ -139,6 +185,47 @@ test('ghost freeze vs live advance: same hole, angles diverge', () => {
   for (let i = 0; i < 60; i++) advanceHoleObstacles(hLive, TICK_DT);
   assert.strictEqual(hGhost.windmills[0].angle, 0.1, 'ghost input frozen');
   assert.ok(Math.abs(hLive.windmills[0].angle - 0.1) > 0.01, 'live mill moved');
+});
+
+test('advanceMovers:true rotates windmill on clone; does not mutate live hole', () => {
+  const h = blankHole({
+    windmills: [{ cx: 400, cy: 250, armLength: 80, blades: 4, rotationSpeed: 3, angle: 0.25 }],
+  });
+  const angleBefore = h.windmills[0].angle;
+  const ball = createBallState(h.tee);
+  const sim = createTrajectorySim(h, ball, 120, 0, { advanceMovers: true, sampleEvery: 2 });
+  stepTrajectorySim(sim, 90);
+  assert.strictEqual(h.windmills[0].angle, angleBefore, 'live hole angle unchanged');
+  assert.ok(Math.abs(sim.h.windmills[0].angle - angleBefore) > 0.01, 'clone mill advanced');
+});
+
+test('advanceMovers:true ghost path can differ from frozen mill path', () => {
+  // Blade blocks +x corridor only after rotating; frozen path may miss the bounce.
+  const h = blankHole({
+    tee: { x: 200, y: 250 },
+    cup: { x: 700, y: 250, radius: 11 },
+    windmills: [{ cx: 400, cy: 250, armLength: 90, blades: 4, rotationSpeed: 4, angle: 0 }],
+  });
+  const ball = createBallState(h.tee);
+  const frozen = simulateTrajectory(h, ball, 280, 0, {
+    maxTicks: TICK_HZ * 3,
+    advanceMovers: false,
+    sampleEvery: 1,
+  });
+  const live = simulateTrajectory(h, ball, 280, 0, {
+    maxTicks: TICK_HZ * 3,
+    advanceMovers: true,
+    sampleEvery: 1,
+  });
+  // Paths should not be identical when a mill sits on the corridor.
+  let maxDist = 0;
+  const n = Math.min(frozen.length, live.length);
+  for (let i = 0; i < n; i++) {
+    const d = Math.hypot(frozen[i].x - live[i].x, frozen[i].y - live[i].y);
+    if (d > maxDist) maxDist = d;
+  }
+  assert.ok(maxDist > 2 || frozen.length !== live.length,
+    'animating mill changes ghost vs frozen (maxDist=' + maxDist + ')');
 });
 
 // --- Rest / wake contract used by editor Test loop ---

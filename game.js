@@ -11,6 +11,8 @@ const {
   createBallState, stepBallPhysics, advanceHoleObstacles, setHoleObstaclesAtTick, resetHoleObstacles,
   computeLaunchVelocity, clampDragVector, stickyLaunchFactor, stickyIndexAt, latchStickyAfterPutt,
   markWetFromWater, noteWetPutt, ballMayRestForAim,
+  createSpeedAvgTracker, resetSpeedAvgTracker, noteSpeedSample, isQuasiRest, mayPuttBall,
+  teePositionFor,
   decodeHole, encodeHole, normalizeHole, blankHole,
 } = window.Shared;
 // Must match gameSession PHYSICS_SUBTICKS — same dt schedule keeps sticky latch deterministic.
@@ -40,6 +42,8 @@ const Game = {
   lastTime: 0,
   lastBounceSoundAt: 0,
   players: new Map(), // multiplayer only: id -> latest snapshot ball {x,y,vx,vy,hue,name,strokes,holedOut}
+  /** Rolling speed average for quasi-rest putt escape (solo). */
+  speedTracker: createSpeedAvgTracker(),
 };
 
 // ---- Canvas setup ----
@@ -54,9 +58,13 @@ const hudTotal = document.getElementById('hud-total');
 const powerLabelEl = document.getElementById('power-label');
 const respawnOfferEl = document.getElementById('respawn-offer');
 const RESPAWN_OFFER_SEC = 15;
+/** Ignore soft host poses for this long after local respawn (soft snaps undid the tee). */
+const RESPAWN_SOFT_GRACE_MS = 1500;
 let unsettledSec = 0;
+let settledSec = 0;
 let respawnOfferVisible = false;
 let respawnDismissedUntilSettle = false;
+let respawnSoftGraceUntil = 0;
 
 function hideRespawnOffer() {
   if (respawnOfferEl) respawnOfferEl.classList.add('hidden');
@@ -67,7 +75,7 @@ function showRespawnOffer() {
   respawnOfferEl.classList.remove('hidden');
   respawnOfferVisible = true;
 }
-/** True while the local ball is in play but not ready for the next putt. */
+/** True while local ball is in play and not ready for a normal putt. */
 function isBallUnsettled() {
   if (MULTIPLAYER) {
     if (!mpPlaying || !mpPlayerId) return false;
@@ -75,20 +83,39 @@ function isBallUnsettled() {
     if (!me || me.holedOut) return false;
     return !mpCanPutt;
   }
-  return Game.state === 'BALL_MOVING';
+  // Solo: rolling, or gravity-wake thrash that never hands AIMING cleanly.
+  if (Game.state === 'BALL_MOVING') return true;
+  if (Game.state === 'AIMING') {
+    const hole = currentHoles()[Game.currentHoleIndex];
+    return !mayPuttBall(Game.ball, hole, Game.speedTracker);
+  }
+  return false;
 }
 function resetUnsettledTimer() {
   unsettledSec = 0;
+  settledSec = 0;
   respawnDismissedUntilSettle = false;
   hideRespawnOffer();
 }
 function doLocalRespawnToTee() {
   const hole = currentHoles()[Game.currentHoleIndex];
+  Game.drag.active = false;
+  if (powerLabelEl) powerLabelEl.classList.add('hidden');
+  resetSpeedAvgTracker(Game.speedTracker);
+  respawnSoftGraceUntil = performance.now() + RESPAWN_SOFT_GRACE_MS;
   if (MULTIPLAYER) {
     const me = Game.players.get(mpPlayerId);
     if (me) {
-      me.x = hole.tee.x;
-      me.y = hole.tee.y;
+      // Match host slot layout so optimistic tee agrees with authority.
+      let idx = 0;
+      let i = 0;
+      for (const p of Game.players.values()) {
+        if (p.id === mpPlayerId) { idx = i; break; }
+        i++;
+      }
+      const tee = teePositionFor(idx, Game.players.size, hole);
+      me.x = tee.x;
+      me.y = tee.y;
       me.vx = 0;
       me.vy = 0;
       me.z = 0;
@@ -102,6 +129,8 @@ function doLocalRespawnToTee() {
       me.firedBoosts = new Set();
       me.stuckStickyIndex = -1;
       mpSyncSelfFromPlayer(me);
+      // Force putt unlock at tee (soft host snaps must not re-lock for grace window).
+      if (!me.holedOut) mpCanPutt = true;
     }
   } else {
     Game.ball.x = hole.tee.x;
@@ -115,13 +144,16 @@ function doLocalRespawnToTee() {
     Game.ball.firedBoosts = new Set();
     Game.ball.stuckStickyIndex = -1;
     Game.trail = [];
-    Game.drag.active = false;
     Game.state = 'AIMING';
   }
   resetUnsettledTimer();
   hideAllScreens();
 }
-function requestRespawn() {
+function requestRespawn(ev) {
+  if (ev && typeof ev.preventDefault === 'function') {
+    ev.preventDefault();
+    ev.stopPropagation();
+  }
   soundClick();
   if (MULTIPLAYER) {
     if (mpSocketOpen()) {
@@ -136,9 +168,19 @@ function requestRespawn() {
 function updateRespawnOffer(dt) {
   if (isBallUnsettled()) {
     unsettledSec += dt;
+    settledSec = 0;
     if (unsettledSec >= RESPAWN_OFFER_SEC) showRespawnOffer();
   } else {
-    if (unsettledSec > 0 || respawnOfferVisible) resetUnsettledTimer();
+    settledSec += dt;
+    // Hysteresis: brief AIMING flicker mid-bounce must not wipe a nearly-ready offer.
+    if (settledSec >= 0.45) {
+      if (respawnOfferVisible) {
+        // Can putt again — drop the offer.
+        resetUnsettledTimer();
+      } else if (unsettledSec > 0) {
+        unsettledSec = 0;
+      }
+    }
   }
 }
 
@@ -367,10 +409,20 @@ function updateBallPhysics(dt) {
       Game.ball.vx = 0;
       Game.ball.vy = 0;
       Game.state = 'AIMING';
+    } else if (!nearCup && isQuasiRest(Game.speedTracker)) {
+      // Endless soft-bounce / crawl in a field: allow aim after sustained near-zero avg speed.
+      Game.ball.vx = 0;
+      Game.ball.vy = 0;
+      Game.state = 'AIMING';
     } else if (!nearCup) {
       // Keep simulating (e.g. moon field just overlapped a resting ball).
       Game.state = 'BALL_MOVING';
     }
+  } else if (isQuasiRest(Game.speedTracker)) {
+    // Still slightly moving (e.g. bumper chatter) but avg |v| has been tiny for ~5s.
+    Game.ball.vx = 0;
+    Game.ball.vy = 0;
+    Game.state = 'AIMING';
   }
 }
 
@@ -774,6 +826,7 @@ function loadHole(i) {
   hud.classList.remove('hidden');
   hideAllScreens();
   Game.state = 'AIMING';
+  resetSpeedAvgTracker(Game.speedTracker);
   resetUnsettledTimer();
   updateHUD();
 }
@@ -826,7 +879,18 @@ function showRoundComplete() {
 // ---- Input ----
 function handlePointerDown(x, y) {
   if (Game.drag.active) return;
-  if (MULTIPLAYER ? !mpCanPutt : Game.state !== 'AIMING') return;
+  if (MULTIPLAYER) {
+    if (!mpCanPutt) return;
+  } else {
+    const hole = currentHoles()[Game.currentHoleIndex];
+    if (Game.state !== 'AIMING' && !mayPuttBall(Game.ball, hole, Game.speedTracker)) return;
+    if (Game.state !== 'AIMING' && mayPuttBall(Game.ball, hole, Game.speedTracker)) {
+      Game.ball.vx = 0;
+      Game.ball.vy = 0;
+      Game.state = 'AIMING';
+    }
+    if (Game.state !== 'AIMING') return;
+  }
   Game.drag.active = true;
   Game.drag.pointerVec = { x: 0, y: 0 };
 }
@@ -856,6 +920,7 @@ function launchBall(dragLen, pointerVec) {
   updateHUD();
   soundPutt(v.speed / MAX_LAUNCH_SPEED);
   Game.state = 'BALL_MOVING';
+  resetSpeedAvgTracker(Game.speedTracker);
 }
 function handlePointerUp(x, y) {
   if (!Game.drag.active) return;
@@ -927,12 +992,24 @@ document.getElementById('btn-next').addEventListener('click', () => {
 document.getElementById('btn-replay').addEventListener('click', () => { soundClick(); startGame(); });
 const btnRespawn = document.getElementById('btn-respawn');
 const btnRespawnDismiss = document.getElementById('btn-respawn-dismiss');
-if (btnRespawn) btnRespawn.addEventListener('click', requestRespawn);
+if (btnRespawn) {
+  btnRespawn.addEventListener('click', requestRespawn);
+  // Pointerdown so a canvas-style drag never steals the press on touch devices.
+  btnRespawn.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+  });
+}
 if (btnRespawnDismiss) {
-  btnRespawnDismiss.addEventListener('click', () => {
+  btnRespawnDismiss.addEventListener('click', (e) => {
+    if (e && e.stopPropagation) e.stopPropagation();
     soundClick();
     hideRespawnOffer();
     respawnDismissedUntilSettle = true;
+  });
+  btnRespawnDismiss.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
   });
 }
 
@@ -947,15 +1024,28 @@ function update(dt) {
     advanceHoleObstacles(hole, dt);
   }
   Game.flagPhase += dt;
+  // Track speed for quasi-rest putt escape (solo). MP uses per-player trackers in sim.
+  if (!MULTIPLAYER) {
+    noteSpeedSample(Game.speedTracker, Math.hypot(Game.ball.vx, Game.ball.vy), dt);
+  }
   // Orbit: while AIMING, only wake physics when a field is actually yanking the ball
   // (moon sweep, fall into well). Do NOT force BALL_MOVING every frame while at rest on a
   // planet crust/sand — that caused an infinite soft-collision loop and blocked putting.
+  // Quasi-rest: hold AIMING so a stuck soft-bounce can be putted after ~5s near-zero avg v.
   const hasGravity = (hole.gravityBodies || []).length > 0;
   if (Game.state === 'BALL_MOVING') {
     updateBallPhysics(dt);
-  } else if (Game.state === 'AIMING' && hasGravity && !ballMayRestForAim(Game.ball, hole)) {
+  } else if (
+    Game.state === 'AIMING' &&
+    hasGravity &&
+    !ballMayRestForAim(Game.ball, hole) &&
+    !isQuasiRest(Game.speedTracker)
+  ) {
     Game.state = 'BALL_MOVING';
     updateBallPhysics(dt);
+  } else if (Game.state === 'AIMING' && isQuasiRest(Game.speedTracker)) {
+    Game.ball.vx = 0;
+    Game.ball.vy = 0;
   }
   if (Game.state === 'HAZARD_RESET') {
     Game.hazardTimer -= dt;
@@ -1500,13 +1590,8 @@ function mpSyncSelfFromPlayer(p) {
   Game.ball.vy = p.vy;
   Game.ball.z = p.z || 0;
   Game.ball.vz = p.vz || 0;
-  const speed = Math.hypot(p.vx, p.vy);
   const hole = currentHoles()[Game.currentHoleIndex];
-  mpCanPutt =
-    !p.holedOut &&
-    speed < STOP_THRESHOLD &&
-    (p.z || 0) === 0 &&
-    ballMayRestForAim(p, hole);
+  mpCanPutt = !p.holedOut && mayPuttBall(p, hole, Game.speedTracker);
   setHudText(hudStrokes, `Strokes: ${p.strokes}`);
 }
 
@@ -1521,6 +1606,13 @@ function mpApplyAuthorityPose(p, b, hard) {
   // Instant Δv (or mid-coast x/y snap) rewrites the integration path under the ball —
   // visual error decay cannot hide that kink. Soft packets are juice/meta only until
   // a hard discrete event (clash/water/holed/idle/resync) or catastrophic error.
+  // Also ignore soft poses for self during post-respawn grace (soft idle undid tee reset).
+  const selfRespawnGrace =
+    p.id === mpPlayerId && performance.now() < respawnSoftGraceUntil;
+  if (!hard && selfRespawnGrace) {
+    if (typeof b.strokes === 'number' && b.strokes > p.strokes) p.strokes = b.strokes;
+    return;
+  }
   if (!hard && moving && !b.holedOut) {
     if (typeof b.strokes === 'number' && b.strokes > p.strokes) p.strokes = b.strokes;
     p.rx = p.x + p.errX;
@@ -1609,6 +1701,7 @@ function mpApplyPuttLocal(playerId, dragVector, fromServer, playSound) {
   p.ry = p.y;
   if (playSound) soundPutt(Math.hypot(p.vx, p.vy) / MAX_LAUNCH_SPEED);
   if (playerId === mpPlayerId) {
+    resetSpeedAvgTracker(Game.speedTracker);
     mpSyncSelfFromPlayer(p);
     mpCanPutt = false;
   }
@@ -1748,6 +1841,12 @@ function mpStepOneTick() {
         }
       }
     }
+  }
+  // Quasi-rest window for local player (host validates with its own tracker).
+  const me = Game.players.get(mpPlayerId);
+  if (me && !me.holedOut) {
+    noteSpeedSample(Game.speedTracker, Math.hypot(me.vx || 0, me.vy || 0), TICK_DT);
+    mpSyncSelfFromPlayer(me);
   }
 }
 

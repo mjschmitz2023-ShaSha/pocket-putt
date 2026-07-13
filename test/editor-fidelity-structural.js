@@ -115,14 +115,22 @@ function main() {
     'editor.js advances movers while ball rolling'
   );
 
-  // --- Ghost trajectory freezes movers ---
+  // --- Ghost trajectory freezes movers; progressive create/step (no hard 5s path cap) ---
   assert.ok(
-    /simulateTrajectory\s*\(/.test(editorSrc),
-    'editor.js calls simulateTrajectory'
+    /createTrajectorySim\s*\(/.test(editorSrc) && /stepTrajectorySim\s*\(/.test(editorSrc),
+    'editor.js uses progressive createTrajectorySim + stepTrajectorySim'
   );
   assert.ok(
-    /advanceMovers\s*:\s*false/.test(editorSrc),
-    'editor.js simulateTrajectory uses advanceMovers: false'
+    /advanceMovers\s*:\s*true/.test(editorSrc),
+    'editor.js ghost sim advances movers (projects live animation)'
+  );
+  assert.ok(
+    /GHOST_TICKS_PER_FRAME/.test(editorSrc),
+    'editor.js soft-caps ghost ticks per frame'
+  );
+  assert.ok(
+    !/maxTicks\s*:\s*60\s*\*\s*5/.test(editorSrc),
+    'editor.js does not hard-cap ghost at 5s of physics'
   );
 
   // --- editor-gizmos exports ---

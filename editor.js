@@ -7,12 +7,13 @@
     MAX_DRAG_DIST, MIN_DRAG_DIST, STOP_THRESHOLD,
     CUP_GRAVITY_RADIUS,
     blankHole, normalizeHole, validateHole, encodeHole, decodeHole,
-    deepCloneHole, simulateTrajectory,
+    deepCloneHole, createTrajectorySim, stepTrajectorySim,
     wall, sandRect, waterRect, boostRect, rampRect, stickyRect,
     pendulum, slidingGate, planet, blackHole, moon,
     createBallState, stepBallPhysics, advanceHoleObstacles, resetHoleObstacles,
     computeLaunchVelocity, clampDragVector, stickyLaunchFactor, latchStickyAfterPutt, noteWetPutt,
     markWetFromWater, ballMayRestForAim, cupHasGravity,
+    createSpeedAvgTracker, resetSpeedAvgTracker, noteSpeedSample, isQuasiRest, mayPuttBall,
     getWindmillBlades, getPendulumSegment, getSlidingGateSegment,
     COURSES, zoneBounds, TICK_DT,
   } = S;
@@ -41,6 +42,13 @@
   let testStrokes = 0;
   let testDrag = { active: false, pointerVec: { x: 0, y: 0 } };
   let trajectoryPts = [];
+  /** Progressive ghost sim; same aim key continues across frames until natural end. */
+  let ghostSim = null;
+  let lastGhostKey = '';
+  /** Soft physics-tick budget per animation frame while aiming (UI stay snappy). */
+  const GHOST_TICKS_PER_FRAME = 48;
+  /** Quasi-rest: allow putt if avg |v| stays near 0 for ~5s (stuck bumper chatter). */
+  let testSpeedTracker = createSpeedAvgTracker();
   let lastTime = 0;
   /** Fixed-step residual for Test physics (matches Shared.TICK_DT / game TICK_HZ). */
   let testPhysAcc = 0;
@@ -1148,7 +1156,8 @@
     testState = 'AIMING';
     testStrokes = 0;
     testDrag = { active: false, pointerVec: { x: 0, y: 0 } };
-    trajectoryPts = [];
+    testSpeedTracker = createSpeedAvgTracker();
+    clearGhostTrajectory();
     testPhysAcc = 0;
     mode = 'test';
     testHud.classList.remove('hidden');
@@ -1162,7 +1171,7 @@
     draftSnapshot = null;
     mode = 'edit';
     testBall = null;
-    trajectoryPts = [];
+    clearGhostTrajectory();
     testPhysAcc = 0;
     testHud.classList.add('hidden');
     powerEl.classList.add('hidden');
@@ -1176,7 +1185,12 @@
 
   /** @returns {boolean} true if aim drag started (caller should capture pointer) */
   function handleTestPointerDown(p) {
-    if (testState !== 'AIMING') return false;
+    if (testState !== 'AIMING') {
+      if (!mayPuttBall(testBall, hole, testSpeedTracker)) return false;
+      testBall.vx = 0;
+      testBall.vy = 0;
+      testState = 'AIMING';
+    }
     if (Math.hypot(p.x - testBall.x, p.y - testBall.y) > 40) return false;
     testDrag.active = true;
     testDrag.pointerVec = { x: 0, y: 0 };
@@ -1197,7 +1211,7 @@
     if (!testDrag.active) return;
     testDrag.active = false;
     const clamped = clampDragVector(testDrag.pointerVec);
-    trajectoryPts = [];
+    clearGhostTrajectory();
     powerEl.classList.add('hidden');
     if (!clamped) return;
     const launch = computeLaunchVelocity(clamped);
@@ -1211,37 +1225,46 @@
     testBall.firedBoosts = new Set();
     testStrokes++;
     testState = 'BALL_MOVING';
-    trajectoryPts = [];
-    lastGhostKey = '';
+    resetSpeedAvgTracker(testSpeedTracker);
     if (testStrokesEl) testStrokesEl.textContent = 'Strokes: ' + testStrokes;
   }
 
-  let lastGhostKey = '';
-  let lastGhostAt = 0;
+  function clearGhostTrajectory() {
+    ghostSim = null;
+    lastGhostKey = '';
+    trajectoryPts = [];
+  }
 
+  /**
+   * Progressive ghost: soft tick budget per call; same aim key continues until
+   * the ball naturally ends (rest / hazard / hole). Input change restarts.
+   */
   function updateTrajectory() {
     const clamped = clampDragVector(testDrag.pointerVec);
     if (!clamped) {
-      trajectoryPts = [];
-      lastGhostKey = '';
+      clearGhostTrajectory();
+      powerEl.classList.add('hidden');
       return;
     }
-    // Throttle ghost re-sim (full hole clone + hundreds of ticks) to keep Test interactive.
+    // Quantize aim so sub-pixel jitter does not thrash the sim restart.
     const key = clamped.x.toFixed(0) + ',' + clamped.y.toFixed(0);
-    const now = performance.now();
-    if (key === lastGhostKey && now - lastGhostAt < 40 && trajectoryPts.length > 1) {
-      // still refresh power label
-    } else {
+    if (key !== lastGhostKey) {
       lastGhostKey = key;
-      lastGhostAt = now;
       const launch = computeLaunchVelocity(clamped);
       const factor = stickyLaunchFactor(testBall, hole);
-      // Ghost freezes movers (advanceMovers:false) but still runs full stepBallPhysics.
-      trajectoryPts = simulateTrajectory(hole, testBall, launch.vx * factor, launch.vy * factor, {
-        advanceMovers: false,
-        maxTicks: 60 * 5,
+      // Clone starts from live (frozen-on-aim) pose, then animates movers so the
+      // ghost path includes future windmill/pendulum/gate/moon motion.
+      ghostSim = createTrajectorySim(hole, testBall, launch.vx * factor, launch.vy * factor, {
+        advanceMovers: true,
         sampleEvery: 3,
       });
+      trajectoryPts = ghostSim.pts;
+    }
+    if (ghostSim && !ghostSim.done) {
+      stepTrajectorySim(ghostSim, GHOST_TICKS_PER_FRAME);
+      trajectoryPts = ghostSim.pts;
+    } else if (ghostSim) {
+      trajectoryPts = ghostSim.pts;
     }
     const power = Math.min(clamped.len / MAX_DRAG_DIST, 1);
     powerEl.classList.remove('hidden');
@@ -1267,7 +1290,7 @@
       markWetFromWater(testBall);
       testStrokes++;
       testDrag.active = false;
-      trajectoryPts = [];
+      clearGhostTrajectory();
       testState = 'AIMING';
       return;
     }
@@ -1275,7 +1298,7 @@
       testBall = createBallState(hole.tee);
       testStrokes++;
       testDrag.active = false;
-      trajectoryPts = [];
+      clearGhostTrajectory();
       testState = 'AIMING';
       return;
     }
@@ -1284,7 +1307,7 @@
       testBall = createBallState(hole.tee);
       resetHoleObstacles(hole);
       testDrag.active = false;
-      trajectoryPts = [];
+      clearGhostTrajectory();
       testState = 'AIMING';
       return;
     }
@@ -1294,13 +1317,18 @@
       const nearCup =
         cupHasGravity(hole) &&
         Math.hypot(testBall.x - hole.cup.x, testBall.y - hole.cup.y) < CUP_GRAVITY_RADIUS;
-      if (!nearCup && ballMayRestForAim(testBall, hole)) {
+      if (!nearCup && (ballMayRestForAim(testBall, hole) || isQuasiRest(testSpeedTracker))) {
         testBall.vx = 0;
         testBall.vy = 0;
         testBall.firedBoosts = new Set();
         testState = 'AIMING';
       }
       // else stay BALL_MOVING (cup divot / gravity settle)
+    } else if (isQuasiRest(testSpeedTracker)) {
+      testBall.vx = 0;
+      testBall.vy = 0;
+      testBall.firedBoosts = new Set();
+      testState = 'AIMING';
     }
   }
 
@@ -1313,12 +1341,23 @@
   function updateTest(dt) {
     const hasGravity = (hole.gravityBodies || []).length > 0;
 
-    // Match game.js solo: wake when a field is yanking the ball (cannot rest/aim).
-    if (testState === 'AIMING' && hasGravity && !ballMayRestForAim(testBall, hole)) {
+    noteSpeedSample(testSpeedTracker, Math.hypot(testBall.vx || 0, testBall.vy || 0), dt);
+
+    // Match game.js solo: wake when a field is yanking the ball (cannot rest/aim),
+    // unless quasi-rest allows a stuck putt escape.
+    if (
+      testState === 'AIMING' &&
+      hasGravity &&
+      !ballMayRestForAim(testBall, hole) &&
+      !isQuasiRest(testSpeedTracker)
+    ) {
       testState = 'BALL_MOVING';
       testDrag.active = false;
-      trajectoryPts = [];
+      clearGhostTrajectory();
       powerEl.classList.add('hidden');
+    } else if (testState === 'AIMING' && isQuasiRest(testSpeedTracker)) {
+      testBall.vx = 0;
+      testBall.vy = 0;
     }
 
     // Freeze only while human is dragging aim (trajectory ghost), not all of AIMING.
@@ -1332,7 +1371,8 @@
       // Ball at rest, not dragging — world keeps moving so timing is visible.
       advanceHoleObstacles(hole, dt);
     }
-    // AIMING + testDrag.active: hold obstacle clock for ghost accuracy.
+    // AIMING + testDrag.active: hold obstacle clock; keep extending ghost path.
+    if (freezeMovers) updateTrajectory();
   }
 
   function drawTest() {

@@ -38,11 +38,15 @@ html, body {
 }
 
 canvas#game {
+  position: absolute;
+  left: 0;
+  top: 0;
   display: block;
   width: 800px;
   height: 500px;
   touch-action: none;
   cursor: crosshair;
+  z-index: 0;
 }
 
 #hud {
@@ -98,7 +102,8 @@ canvas#game {
   left: 50%;
   bottom: 22px;
   transform: translateX(-50%);
-  z-index: 20;
+  /* Above canvas (z=0) and HUD so the button always receives clicks. */
+  z-index: 30;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -118,6 +123,8 @@ canvas#game {
   opacity: 0.9;
 }
 #respawn-offer button {
+  position: relative;
+  z-index: 1;
   min-width: 160px;
   padding: 8px 14px;
   border-radius: 8px;
@@ -125,6 +132,7 @@ canvas#game {
   font-size: 14px;
   font-weight: 700;
   cursor: pointer;
+  pointer-events: auto;
 }
 #btn-respawn {
   background: #3d8f5a;

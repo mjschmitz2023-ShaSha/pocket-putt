@@ -37,6 +37,10 @@ const CUP_CAPTURE_MAX_SPEED = 300;
 const LOW_SPEED_CUTOFF = 60;
 const LOW_SPEED_DRAG = 3.5;
 const WALL_RESTITUTION = 0.8;
+/** Drawn stroke width for walls/blades/gates (must match draw.js WALL_DRAW_WIDTH). */
+const WALL_THICKNESS = 10;
+/** Half of stroke width — solid surface is this far from the segment centerline. */
+const WALL_HALF_WIDTH = WALL_THICKNESS / 2;
 const BUMPER_RESTITUTION = 1.05;
 const PENDULUM_RESTITUTION = 0.95;
 const GATE_RESTITUTION = 0.85;
@@ -252,6 +256,63 @@ function ballMayRestForAim(ball, hole) {
   // Free grass / sand bunker: still no rest if net pull (after sand) is strong (moon yank).
   if (effectiveGravityMag(ball, hole) >= REST_GRAVITY_EPS) return false;
   return true;
+}
+
+/**
+ * Quasi-rest: if average |v| stays near zero for several seconds (e.g. endless
+ * soft-bounce on a bumper in a gravity well), allow a putt even though the ball
+ * is not a clean AIMING rest. Window + threshold are shared by solo/MP/editor.
+ */
+const QUASI_REST_WINDOW_S = 5;
+const QUASI_REST_AVG_SPEED = 30; // mean speed "close to 0" (STOP_THRESHOLD is 18)
+
+function createSpeedAvgTracker() {
+  return { sumSpDt: 0, sumDt: 0, q: [] };
+}
+
+function resetSpeedAvgTracker(tr) {
+  if (!tr) return createSpeedAvgTracker();
+  tr.sumSpDt = 0;
+  tr.sumDt = 0;
+  tr.q.length = 0;
+  return tr;
+}
+
+/** Record one speed sample over dt seconds (drops samples older than the window). */
+function noteSpeedSample(tr, speed, dt) {
+  if (!tr || !(dt > 0) || !Number.isFinite(speed)) return tr;
+  const sp = Math.max(0, speed);
+  tr.q.push(sp, dt);
+  tr.sumSpDt += sp * dt;
+  tr.sumDt += dt;
+  while (tr.sumDt > QUASI_REST_WINDOW_S && tr.q.length >= 2) {
+    const oldSp = tr.q.shift();
+    const oldDt = tr.q.shift();
+    tr.sumSpDt -= oldSp * oldDt;
+    tr.sumDt -= oldDt;
+  }
+  return tr;
+}
+
+function speedAvg(tr) {
+  if (!tr || tr.sumDt <= 1e-9) return Infinity;
+  return tr.sumSpDt / tr.sumDt;
+}
+
+function isQuasiRest(tr) {
+  return !!(tr && tr.sumDt >= QUASI_REST_WINDOW_S - 1e-6 && speedAvg(tr) < QUASI_REST_AVG_SPEED);
+}
+
+/**
+ * True if the player may start a putt: clean rest, or quasi-rest escape hatch.
+ * Does not require airborne false alone for quasi-rest — still blocks z>0.
+ */
+function mayPuttBall(ball, hole, speedTracker) {
+  if (!ball || (ball.z || 0) > 0) return false;
+  const speed = Math.hypot(ball.vx || 0, ball.vy || 0);
+  if (speed < STOP_THRESHOLD && ballMayRestForAim(ball, hole)) return true;
+  if (isQuasiRest(speedTracker)) return true;
+  return false;
 }
 
 /**
@@ -1307,6 +1368,11 @@ for (const c of COURSES) {
 }
 
 // ---- Physics ----
+/**
+ * Circle (ball surface) vs thick segment (wall centerline ± WALL_HALF_WIDTH).
+ * Contact when center is within BALL_RADIUS + WALL_HALF_WIDTH of the segment —
+ * not centroid-vs-centerline (which sank the ball into the drawn stroke).
+ */
 function resolveWallCollision(ball, w) {
   const dx = w.x2 - w.x1, dy = w.y2 - w.y1;
   const lenSq = dx * dx + dy * dy;
@@ -1315,9 +1381,11 @@ function resolveWallCollision(ball, w) {
   const cx = w.x1 + t * dx, cy = w.y1 + t * dy;
   const distX = ball.x - cx, distY = ball.y - cy;
   const dist = Math.hypot(distX, distY);
-  if (dist < BALL_RADIUS && dist > 0.0001) {
+  // Surface-to-surface: ball disk vs stadium (capsule) around the segment.
+  const contactR = BALL_RADIUS + WALL_HALF_WIDTH;
+  if (dist < contactR && dist > 0.0001) {
     const nx = distX / dist, ny = distY / dist;
-    const overlap = BALL_RADIUS - dist;
+    const overlap = contactR - dist;
     ball.x += nx * (overlap + 0.1);
     ball.y += ny * (overlap + 0.1);
     // Moving obstacles (windmill blades, pendulums, gates) carry surface velocity at the
@@ -2306,19 +2374,31 @@ function decodeHole(str) {
 }
 
 /**
- * Ghost path for editor Test aim. Clones hole obstacle phase; does not mutate inputs.
+ * Absolute ceiling so pathological paths (stable gravity orbits that never rest)
+ * cannot run forever. Not a design target for normal putts — progressive ghost
+ * stops at natural end well before this.
+ */
+const TRAJECTORY_SAFETY_MAX_TICKS = TICK_HZ * 120; // 2 minutes of sim time
+
+/**
+ * Start a ghost trajectory sim (clones hole; does not mutate inputs).
+ * Call stepTrajectorySim repeatedly with a soft per-frame budget until sim.done.
+ *
  * @param {object} hole
  * @param {{x,y,z?,vz?,stuckStickyIndex?,wet?,wetStroke?}} startBall
  * @param {number} vx
  * @param {number} vy
- * @param {{maxTicks?,sampleEvery?,advanceMovers?}} opts
- *   advanceMovers default false (matches freeze-on-aim ghost).
+ * @param {{sampleEvery?,advanceMovers?,safetyMaxTicks?}} opts
+ *   advanceMovers: when true (editor default), clone advances windmills/gates/etc.
+ *   from the snapshot pose so the ghost path matches a live putt. Default false
+ *   for one-shot callers that want a frozen world.
+ * @returns {object} sim — { pts, done, endReason, ticksRun, ... }
  */
-function simulateTrajectory(hole, startBall, vx, vy, opts) {
+function createTrajectorySim(hole, startBall, vx, vy, opts) {
   opts = opts || {};
-  const maxTicks = opts.maxTicks != null ? opts.maxTicks : TICK_HZ * 10;
   const sampleEvery = opts.sampleEvery != null ? opts.sampleEvery : 2;
-  const advanceMovers = !!opts.advanceMovers;
+  const advanceMovers = opts.advanceMovers === true;
+  const safetyMaxTicks = opts.safetyMaxTicks != null ? opts.safetyMaxTicks : TRAJECTORY_SAFETY_MAX_TICKS;
 
   const h = normalizeHole(JSON.parse(JSON.stringify({
     name: hole.name,
@@ -2376,22 +2456,69 @@ function simulateTrajectory(hole, startBall, vx, vy, opts) {
   ball.vy = vy;
   ball.firedBoosts = new Set();
 
-  const pts = [{ x: ball.x, y: ball.y }];
-  for (let t = 0; t < maxTicks; t++) {
-    if (advanceMovers) advanceHoleObstacles(h, TICK_DT);
-    const ev = stepBallPhysics(ball, h, TICK_DT);
-    if (t % sampleEvery === 0) pts.push({ x: ball.x, y: ball.y });
-    if (ev.holed || ev.water || ev.blackHole) {
-      pts.push({ x: ball.x, y: ball.y });
+  return {
+    h,
+    ball,
+    pts: [{ x: ball.x, y: ball.y }],
+    sampleEvery,
+    advanceMovers,
+    safetyMaxTicks,
+    ticksRun: 0,
+    done: false,
+    /** @type {null|'holed'|'water'|'blackHole'|'rest'|'safety'} */
+    endReason: null,
+  };
+}
+
+/**
+ * Advance a trajectory sim by up to budgetTicks physics steps.
+ * Soft per-frame budgets: same inputs → keep stepping until natural end.
+ * @returns {object} sim (mutated)
+ */
+function stepTrajectorySim(sim, budgetTicks) {
+  if (!sim || sim.done) return sim;
+  const budget = Math.max(0, budgetTicks | 0);
+  for (let i = 0; i < budget; i++) {
+    if (sim.ticksRun >= sim.safetyMaxTicks) {
+      sim.done = true;
+      sim.endReason = 'safety';
       break;
     }
-    const speed = Math.hypot(ball.vx, ball.vy);
-    if (speed < STOP_THRESHOLD && (ball.z || 0) === 0 && ballMayRestForAim(ball, h)) {
-      pts.push({ x: ball.x, y: ball.y });
+    if (sim.advanceMovers) advanceHoleObstacles(sim.h, TICK_DT);
+    const ev = stepBallPhysics(sim.ball, sim.h, TICK_DT);
+    if (sim.ticksRun % sim.sampleEvery === 0) {
+      sim.pts.push({ x: sim.ball.x, y: sim.ball.y });
+    }
+    sim.ticksRun++;
+    if (ev.holed || ev.water || ev.blackHole) {
+      sim.pts.push({ x: sim.ball.x, y: sim.ball.y });
+      sim.done = true;
+      sim.endReason = ev.holed ? 'holed' : (ev.water ? 'water' : 'blackHole');
+      break;
+    }
+    const speed = Math.hypot(sim.ball.vx, sim.ball.vy);
+    if (speed < STOP_THRESHOLD && (sim.ball.z || 0) === 0 && ballMayRestForAim(sim.ball, sim.h)) {
+      sim.pts.push({ x: sim.ball.x, y: sim.ball.y });
+      sim.done = true;
+      sim.endReason = 'rest';
       break;
     }
   }
-  return pts;
+  return sim;
+}
+
+/**
+ * One-shot ghost path (runs until natural end or maxTicks / safety).
+ * Prefer createTrajectorySim + stepTrajectorySim for progressive UI.
+ * @param {{maxTicks?,sampleEvery?,advanceMovers?,safetyMaxTicks?}} opts
+ *   maxTicks: optional hard budget for this call (tests / one-shot). Default = safety ceiling.
+ */
+function simulateTrajectory(hole, startBall, vx, vy, opts) {
+  opts = opts || {};
+  const sim = createTrajectorySim(hole, startBall, vx, vy, opts);
+  const maxTicks = opts.maxTicks != null ? opts.maxTicks : sim.safetyMaxTicks;
+  stepTrajectorySim(sim, maxTicks);
+  return sim.pts;
 }
 
 function deepCloneHole(hole) {
@@ -2402,7 +2529,8 @@ return {
   TICK_HZ, TICK_DT, TICK_MS, tickToElapsedMs, elapsedMsToTick,
   LOGICAL_W, LOGICAL_H, BALL_RADIUS, FRICTION_GRASS, FRICTION_SAND, SAND_GRAVITY_HOLD, STOP_THRESHOLD,
   CUP_GRAVITY_RADIUS,
-  WALL_RESTITUTION, BUMPER_RESTITUTION, PENDULUM_RESTITUTION, GATE_RESTITUTION,
+  WALL_RESTITUTION, WALL_THICKNESS, WALL_HALF_WIDTH,
+  BUMPER_RESTITUTION, PENDULUM_RESTITUTION, GATE_RESTITUTION,
   MAX_DRAG_DIST, MIN_DRAG_DIST, POWER_MULTIPLIER, MAX_LAUNCH_SPEED, BOOST_MAX_SPEED, BOUND,
   RAMP_MIN_SPEED, RAMP_GRAVITY, RAMP_VZ_SCALE, RAMP_VZ_MIN, RAMP_VZ_MAX,
   FRICTION_STICKY, STICKY_STOP_SPEED, STICKY_LAUNCH_FACTOR, FRICTION_WET_GOO,
@@ -2412,6 +2540,8 @@ return {
   zoneCenterXY, orientedRectCorners, circleTouchesOrientedRect, circleTouchesRamp,
   gravityBody, planet, blackHole, moon, escapeSpeed, bodyCanEscapeAtMaxLaunch,
   planetContactRadius, ballOnPlanetCrust, ballFloatingInGravity, ballMayRestForAim,
+  QUASI_REST_WINDOW_S, QUASI_REST_AVG_SPEED,
+  createSpeedAvgTracker, resetSpeedAvgTracker, noteSpeedSample, speedAvg, isQuasiRest, mayPuttBall,
   ballInSand, effectiveGravityMag, gravityAccelAt, REST_GRAVITY_EPS, SAND_GRAVITY_HOLD,
   setMoonPoseAtTick, applyGravityAcceleration, resolvePlanetCollision, blackHoleCaptures,
   BOUNDARY_WALLS, HOLES, ORBIT_HOLES, COURSES,
@@ -2422,7 +2552,8 @@ return {
   resolveBallBallCollision, teePositionFor,
   LEVEL_CODEC_VERSION, LEVEL_MAX_B64_LEN, LEVEL_CAPS, LEVEL_MAX_NAME_LEN,
   blankHole, normalizeHole, validateHole, encodeHole, decodeHole,
-  packHoleBytes, unpackHoleBytes, simulateTrajectory, deepCloneHole, holeObjectCounts,
+  packHoleBytes, unpackHoleBytes, simulateTrajectory, createTrajectorySim, stepTrajectorySim,
+  TRAJECTORY_SAFETY_MAX_TICKS, deepCloneHole, holeObjectCounts,
 };
 
 });

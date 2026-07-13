@@ -8,7 +8,7 @@
     "lan": "node relay.js",
     "relay": "node relay.js",
     "lan-legacy": "node server.js",
-    "test": "node test/level-codec.js && node test/draw-shared.js && node test/editor-phase.js && node test/editor-snap.js && node test/editor-gizmos.js && node test/editor-test-physics.js && node test/editor-fidelity-structural.js && node test/ramp-oriented.js && node test/boost-latch.js && node test/custom-mp-hole.js && node test/relay-static-files.js && node test/sticky-latch.js && node test/orbit-hio.js && node test/rubberband-harness.js --all",
+    "test": "node test/level-codec.js && node test/draw-shared.js && node test/editor-phase.js && node test/editor-snap.js && node test/editor-gizmos.js && node test/editor-test-physics.js && node test/editor-fidelity-structural.js && node test/ramp-oriented.js && node test/boost-latch.js && node test/custom-mp-hole.js && node test/relay-static-files.js && node test/sticky-latch.js && node test/wall-surface-collision.js && node test/quasi-rest.js && node test/respawn-offer.js && node test/orbit-hio.js && node test/rubberband-harness.js --all",
     "test:ramps": "node test/ramp-oriented.js",
     "test:boost": "node test/boost-latch.js",
     "test:level": "node test/level-codec.js",

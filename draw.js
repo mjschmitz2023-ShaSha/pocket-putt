@@ -20,7 +20,10 @@
 
   const BOOST_COLOR_A = '#8b2fd1';
   const BOOST_COLOR_B = '#2fd1c8';
-  /** Match game wall stroke thickness (physics contact is separate). */
+  /**
+   * Wall stroke width (must match Shared.WALL_THICKNESS = 10).
+   * Physics uses WALL_HALF_WIDTH so ball surface meets the drawn solid, not the centerline.
+   */
   const WALL_DRAW_WIDTH = 10;
 
   // Black-hole lens look — dialed in via bh-lens-demo.html
