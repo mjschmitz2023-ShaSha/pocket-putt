@@ -204,39 +204,59 @@ function tick() {
   Shared.advanceHoleObstacles(hole, dt);
 
   // Per-tick gameplay events, forwarded with snapshots so clients can play the matching
-  // sound/particle juice at the right moment (the client no longer runs its own physics
-  // in multiplayer, so it can't detect these locally).
+  // sound/particle juice at the right moment. Ball stepping and ball-vs-ball collision
+  // are INTERLEAVED in sub-ticks: at full speed two approaching balls close ~42px per
+  // tick while contact range is only 14px, so colliding once per tick let them tunnel
+  // straight through each other. Four sub-ticks brings closure per check under contact
+  // range, so rams always connect.
   const tickEvents = Lobby.pendingEvents;
-  for (const p of Lobby.players.values()) {
-    if (!p.connected || p.holedOut || !p.ball) continue;
-    const events = Shared.stepBallPhysics(p.ball, hole, dt);
-    if (events.bounced) tickEvents.push({ id: p.id, kind: 'bounce' });
-    if (events.enteredSand) tickEvents.push({ id: p.id, kind: 'sand' });
-    for (const z of events.boosts) tickEvents.push({ id: p.id, kind: 'boost', x: p.ball.x, y: p.ball.y, angle: p.ball.angleDir });
-    if (events.water) {
-      p.strokes++;
-      tickEvents.push({ id: p.id, kind: 'water', x: p.ball.x, y: p.ball.y });
-      p.ball.x = events.water.dropPoint.x;
-      p.ball.y = events.water.dropPoint.y;
-      p.ball.vx = 0;
-      p.ball.vy = 0;
+  const SUBTICKS = 4;
+  const bouncedThisTick = new Set(); // dedupe per-player bounce/sand noise across sub-ticks
+  const sandedThisTick = new Set();
+  const clashedPairs = new Set();
+  for (let s = 0; s < SUBTICKS; s++) {
+    for (const p of Lobby.players.values()) {
+      if (!p.connected || p.holedOut || !p.ball) continue;
+      const events = Shared.stepBallPhysics(p.ball, hole, dt / SUBTICKS);
+      if (events.bounced && !bouncedThisTick.has(p.id)) {
+        bouncedThisTick.add(p.id);
+        tickEvents.push({ id: p.id, kind: 'bounce' });
+      }
+      if (events.enteredSand && !sandedThisTick.has(p.id)) {
+        sandedThisTick.add(p.id);
+        tickEvents.push({ id: p.id, kind: 'sand' });
+      }
+      for (const z of events.boosts) tickEvents.push({ id: p.id, kind: 'boost', x: p.ball.x, y: p.ball.y, angle: p.ball.angleDir });
+      if (events.water) {
+        p.strokes++;
+        tickEvents.push({ id: p.id, kind: 'water', x: p.ball.x, y: p.ball.y });
+        p.ball.x = events.water.dropPoint.x;
+        p.ball.y = events.water.dropPoint.y;
+        p.ball.vx = 0;
+        p.ball.vy = 0;
+      }
+      if (events.holed) {
+        finishPlayerHole(p, false);
+        tickEvents.push({ id: p.id, kind: 'holed', strokes: p.strokes });
+      }
     }
-    if (events.holed) {
-      finishPlayerHole(p, false);
-      tickEvents.push({ id: p.id, kind: 'holed', strokes: p.strokes });
-    }
-  }
 
-  // Ball-vs-ball collisions: ram away. Holed-out balls are ghosts.
-  const active = [...Lobby.players.values()].filter((p) => p.connected && p.ball && !p.holedOut);
-  for (let i = 0; i < active.length; i++) {
-    for (let j = i + 1; j < active.length; j++) {
-      const a = active[i].ball, b = active[j].ball;
-      if (Shared.resolveBallBallCollision(a, b)) {
-        tickEvents.push({ kind: 'clash', x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
+    // Ball-vs-ball collisions each sub-tick. Holed-out balls are ghosts.
+    const activeNow = [...Lobby.players.values()].filter((p) => p.connected && p.ball && !p.holedOut);
+    for (let i = 0; i < activeNow.length; i++) {
+      for (let j = i + 1; j < activeNow.length; j++) {
+        const a = activeNow[i].ball, b = activeNow[j].ball;
+        if (Shared.resolveBallBallCollision(a, b)) {
+          const key = activeNow[i].id + '|' + activeNow[j].id;
+          if (!clashedPairs.has(key)) {
+            clashedPairs.add(key);
+            tickEvents.push({ kind: 'clash', x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
+          }
+        }
       }
     }
   }
+  const active = [...Lobby.players.values()].filter((p) => p.connected && p.ball && !p.holedOut);
 
   const connected = [...Lobby.players.values()].filter((p) => p.connected);
   const elapsed = Date.now() - Lobby.holeStartedAtMs;

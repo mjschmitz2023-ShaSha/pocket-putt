@@ -868,6 +868,15 @@ function handlePointerUp(x, y) {
   if (MULTIPLAYER) {
     mpSocket.send(JSON.stringify({ type: 'putt', dragVector: v }));
     mpCanPutt = false; // re-armed once the next snapshot shows the ball stopped again
+    // Client-side prediction: launch the local copy of our ball immediately so the shot
+    // responds with zero perceived latency; server snapshots blend-correct any drift.
+    const lv = computeLaunchVelocity(v);
+    Game.ball.firedBoosts.clear();
+    Game.ball.vx = lv.vx;
+    Game.ball.vy = lv.vy;
+    Game.ball.squash = 0.6;
+    Game.ball.angleDir = Math.atan2(lv.vy, lv.vx);
+    soundPutt(lv.speed / MAX_LAUNCH_SPEED);
   } else {
     launchBall(len, v);
   }
@@ -914,7 +923,27 @@ function update(dt) {
   // everyone stays corrected to the authoritative timeline while animating smoothly
   // between packets — even during 5Hz idle keepalives.
   advanceHoleObstacles(hole, dt);
-  if (MULTIPLAYER) mpInterpolateBalls();
+  if (MULTIPLAYER) {
+    // Predict our own ball locally every frame (same shared physics the server runs) so
+    // our shots and bounces feel instant; sounds/particles for our ball come from this
+    // local sim, while water/holed outcomes stay server-authoritative.
+    const meSnap = Game.players.get(mpPlayerId);
+    if (meSnap && !meSnap.holedOut) {
+      const evs = stepBallPhysics(Game.ball, hole, dt);
+      if (evs.bounced) maybePlayBounceSound();
+      if (evs.enteredSand) soundSand();
+      for (const z of evs.boosts) {
+        spawnBoostSpark(Game.ball.x, Game.ball.y, Game.ball.angleDir);
+        soundBoost();
+      }
+      if (evs.water || evs.holed) {
+        Game.ball.vx = 0;
+        Game.ball.vy = 0; // freeze and let the server's verdict arrive
+      }
+      Game.ball.squash *= Math.exp(-10 * dt);
+    }
+    mpInterpolateBalls();
+  }
   Game.flagPhase += dt;
   if (Game.state === 'BALL_MOVING') updateBallPhysics(dt);
   if (Game.state === 'HAZARD_RESET') {
@@ -1096,10 +1125,21 @@ function mpApplySnapshot(msg) {
 
   const me = Game.players.get(mpPlayerId);
   if (me) {
-    Game.ball.x = me.x;
-    Game.ball.y = me.y;
-    Game.ball.vx = me.vx;
-    Game.ball.vy = me.vy;
+    // Reconcile prediction with the server: snap on big divergence (we got rammed, or a
+    // water teleport we predicted differently), otherwise absorb the error gently so the
+    // correction is invisible.
+    const errX = me.x - Game.ball.x, errY = me.y - Game.ball.y;
+    if (Math.hypot(errX, errY) > 60) {
+      Game.ball.x = me.x;
+      Game.ball.y = me.y;
+      Game.ball.vx = me.vx;
+      Game.ball.vy = me.vy;
+    } else {
+      Game.ball.x += errX * 0.15;
+      Game.ball.y += errY * 0.15;
+      Game.ball.vx += (me.vx - Game.ball.vx) * 0.15;
+      Game.ball.vy += (me.vy - Game.ball.vy) * 0.15;
+    }
     const speed = Math.hypot(me.vx, me.vy);
     mpCanPutt = !me.holedOut && speed < STOP_THRESHOLD;
     mpUpdateHUD(msg);
@@ -1140,6 +1180,14 @@ function mpInterpolateBalls() {
       p.ry = b1.y;
     }
   }
+  // Our own ball renders from the local prediction, not the delayed interp buffer.
+  const meP = Game.players.get(mpPlayerId);
+  if (meP && !meP.holedOut) {
+    meP.rx = Game.ball.x;
+    meP.ry = Game.ball.y;
+    meP.vx = Game.ball.vx;
+    meP.vy = Game.ball.vy;
+  }
   // Smooth timer between packets (also during 5Hz idle keepalives).
   setHudText(hudTotal, `Time: ${(mpEstimatedElapsedMs() / 1000).toFixed(1)}s`);
   // Prune history we can no longer render.
@@ -1162,15 +1210,14 @@ function mpShowBanner(text) {
 function mpHandleEvent(ev, hole) {
   const mine = ev.id === mpPlayerId;
   switch (ev.kind) {
+    // Our own bounce/sand/boost feedback comes from the local prediction sim (instant);
+    // the server copies of those events are skipped for us to avoid doubles.
     case 'bounce':
-      if (mine) maybePlayBounceSound();
       break;
     case 'sand':
-      if (mine) soundSand();
       break;
     case 'boost':
-      spawnBoostSpark(ev.x, ev.y, ev.angle);
-      if (mine) soundBoost();
+      if (!mine) spawnBoostSpark(ev.x, ev.y, ev.angle);
       break;
     case 'water':
       spawnSplash(ev.x, ev.y);
