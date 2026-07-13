@@ -166,8 +166,8 @@ wss.on('connection', (ws, req) => {
       const t = msg.type;
       if (t === 'relay_create') {
         if (rooms.size >= MAX_ROOMS) {
+          // Keep socket open so the client can retry without a full page refresh.
           send(ws, { type: 'relay_error', code: 'server_full' });
-          ws.close();
           return;
         }
         const room = createRoom();
@@ -179,7 +179,6 @@ wss.on('connection', (ws, req) => {
         if (error || !player) {
           destroyRoom(room.code);
           send(ws, { type: 'relay_error', code: error || 'join_failed' });
-          ws.close();
           return;
         }
         binding = { room, player };
@@ -198,16 +197,15 @@ wss.on('connection', (ws, req) => {
       if (t === 'relay_join' || t === 'relay_reconnect') {
         const room = getRoom(msg.room_code);
         if (!room) {
+          // Expired/stale room codes are common after free-tier sleep — do NOT close
+          // the socket; the client can Create Room or Join a different code next.
           send(ws, { type: 'relay_error', code: 'room_not_found' });
-          ws.close();
           return;
         }
         const reconnectToken =
           msg.reconnect_token || msg.reconnectToken || msg.token || null;
-        // reconnect path: token must match an existing player
         if (t === 'relay_reconnect' && !reconnectToken) {
           send(ws, { type: 'relay_error', code: 'bad_token' });
-          ws.close();
           return;
         }
         const { player, error, reconnected } = room.session.addPlayer(
@@ -217,28 +215,17 @@ wss.on('connection', (ws, req) => {
             reconnectToken,
             isLocal: false,
           },
-          { quiet: true }
+          { quiet: true, requireReconnect: t === 'relay_reconnect' }
         );
         if (error === 'room_full') {
           send(ws, { type: 'relay_error', code: 'room_full' });
-          ws.close();
           return;
         }
-        if (!player) {
+        if (!player || (t === 'relay_reconnect' && !reconnected)) {
           send(ws, {
             type: 'relay_error',
-            code: t === 'relay_reconnect' ? 'bad_token' : 'join_failed',
+            code: t === 'relay_reconnect' ? 'bad_token' : error || 'join_failed',
           });
-          ws.close();
-          return;
-        }
-        // join with a bad token falls through to a new player — fine for relay_join.
-        // For relay_reconnect we require an actual reconnect.
-        if (t === 'relay_reconnect' && !reconnected) {
-          // New player was created by mistake if token didn't match — remove and error.
-          room.session.players.delete(player.id);
-          send(ws, { type: 'relay_error', code: 'bad_token' });
-          ws.close();
           return;
         }
         binding = { room, player };
@@ -253,9 +240,9 @@ wss.on('connection', (ws, req) => {
         return;
       }
 
-      // LAN-style join is not valid on the multi-room relay.
+      // LAN-style join is not valid on the multi-room relay — keep socket open for a
+      // proper relay_create / relay_join next.
       send(ws, { type: 'relay_error', code: 'bad_handshake' });
-      ws.close();
       return;
     }
 

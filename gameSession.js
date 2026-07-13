@@ -451,6 +451,7 @@ class GameSession {
 
   addPlayer(ws, { name, reconnectToken, isLocal }, opts = {}) {
     const quiet = !!opts.quiet;
+    const requireReconnect = !!opts.requireReconnect;
     this.touch();
     if (reconnectToken) {
       const existing = [...this.players.values()].find((p) => p.reconnectToken === reconnectToken);
@@ -466,6 +467,11 @@ class GameSession {
         }
         return { player: existing, reconnected: true };
       }
+      if (requireReconnect) {
+        return { player: null, error: 'bad_token', reconnected: false };
+      }
+    } else if (requireReconnect) {
+      return { player: null, error: 'bad_token', reconnected: false };
     }
 
     if (this.isFull()) {

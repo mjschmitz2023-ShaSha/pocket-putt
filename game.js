@@ -1320,18 +1320,55 @@ function mpRenderLobby(msg) {
   waitingText.classList.toggle('hidden', mpIsHost);
 }
 
-function mpConnect() {
+let mpConnectGeneration = 0;
+let mpPendingAction = null; // { type: 'create' } | { type: 'join', code }
+
+function mpClearRoomCreds() {
+  localStorage.removeItem('pocketPuttRoomCode');
+  localStorage.removeItem('pocketPuttReconnectToken');
+  mpRoomCode = null;
+}
+
+function mpSocketOpen() {
+  return mpSocket && mpSocket.readyState === WebSocket.OPEN;
+}
+
+function mpConnect(opts = {}) {
+  const skipAutoRejoin = !!opts.skipAutoRejoin;
+  // Drop a half-open socket so create/join always get a clean handshake.
+  if (mpSocket && (mpSocket.readyState === WebSocket.OPEN || mpSocket.readyState === WebSocket.CONNECTING)) {
+    try { mpSocket.close(); } catch { /* ignore */ }
+  }
+  const gen = ++mpConnectGeneration;
   mpSetRelayStatus('Connecting…');
   mpSocket = new WebSocket(RELAY_WS);
   mpSocket.addEventListener('open', () => {
+    if (gen !== mpConnectGeneration) return;
     const savedToken = localStorage.getItem('pocketPuttReconnectToken');
     const savedName = localStorage.getItem('pocketPuttName') || '';
     const savedRoom = localStorage.getItem('pocketPuttRoomCode') || '';
     const queryRoom = (MP_PARAMS.get('room') || '').trim().toUpperCase();
     document.getElementById('lobby-name-input').value = savedName;
     const roomInput = document.getElementById('lobby-room-input');
-    if (roomInput) roomInput.value = queryRoom || savedRoom || '';
+    if (roomInput && !roomInput.value) roomInput.value = queryRoom || savedRoom || '';
     mpSetRelayStatus('Connected. Create a room or join with a code.');
+
+    // Pending user action after a reconnect wins over auto-rejoin.
+    if (mpPendingAction) {
+      const action = mpPendingAction;
+      mpPendingAction = null;
+      if (action.type === 'create') {
+        mpDoCreateRoom();
+      } else if (action.type === 'join') {
+        mpDoJoinRoom(action.code);
+      }
+      return;
+    }
+
+    if (skipAutoRejoin) return;
+
+    // Auto-rejoin only when we have both a room and token. Stale rooms are common after
+    // free-tier sleep — server keeps the socket open so create/join still work.
     if (savedRoom && savedToken && (!queryRoom || queryRoom === savedRoom)) {
       mpSetRelayStatus(`Reconnecting to ${savedRoom}…`);
       mpSocket.send(JSON.stringify({
@@ -1350,21 +1387,29 @@ function mpConnect() {
     }
   });
   mpSocket.addEventListener('close', () => {
-    mpSetRelayStatus('Disconnected. Refresh to reconnect.');
+    if (gen !== mpConnectGeneration) return;
+    mpSetRelayStatus('Disconnected — click Create or Join to reconnect.');
   });
   mpSocket.addEventListener('error', () => {
-    mpSetRelayStatus('Connection failed (free tier cold start can take ~1 min). Retry.');
+    if (gen !== mpConnectGeneration) return;
+    mpSetRelayStatus('Connection failed (free tier cold start can take ~1 min). Retry Create/Join.');
   });
   mpSocket.addEventListener('message', (e) => {
+    if (gen !== mpConnectGeneration) return;
     const msg = JSON.parse(e.data);
     if (msg.type === 'relay_error') {
       const hints = {
-        room_not_found: 'Room not found (expired or wrong code).',
+        room_not_found: 'Room not found (expired or wrong code). Create a new room or join another.',
         room_full: 'That room is full.',
         server_full: 'Relay is full — try later.',
-        bad_token: 'Reconnect failed — create/join again.',
-        bad_handshake: 'Bad handshake — hard-refresh the page.',
+        bad_token: 'Session expired — create or join again.',
+        bad_handshake: 'Still connecting — try Create/Join once more.',
+        join_failed: 'Could not join — try again.',
       };
+      // Stale room/token must not block a fresh create on the same socket.
+      if (msg.code === 'room_not_found' || msg.code === 'bad_token') {
+        mpClearRoomCreds();
+      }
       mpSetRelayStatus(hints[msg.code] || `Error: ${msg.code || 'unknown'}`);
       return;
     }
@@ -1836,32 +1881,55 @@ function mpHandleEvent(ev, hole) {
   }
 }
 
-function mpSendCreateRoom() {
-  if (!mpSocket || mpSocket.readyState !== WebSocket.OPEN) {
-    mpSetRelayStatus('Not connected yet…');
-    return;
-  }
+function mpDoCreateRoom() {
   const name = mpLobbyName();
   localStorage.setItem('pocketPuttName', name);
-  localStorage.removeItem('pocketPuttRoomCode');
-  localStorage.removeItem('pocketPuttReconnectToken');
+  mpClearRoomCreds();
   mpSetRelayStatus('Creating room…');
   mpSocket.send(JSON.stringify({ type: 'relay_create', player_name: name }));
 }
-function mpSendJoinRoom() {
-  if (!mpSocket || mpSocket.readyState !== WebSocket.OPEN) {
-    mpSetRelayStatus('Not connected yet…');
+
+function mpDoJoinRoom(code) {
+  const name = mpLobbyName();
+  localStorage.setItem('pocketPuttName', name);
+  mpSetRelayStatus(`Joining ${code}…`);
+  mpSocket.send(JSON.stringify({ type: 'relay_join', room_code: code, player_name: name }));
+}
+
+function mpSendCreateRoom() {
+  // Fresh create must not reuse a half-handshaken socket that already tried reconnect.
+  if (!mpSocketOpen()) {
+    mpPendingAction = { type: 'create' };
+    mpConnect({ skipAutoRejoin: true });
     return;
   }
-  const name = mpLobbyName();
+  // If we auto-rejoined or failed a reconnect on this socket, open a clean one for create.
+  if (mpRoomCode || localStorage.getItem('pocketPuttRoomCode')) {
+    mpPendingAction = { type: 'create' };
+    mpConnect({ skipAutoRejoin: true });
+    return;
+  }
+  mpDoCreateRoom();
+}
+
+function mpSendJoinRoom() {
   const code = (document.getElementById('lobby-room-input').value || '').trim().toUpperCase();
   if (!code) {
     mpSetRelayStatus('Enter a room code.');
     return;
   }
-  localStorage.setItem('pocketPuttName', name);
-  mpSetRelayStatus(`Joining ${code}…`);
-  mpSocket.send(JSON.stringify({ type: 'relay_join', room_code: code, player_name: name }));
+  if (!mpSocketOpen()) {
+    mpPendingAction = { type: 'join', code };
+    mpConnect({ skipAutoRejoin: true });
+    return;
+  }
+  // Prefer a clean handshake if this socket already joined something else.
+  if (mpPlayerId) {
+    mpPendingAction = { type: 'join', code };
+    mpConnect({ skipAutoRejoin: true });
+    return;
+  }
+  mpDoJoinRoom(code);
 }
 const btnCreate = document.getElementById('btn-create-room');
 if (btnCreate) {
