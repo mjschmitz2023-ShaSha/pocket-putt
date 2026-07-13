@@ -1349,8 +1349,10 @@ function mpConnect(opts = {}) {
     const savedRoom = localStorage.getItem('pocketPuttRoomCode') || '';
     const queryRoom = (MP_PARAMS.get('room') || '').trim().toUpperCase();
     document.getElementById('lobby-name-input').value = savedName;
+    // Prefill the join field ONLY from ?room= in the URL — never from localStorage,
+    // so a hard refresh doesn't look like a leftover "cookie" room code.
     const roomInput = document.getElementById('lobby-room-input');
-    if (roomInput && !roomInput.value) roomInput.value = queryRoom || savedRoom || '';
+    if (roomInput && queryRoom) roomInput.value = queryRoom;
     mpSetRelayStatus('Connected. Create a room or join with a code.');
 
     // Pending user action after a reconnect wins over auto-rejoin.
@@ -1367,22 +1369,24 @@ function mpConnect(opts = {}) {
 
     if (skipAutoRejoin) return;
 
-    // Auto-rejoin only when we have both a room and token. Stale rooms are common after
-    // free-tier sleep — server keeps the socket open so create/join still work.
-    if (savedRoom && savedToken && (!queryRoom || queryRoom === savedRoom)) {
-      mpSetRelayStatus(`Reconnecting to ${savedRoom}…`);
-      mpSocket.send(JSON.stringify({
-        type: 'relay_reconnect',
-        room_code: savedRoom,
-        token: savedToken,
-        player_name: savedName,
-      }));
-    } else if (queryRoom) {
+    // Deep link: https://host/?room=ABCDEF — join that room once.
+    // Do not auto-rejoin from localStorage alone (stale codes after free-tier sleep
+    // were closing sessions and stuffing the input field on every visit).
+    if (queryRoom) {
       mpSetRelayStatus(`Joining ${queryRoom}…`);
       mpSocket.send(JSON.stringify({
         type: 'relay_join',
         room_code: queryRoom,
         player_name: savedName || 'Player',
+      }));
+    } else if (savedRoom && savedToken) {
+      // Silent resume only — leave the join field empty.
+      mpSetRelayStatus(`Reconnecting to last room…`);
+      mpSocket.send(JSON.stringify({
+        type: 'relay_reconnect',
+        room_code: savedRoom,
+        token: savedToken,
+        player_name: savedName,
       }));
     }
   });
