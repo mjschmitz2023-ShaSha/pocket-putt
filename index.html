@@ -37,11 +37,22 @@
       <h1>⛳ Pocket Putt</h1>
       <p class="subtitle">A simple, super fun mini golf game — four 19-hole courses</p>
       <p class="instructions">Click and drag back from the ball to aim, then release to putt.<br>Watch out for sand, water, windmills, boost pads, jump ramps, sticky goo,<br>and on Orbit — planets, gravity wells, and black holes!</p>
+      <div id="custom-level-panel" class="hidden">
+        <p id="custom-level-label" class="subtitle">Custom level loaded</p>
+        <p class="instructions" style="margin:6px 0 0;font-size:13px">Play creates a multiplayer room with this hole (you can start alone or invite friends with the room code).</p>
+        <div class="custom-level-actions">
+          <button id="btn-play-custom" type="button">Play this level ▶</button>
+          <button id="btn-edit-level" type="button" class="btn-small">Edit</button>
+          <button id="btn-create-with-level" type="button" class="btn-small">Create room</button>
+        </div>
+        <p id="custom-level-error" class="hidden" style="color:#f88;font-size:13px"></p>
+      </div>
       <div class="course-row">
         <label for="solo-course-select">Course</label>
         <select id="solo-course-select"></select>
       </div>
       <button id="btn-play">Play ▶</button>
+      <p style="margin-top:14px"><a id="link-level-editor" href="editor.html" class="btn-small" style="display:inline-block;text-decoration:none">Level Editor</a></p>
     </div>
 
     <div id="screen-lobby" class="screen hidden">
@@ -66,6 +77,8 @@
           <select id="course-select"></select>
           <span id="course-display" class="hidden"></span>
         </div>
+        <p id="lobby-custom-label" class="subtitle hidden"></p>
+        <button type="button" id="btn-clear-custom" class="btn-small hidden">Clear custom hole</button>
         <div id="lobby-customize">
           <div class="customize-row">
             <input id="lobby-rename-input" type="text" maxlength="20" autocomplete="off" placeholder="New name">
@@ -122,7 +135,8 @@
     </div>
   </div>
 
-  <script src="shared.js?v=rb2"></script>
-  <script src="game.js?v=rb2"></script>
+  <script src="shared.js?v=lvl1"></script>
+  <script src="draw.js?v=lvl1"></script>
+  <script src="game.js?v=lvl1"></script>
 </body>
 </html>

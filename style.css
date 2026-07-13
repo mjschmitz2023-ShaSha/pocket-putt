@@ -596,3 +596,22 @@ button:active {
   display: flex;
   align-items: center;
   gap: 8px;
+
+/* Custom level share link panel (start screen) */
+#custom-level-panel {
+  margin: 12px 0 4px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.28);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+}
+.custom-level-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: center;
+  margin-top: 8px;
+}
+#lobby-custom-label {
+  margin-top: 8px;
+}

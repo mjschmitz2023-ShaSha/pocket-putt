@@ -40,6 +40,8 @@ class GameSession {
     this.players = new Map();
     this.hostPlayerId = null;
     this.courseIndex = 0;
+    /** @type {object|null} validated single custom hole; when set, round is 1 hole */
+    this.customHole = null;
     this.currentHoleIndex = 0;
     this.holeStartedAtMs = 0;
     this.simTick = 0;
@@ -74,7 +76,25 @@ class GameSession {
   }
 
   currentHoles() {
+    if (this.customHole) return [this.customHole];
     return COURSES[this.courseIndex].holes;
+  }
+
+  customHoleLobbyFields() {
+    if (!this.customHole) {
+      return { hasCustomHole: false, customHoleName: null, customLvl: null };
+    }
+    let customLvl = null;
+    try {
+      customLvl = Shared.encodeHole(this.customHole);
+    } catch {
+      customLvl = null;
+    }
+    return {
+      hasCustomHole: true,
+      customHoleName: this.customHole.name || 'Custom',
+      customLvl,
+    };
   }
 
   roundStatePayload() {
@@ -87,6 +107,7 @@ class GameSession {
       par: hole.par,
       tick: this.simTick,
       tickHz: TICK_HZ,
+      ...this.customHoleLobbyFields(),
       // Reliable tee seed — clients must not depend solely on an unreliable resync
       // snapshot to populate Game.players (dropped resync → empty roster / vanished ball).
       balls: [...this.players.values()]
@@ -132,6 +153,7 @@ class GameSession {
       joinUrl: this.joinUrl,
       joinUrlFallback: this.joinUrlFallback,
       roomCode: this.code,
+      ...this.customHoleLobbyFields(),
     });
   }
 
@@ -623,8 +645,23 @@ class GameSession {
         msg.courseIndex < COURSES.length
       ) {
         this.courseIndex = msg.courseIndex;
+        this.customHole = null; // built-in course selection clears custom
         this.broadcastLobbyState();
       }
+    } else if (msg.type === 'setCustomHole') {
+      if (player.id !== this.hostPlayerId || this.state !== 'WAITING_FOR_PLAYERS') return;
+      if (typeof msg.lvl !== 'string' || !msg.lvl) return;
+      const decoded = Shared.decodeHole(msg.lvl);
+      if (!decoded.ok) {
+        this.send(player.ws, { type: 'notice', text: `Custom hole rejected: ${decoded.error}` });
+        return;
+      }
+      this.customHole = decoded.hole;
+      this.broadcastLobbyState();
+    } else if (msg.type === 'clearCustomHole') {
+      if (player.id !== this.hostPlayerId || this.state !== 'WAITING_FOR_PLAYERS') return;
+      this.customHole = null;
+      this.broadcastLobbyState();
     } else if (msg.type === 'startRound') {
       if (
         player.id === this.hostPlayerId &&
@@ -636,7 +673,10 @@ class GameSession {
           msg.courseIndex < COURSES.length
         ) {
           this.courseIndex = msg.courseIndex;
+          // Explicit course index on start means built-in course (clears custom).
+          this.customHole = null;
         }
+        // If customHole is set and no courseIndex in message, keep single custom hole.
         this.startNewRound();
       }
     } else if (msg.type === 'restartGame') {

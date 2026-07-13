@@ -352,7 +352,9 @@ function rampRect(x1, y1, x2, y2, angle, minSpeed) {
 }
 function stickyRect(x1, y1, x2, y2) { return { shape: 'rect', x1, y1, x2, y2 }; }
 function pendulum(cx, cy, length, angleCenter, amplitude, period, phaseOffset) {
-  return { cx, cy, length, angleCenter, amplitude, period, phase: phaseOffset || 0 };
+  // phase0 = design-time offset (seconds); phase = live clock used by getPendulumSegment.
+  const p0 = phaseOffset || 0;
+  return { cx, cy, length, angleCenter, amplitude, period, phase0: p0, phase: p0 };
 }
 function getPendulumSegment(p) {
   const angle = p.angleCenter + p.amplitude * Math.sin((2 * Math.PI * p.phase) / p.period);
@@ -366,7 +368,9 @@ function getPendulumSegment(p) {
   };
 }
 function slidingGate(x1, y1, x2, y2, axis, amplitude, period, phaseOffset) {
-  return { x1, y1, x2, y2, axis, amplitude, period, phase: phaseOffset || 0 };
+  // phase0 = design-time offset (seconds); phase = live clock used by getSlidingGateSegment.
+  const p0 = phaseOffset || 0;
+  return { x1, y1, x2, y2, axis, amplitude, period, phase0: p0, phase: p0 };
 }
 function getSlidingGateSegment(g) {
   const offset = g.amplitude * Math.sin((2 * Math.PI * g.phase) / g.period);
@@ -398,6 +402,52 @@ function circleTouchesZone(x, y, r, z) {
   const nx = Math.max(z.x1, Math.min(x, z.x2));
   const ny = Math.max(z.y1, Math.min(y, z.y2));
   return Math.hypot(x - nx, y - ny) < r;
+}
+
+/**
+ * Ramp pads: x1,y1,x2,y2 define width/height of a local rect; `angle` rotates it about
+ * the center so the long axis of the pad matches launch direction. Boosts stay AABB.
+ * Local +x is the launch direction after rotation.
+ */
+function zoneCenterXY(z) {
+  return { x: (z.x1 + z.x2) / 2, y: (z.y1 + z.y2) / 2 };
+}
+function orientedRectCorners(z) {
+  const cx = (z.x1 + z.x2) / 2, cy = (z.y1 + z.y2) / 2;
+  const hw = Math.abs(z.x2 - z.x1) / 2, hh = Math.abs(z.y2 - z.y1) / 2;
+  const a = z.angle || 0;
+  const ca = Math.cos(a), sa = Math.sin(a);
+  // Local corners: NW, NE, SE, SW (y-up screen: -hh is "north")
+  const locals = [
+    { id: 'nw', lx: -hw, ly: -hh },
+    { id: 'ne', lx: hw, ly: -hh },
+    { id: 'se', lx: hw, ly: hh },
+    { id: 'sw', lx: -hw, ly: hh },
+  ];
+  return locals.map((c) => ({
+    id: c.id,
+    kind: 'corner',
+    x: cx + c.lx * ca - c.ly * sa,
+    y: cy + c.lx * sa + c.ly * ca,
+  }));
+}
+/** Circle vs oriented rect (ramp). Angle 0 matches axis-aligned circleTouchesZone. */
+function circleTouchesOrientedRect(x, y, r, z) {
+  const cx = (z.x1 + z.x2) / 2, cy = (z.y1 + z.y2) / 2;
+  const hw = Math.abs(z.x2 - z.x1) / 2, hh = Math.abs(z.y2 - z.y1) / 2;
+  const a = z.angle || 0;
+  const ca = Math.cos(a), sa = Math.sin(a);
+  // World → local: R(-a) * (p - center)
+  const dx = x - cx, dy = y - cy;
+  const lx = ca * dx + sa * dy;
+  const ly = -sa * dx + ca * dy;
+  const qx = Math.max(-hw, Math.min(hw, lx));
+  const qy = Math.max(-hh, Math.min(hh, ly));
+  const ex = lx - qx, ey = ly - qy;
+  return ex * ex + ey * ey < r * r;
+}
+function circleTouchesRamp(x, y, r, z) {
+  return circleTouchesOrientedRect(x, y, r, z);
 }
 // A cup whose divot area overlaps sticky goo loses its magnet entirely: goo-guarded
 // holes are meant to be punishing, so the ball must be putt in clean - no assist.
@@ -1469,7 +1519,8 @@ function stepBallPhysics(ball, hole, dt) {
 
     if (ball.z <= 0) {
       for (const z of hole.ramps) {
-        if (!circleTouchesZone(ball.x, ball.y, BALL_RADIUS, z)) continue;
+        // Oriented pad: rectangle rotates with launch angle (boosts stay AABB).
+        if (!circleTouchesRamp(ball.x, ball.y, BALL_RADIUS, z)) continue;
         // Launch only fires for balls moving UP the slope fast enough — the dot-product
         // gate means a ball rolling back down (or crossing against the ramp's direction)
         // can never launch.
@@ -1553,6 +1604,7 @@ function stepBallPhysics(ball, hole, dt) {
 }
 
 function advanceHoleObstacles(hole, dt) {
+  // Live angles/phases advance from their phase0-seeded start (see reset / setAtTick).
   for (const wm of hole.windmills) wm.angle += wm.rotationSpeed * dt;
   for (const p of hole.pendulums) p.phase += dt;
   for (const g of hole.gates) g.phase += dt;
@@ -1568,21 +1620,26 @@ function advanceHoleObstacles(hole, dt) {
 // Absolute obstacle pose from an integer sim tick. Multiplayer host and clients both use
 // this so windmills/pendulums never drift from each other (and never need mid-roll
 // obstacle snapshots that hard-reset phases and fork ball paths).
+// Design-time phase0 / orbitPhase0 is preserved: pose = phase0 + rate * elapsed.
 function setHoleObstaclesAtTick(hole, tick) {
   const t = tick * TICK_DT;
-  for (const wm of hole.windmills) wm.angle = wm.rotationSpeed * t;
-  for (const p of hole.pendulums) p.phase = t;
-  for (const g of hole.gates) g.phase = t;
+  for (const wm of hole.windmills) {
+    const p0 = wm.phase0 || 0;
+    wm.angle = p0 + wm.rotationSpeed * t;
+  }
+  for (const p of hole.pendulums) p.phase = (p.phase0 || 0) + t;
+  for (const g of hole.gates) g.phase = (g.phase0 || 0) + t;
   const bodies = hole.gravityBodies || [];
   for (let i = 0; i < bodies.length; i++) {
     if (bodies[i].kind === 'moon') setMoonPoseAtTick(bodies[i], tick);
   }
+  hole._orbitTick = tick;
 }
 
 function resetHoleObstacles(hole) {
-  for (const wm of hole.windmills) wm.angle = 0;
-  for (const p of hole.pendulums) p.phase = 0;
-  for (const g of hole.gates) g.phase = 0;
+  for (const wm of hole.windmills) wm.angle = wm.phase0 || 0;
+  for (const p of hole.pendulums) p.phase = p.phase0 || 0;
+  for (const g of hole.gates) g.phase = g.phase0 || 0;
   hole._orbitTick = 0;
   const bodies = hole.gravityBodies || [];
   for (let i = 0; i < bodies.length; i++) {
@@ -1661,6 +1718,686 @@ function clampDragVector(v) {
   return { x: (v.x / dragLen) * clampedLen, y: (v.y / dragLen) * clampedLen, len: clampedLen };
 }
 
+// ---- Custom level codec (URL ?lvl= base64url, independent of ?room=) ----
+// v2: windmill phase0 (radians) packed after rotationSpeed. v1 decodes with phase0=0.
+const LEVEL_CODEC_VERSION = 2;
+const LEVEL_MAX_B64_LEN = 4096;
+const LEVEL_MAX_NAME_LEN = 40;
+const LEVEL_CAPS = {
+  walls: 40,
+  sand: 20,
+  water: 20,
+  boost: 20,
+  ramps: 20,
+  sticky: 20,
+  pendulums: 6,
+  gates: 6,
+  windmills: 6,
+  gravityBodies: 8,
+};
+
+function blankHole(overrides) {
+  const h = {
+    name: 'Custom Hole',
+    par: 3,
+    tee: { x: 90, y: 250 },
+    cup: { x: 710, y: 250, radius: 11 },
+    walls: [],
+    sand: [],
+    water: [],
+    boost: [],
+    pendulums: [],
+    gates: [],
+    windmills: [],
+    ramps: [],
+    sticky: [],
+    gravityBodies: [],
+  };
+  if (overrides && typeof overrides === 'object') Object.assign(h, overrides);
+  return h;
+}
+
+function qCoord(v) {
+  const n = Math.round(Number(v) * 10);
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(-32768, Math.min(32767, n));
+}
+function uqCoord(n) { return n / 10; }
+function qF100(v) {
+  const n = Math.round(Number(v) * 100);
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(-32768, Math.min(32767, n));
+}
+function uqF100(n) { return n / 100; }
+function qF10(v) {
+  const n = Math.round(Number(v) * 10);
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(-32768, Math.min(32767, n));
+}
+function uqF10(n) { return n / 10; }
+
+function bytesFromBase64Url(str) {
+  if (typeof str !== 'string' || !str) return null;
+  let s = str.replace(/-/g, '+').replace(/_/g, '/');
+  while (s.length % 4) s += '=';
+  try {
+    if (typeof Buffer !== 'undefined') return new Uint8Array(Buffer.from(s, 'base64'));
+    const bin = atob(s);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  } catch (e) {
+    return null;
+  }
+}
+
+function base64UrlFromBytes(bytes) {
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  let b64;
+  if (typeof Buffer !== 'undefined') b64 = Buffer.from(bytes).toString('base64');
+  else b64 = btoa(bin);
+  return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function ByteWriter(cap) {
+  this.buf = new Uint8Array(cap || 4096);
+  this.i = 0;
+}
+ByteWriter.prototype.ensure = function (n) {
+  if (this.i + n <= this.buf.length) return;
+  const next = new Uint8Array(Math.max(this.buf.length * 2, this.i + n));
+  next.set(this.buf);
+  this.buf = next;
+};
+ByteWriter.prototype.u8 = function (v) {
+  this.ensure(1);
+  this.buf[this.i++] = v & 0xff;
+};
+ByteWriter.prototype.i16 = function (v) {
+  this.ensure(2);
+  const x = v | 0;
+  this.buf[this.i++] = x & 0xff;
+  this.buf[this.i++] = (x >> 8) & 0xff;
+};
+ByteWriter.prototype.bytes = function () {
+  return this.buf.subarray(0, this.i);
+};
+
+function ByteReader(bytes) {
+  this.buf = bytes;
+  this.i = 0;
+}
+ByteReader.prototype.remaining = function () { return this.buf.length - this.i; };
+ByteReader.prototype.u8 = function () {
+  if (this.i >= this.buf.length) throw new Error('eof');
+  return this.buf[this.i++];
+};
+ByteReader.prototype.i16 = function () {
+  if (this.i + 2 > this.buf.length) throw new Error('eof');
+  const lo = this.buf[this.i++];
+  const hi = this.buf[this.i++];
+  let v = lo | (hi << 8);
+  if (v & 0x8000) v = v - 0x10000;
+  return v;
+};
+
+function normalizeGravityBody(b) {
+  if (!b || typeof b !== 'object') return null;
+  const kind = b.kind;
+  if (kind !== 'planet' && kind !== 'blackHole' && kind !== 'moon') return null;
+  const radius = Number(b.radius) || 10;
+  const mass = Number(b.mass) || 1;
+  const body = {
+    kind,
+    x: Number(b.x) || 0,
+    y: Number(b.y) || 0,
+    radius,
+    mass,
+    fieldRadius: b.fieldRadius != null ? Number(b.fieldRadius) : radius * 6,
+    drawRadius: b.drawRadius != null ? Number(b.drawRadius) : (kind === 'blackHole' ? Math.min(radius, 5) : radius),
+  };
+  if (kind === 'moon') {
+    const oc = b.orbitCenter || { x: body.x, y: body.y };
+    body.orbitCenter = { x: Number(oc.x) || 0, y: Number(oc.y) || 0 };
+    body.orbitRadius = b.orbitRadius != null ? Number(b.orbitRadius) : 80;
+    body.orbitPeriodTicks = b.orbitPeriodTicks != null ? Number(b.orbitPeriodTicks) : 240;
+    body.orbitPhase0 = b.orbitPhase0 != null ? Number(b.orbitPhase0) : 0;
+    setMoonPoseAtTick(body, 0);
+  }
+  return body;
+}
+
+function normalizeHole(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const name = typeof raw.name === 'string' ? raw.name.slice(0, LEVEL_MAX_NAME_LEN) : 'Custom Hole';
+  let par = Math.round(Number(raw.par));
+  if (!Number.isFinite(par) || par < 1) par = 3;
+  if (par > 10) par = 10;
+  const tee = raw.tee && typeof raw.tee === 'object'
+    ? { x: Number(raw.tee.x) || 90, y: Number(raw.tee.y) || 250 }
+    : { x: 90, y: 250 };
+  const cupIn = raw.cup && typeof raw.cup === 'object' ? raw.cup : {};
+  const cup = {
+    x: Number(cupIn.x) || 710,
+    y: Number(cupIn.y) || 250,
+    radius: cupIn.radius != null ? Number(cupIn.radius) : 11,
+  };
+  if (!Number.isFinite(cup.radius) || cup.radius <= 0) cup.radius = 11;
+
+  function mapWalls(arr) {
+    return (arr || []).map((w) => wall(w.x1, w.y1, w.x2, w.y2, { bumper: !!w.bumper }));
+  }
+  function mapRects(arr, kind) {
+    return (arr || []).map((z) => {
+      if (z.shape === 'circle') {
+        // Codec v1 is rect-only; expand circle to AABB for import safety.
+        return { shape: 'rect', x1: z.cx - z.r, y1: z.cy - z.r, x2: z.cx + z.r, y2: z.cy + z.r };
+      }
+      return { shape: 'rect', x1: Number(z.x1), y1: Number(z.y1), x2: Number(z.x2), y2: Number(z.y2) };
+    }).filter((z) => Number.isFinite(z.x1) && Number.isFinite(z.y1) && Number.isFinite(z.x2) && Number.isFinite(z.y2));
+  }
+  function mapWater(arr) {
+    return (arr || []).map((z) => {
+      const drop = z.dropPoint && typeof z.dropPoint === 'object'
+        ? { x: Number(z.dropPoint.x), y: Number(z.dropPoint.y) }
+        : { x: (Number(z.x1) + Number(z.x2)) / 2, y: Number(z.y1) - 20 };
+      return waterRect(z.x1, z.y1, z.x2, z.y2, drop);
+    }).filter((z) => Number.isFinite(z.x1));
+  }
+  function mapBoost(arr) {
+    return (arr || []).map((z) => boostRect(z.x1, z.y1, z.x2, z.y2, Number(z.angle) || 0, Number(z.power) || 500));
+  }
+  function mapRamp(arr) {
+    return (arr || []).map((z) => rampRect(z.x1, z.y1, z.x2, z.y2, Number(z.angle) || 0, Number(z.minSpeed) || RAMP_MIN_SPEED));
+  }
+  function mapPend(arr) {
+    return (arr || []).map((p) => {
+      // Prefer stable design offset phase0 so live phase (advanced in editor/game) is not baked in.
+      const p0 = p.phase0 != null ? p.phase0 : (p.phaseOffset != null ? p.phaseOffset : (p.phase || 0));
+      return pendulum(p.cx, p.cy, p.length, p.angleCenter, p.amplitude, p.period, p0);
+    });
+  }
+  function mapGates(arr) {
+    return (arr || []).map((g) => {
+      const p0 = g.phase0 != null ? g.phase0 : (g.phaseOffset != null ? g.phaseOffset : (g.phase || 0));
+      return slidingGate(g.x1, g.y1, g.x2, g.y2, g.axis === 'y' ? 'y' : 'x', g.amplitude, g.period, p0);
+    });
+  }
+  function mapMills(arr) {
+    return (arr || []).map((wm) => {
+      const phase0 = wm.phase0 != null ? Number(wm.phase0) : 0;
+      const p0 = Number.isFinite(phase0) ? phase0 : 0;
+      return {
+        cx: Number(wm.cx),
+        cy: Number(wm.cy),
+        armLength: Number(wm.armLength) || 80,
+        blades: Math.max(2, Math.min(8, Math.round(Number(wm.blades) || 4))),
+        rotationSpeed: Number(wm.rotationSpeed) || 1,
+        phase0: p0,
+        // Live angle starts at design offset; game/editor advance from here.
+        angle: p0,
+      };
+    });
+  }
+  function mapBodies(arr) {
+    return (arr || []).map(normalizeGravityBody).filter(Boolean);
+  }
+
+  const hole = {
+    name,
+    par,
+    tee,
+    cup,
+    walls: mapWalls(raw.walls),
+    sand: mapRects(raw.sand),
+    water: mapWater(raw.water),
+    boost: mapBoost(raw.boost),
+    ramps: mapRamp(raw.ramps),
+    sticky: mapRects(raw.sticky),
+    pendulums: mapPend(raw.pendulums),
+    gates: mapGates(raw.gates),
+    windmills: mapMills(raw.windmills),
+    gravityBodies: mapBodies(raw.gravityBodies),
+  };
+  delete hole._cupMagnet;
+  hole._orbitTick = 0;
+  return hole;
+}
+
+function holeObjectCounts(hole) {
+  return {
+    walls: (hole.walls || []).length,
+    sand: (hole.sand || []).length,
+    water: (hole.water || []).length,
+    boost: (hole.boost || []).length,
+    ramps: (hole.ramps || []).length,
+    sticky: (hole.sticky || []).length,
+    pendulums: (hole.pendulums || []).length,
+    gates: (hole.gates || []).length,
+    windmills: (hole.windmills || []).length,
+    gravityBodies: (hole.gravityBodies || []).length,
+  };
+}
+
+function validateHole(raw) {
+  const hole = normalizeHole(raw);
+  if (!hole) return { ok: false, error: 'invalid_hole' };
+  if (typeof hole.name !== 'string' || hole.name.length === 0 || hole.name.length > LEVEL_MAX_NAME_LEN) {
+    return { ok: false, error: 'bad_name' };
+  }
+  if (hole.par < 1 || hole.par > 10) return { ok: false, error: 'bad_par' };
+  const counts = holeObjectCounts(hole);
+  for (const key of Object.keys(LEVEL_CAPS)) {
+    if (counts[key] > LEVEL_CAPS[key]) {
+      return { ok: false, error: 'over_cap', field: key, count: counts[key], max: LEVEL_CAPS[key] };
+    }
+  }
+  const margin = 40;
+  function inBounds(x, y) {
+    return x >= -margin && x <= LOGICAL_W + margin && y >= -margin && y <= LOGICAL_H + margin;
+  }
+  if (!inBounds(hole.tee.x, hole.tee.y) || !inBounds(hole.cup.x, hole.cup.y)) {
+    return { ok: false, error: 'out_of_bounds' };
+  }
+  for (const w of hole.water) {
+    if (!w.dropPoint || !Number.isFinite(w.dropPoint.x) || !Number.isFinite(w.dropPoint.y)) {
+      return { ok: false, error: 'water_drop' };
+    }
+  }
+  // Size budget: pack and measure (reject if encoded share string would exceed budget).
+  try {
+    const packed = packHoleBytes(hole);
+    const b64 = base64UrlFromBytes(packed);
+    if (b64.length > LEVEL_MAX_B64_LEN) {
+      return { ok: false, error: 'oversize', size: b64.length, max: LEVEL_MAX_B64_LEN };
+    }
+  } catch (e) {
+    return { ok: false, error: 'pack_failed' };
+  }
+  return { ok: true, hole };
+}
+
+function packHoleBytes(hole) {
+  const w = new ByteWriter(2048);
+  w.u8(LEVEL_CODEC_VERSION);
+  w.u8(hole.par & 0xff);
+  const nameBytes = [];
+  const nameStr = String(hole.name || '').slice(0, LEVEL_MAX_NAME_LEN);
+  for (let i = 0; i < nameStr.length; i++) {
+    const c = nameStr.charCodeAt(i);
+    nameBytes.push(c < 128 ? c : 63); // ASCII-ish; '?' for non-ascii
+  }
+  w.u8(nameBytes.length);
+  for (let i = 0; i < nameBytes.length; i++) w.u8(nameBytes[i]);
+  w.i16(qCoord(hole.tee.x));
+  w.i16(qCoord(hole.tee.y));
+  w.i16(qCoord(hole.cup.x));
+  w.i16(qCoord(hole.cup.y));
+  w.i16(qCoord(hole.cup.radius));
+
+  function writeWalls(arr) {
+    w.u8(arr.length);
+    for (const x of arr) {
+      w.i16(qCoord(x.x1)); w.i16(qCoord(x.y1)); w.i16(qCoord(x.x2)); w.i16(qCoord(x.y2));
+      w.u8(x.bumper ? 1 : 0);
+    }
+  }
+  function writeRects(arr) {
+    w.u8(arr.length);
+    for (const z of arr) {
+      w.i16(qCoord(z.x1)); w.i16(qCoord(z.y1)); w.i16(qCoord(z.x2)); w.i16(qCoord(z.y2));
+    }
+  }
+  function writeWater(arr) {
+    w.u8(arr.length);
+    for (const z of arr) {
+      w.i16(qCoord(z.x1)); w.i16(qCoord(z.y1)); w.i16(qCoord(z.x2)); w.i16(qCoord(z.y2));
+      w.i16(qCoord(z.dropPoint.x)); w.i16(qCoord(z.dropPoint.y));
+    }
+  }
+  function writeBoost(arr) {
+    w.u8(arr.length);
+    for (const z of arr) {
+      w.i16(qCoord(z.x1)); w.i16(qCoord(z.y1)); w.i16(qCoord(z.x2)); w.i16(qCoord(z.y2));
+      w.i16(qF100(z.angle)); w.i16(qF10(z.power));
+    }
+  }
+  function writeRamp(arr) {
+    w.u8(arr.length);
+    for (const z of arr) {
+      w.i16(qCoord(z.x1)); w.i16(qCoord(z.y1)); w.i16(qCoord(z.x2)); w.i16(qCoord(z.y2));
+      w.i16(qF100(z.angle)); w.i16(qF10(z.minSpeed || RAMP_MIN_SPEED));
+    }
+  }
+  function writePend(arr) {
+    w.u8(arr.length);
+    for (const p of arr) {
+      w.i16(qCoord(p.cx)); w.i16(qCoord(p.cy)); w.i16(qCoord(p.length));
+      w.i16(qF100(p.angleCenter)); w.i16(qF100(p.amplitude)); w.i16(qF100(p.period));
+      // Store design-time phase offset (seconds), not the live advanced phase.
+      w.i16(qF100(p.phase0 != null ? p.phase0 : (p.phase || 0)));
+    }
+  }
+  function writeGates(arr) {
+    w.u8(arr.length);
+    for (const g of arr) {
+      w.i16(qCoord(g.x1)); w.i16(qCoord(g.y1)); w.i16(qCoord(g.x2)); w.i16(qCoord(g.y2));
+      w.u8(g.axis === 'y' ? 1 : 0);
+      w.i16(qCoord(g.amplitude)); w.i16(qF100(g.period));
+      w.i16(qF100(g.phase0 != null ? g.phase0 : (g.phase || 0)));
+    }
+  }
+  function writeMills(arr) {
+    w.u8(arr.length);
+    for (const m of arr) {
+      w.i16(qCoord(m.cx)); w.i16(qCoord(m.cy)); w.i16(qCoord(m.armLength));
+      w.u8(m.blades & 0xff); w.i16(qF100(m.rotationSpeed));
+      // v2: design-time angular phase offset (radians). angle = phase0 + rotationSpeed * t
+      w.i16(qF100(m.phase0 || 0));
+    }
+  }
+  function writeBodies(arr) {
+    w.u8(arr.length);
+    for (const b of arr) {
+      const kindCode = b.kind === 'blackHole' ? 1 : b.kind === 'moon' ? 2 : 0;
+      w.u8(kindCode);
+      w.i16(qCoord(b.x)); w.i16(qCoord(b.y));
+      w.i16(qCoord(b.radius)); w.i16(qF10(b.mass));
+      w.i16(qCoord(b.fieldRadius)); w.i16(qCoord(b.drawRadius));
+      if (kindCode === 2) {
+        w.i16(qCoord(b.orbitCenter.x)); w.i16(qCoord(b.orbitCenter.y));
+        w.i16(qCoord(b.orbitRadius));
+        w.i16(Math.max(1, Math.round(b.orbitPeriodTicks || 240)));
+        w.i16(qF100(b.orbitPhase0 || 0));
+      }
+    }
+  }
+
+  writeWalls(hole.walls);
+  writeRects(hole.sand);
+  writeWater(hole.water);
+  writeBoost(hole.boost);
+  writeRamp(hole.ramps);
+  writeRects(hole.sticky);
+  writePend(hole.pendulums);
+  writeGates(hole.gates);
+  writeMills(hole.windmills);
+  writeBodies(hole.gravityBodies);
+  return w.bytes();
+}
+
+function unpackHoleBytes(bytes) {
+  const r = new ByteReader(bytes);
+  const ver = r.u8();
+  // Accept current and prior (v1) layouts; unknown versions reject.
+  if (ver !== LEVEL_CODEC_VERSION && ver !== 1) {
+    const err = new Error('bad_version');
+    err.code = 'bad_version';
+    err.version = ver;
+    throw err;
+  }
+  const par = r.u8();
+  const nameLen = r.u8();
+  let name = '';
+  for (let i = 0; i < nameLen; i++) name += String.fromCharCode(r.u8());
+  const tee = { x: uqCoord(r.i16()), y: uqCoord(r.i16()) };
+  const cup = { x: uqCoord(r.i16()), y: uqCoord(r.i16()), radius: uqCoord(r.i16()) };
+
+  function readWalls() {
+    const n = r.u8();
+    const arr = [];
+    for (let i = 0; i < n; i++) {
+      const x1 = uqCoord(r.i16()), y1 = uqCoord(r.i16()), x2 = uqCoord(r.i16()), y2 = uqCoord(r.i16());
+      const bumper = r.u8() === 1;
+      arr.push(wall(x1, y1, x2, y2, { bumper }));
+    }
+    return arr;
+  }
+  function readRects() {
+    const n = r.u8();
+    const arr = [];
+    for (let i = 0; i < n; i++) {
+      arr.push({ shape: 'rect', x1: uqCoord(r.i16()), y1: uqCoord(r.i16()), x2: uqCoord(r.i16()), y2: uqCoord(r.i16()) });
+    }
+    return arr;
+  }
+  function readWater() {
+    const n = r.u8();
+    const arr = [];
+    for (let i = 0; i < n; i++) {
+      const x1 = uqCoord(r.i16()), y1 = uqCoord(r.i16()), x2 = uqCoord(r.i16()), y2 = uqCoord(r.i16());
+      const dx = uqCoord(r.i16()), dy = uqCoord(r.i16());
+      arr.push(waterRect(x1, y1, x2, y2, { x: dx, y: dy }));
+    }
+    return arr;
+  }
+  function readBoost() {
+    const n = r.u8();
+    const arr = [];
+    for (let i = 0; i < n; i++) {
+      const x1 = uqCoord(r.i16()), y1 = uqCoord(r.i16()), x2 = uqCoord(r.i16()), y2 = uqCoord(r.i16());
+      const angle = uqF100(r.i16()), power = uqF10(r.i16());
+      arr.push(boostRect(x1, y1, x2, y2, angle, power));
+    }
+    return arr;
+  }
+  function readRamp() {
+    const n = r.u8();
+    const arr = [];
+    for (let i = 0; i < n; i++) {
+      const x1 = uqCoord(r.i16()), y1 = uqCoord(r.i16()), x2 = uqCoord(r.i16()), y2 = uqCoord(r.i16());
+      const angle = uqF100(r.i16()), minSpeed = uqF10(r.i16());
+      arr.push(rampRect(x1, y1, x2, y2, angle, minSpeed));
+    }
+    return arr;
+  }
+  function readPend() {
+    const n = r.u8();
+    const arr = [];
+    for (let i = 0; i < n; i++) {
+      const cx = uqCoord(r.i16()), cy = uqCoord(r.i16()), length = uqCoord(r.i16());
+      const angleCenter = uqF100(r.i16()), amplitude = uqF100(r.i16()), period = uqF100(r.i16());
+      const phase = uqF100(r.i16());
+      arr.push(pendulum(cx, cy, length, angleCenter, amplitude, period, phase));
+    }
+    return arr;
+  }
+  function readGates() {
+    const n = r.u8();
+    const arr = [];
+    for (let i = 0; i < n; i++) {
+      const x1 = uqCoord(r.i16()), y1 = uqCoord(r.i16()), x2 = uqCoord(r.i16()), y2 = uqCoord(r.i16());
+      const axis = r.u8() === 1 ? 'y' : 'x';
+      const amplitude = uqCoord(r.i16()), period = uqF100(r.i16()), phase = uqF100(r.i16());
+      arr.push(slidingGate(x1, y1, x2, y2, axis, amplitude, period, phase));
+    }
+    return arr;
+  }
+  function readMills() {
+    const n = r.u8();
+    const arr = [];
+    for (let i = 0; i < n; i++) {
+      const cx = uqCoord(r.i16()), cy = uqCoord(r.i16()), armLength = uqCoord(r.i16());
+      const blades = r.u8(), rotationSpeed = uqF100(r.i16());
+      // v2 packs phase0 (rad); v1 has no field → default 0 so old share links still load.
+      const phase0 = ver >= 2 ? uqF100(r.i16()) : 0;
+      arr.push({
+        cx, cy, armLength, blades, rotationSpeed, phase0, angle: phase0,
+      });
+    }
+    return arr;
+  }
+  function readBodies() {
+    const n = r.u8();
+    const arr = [];
+    for (let i = 0; i < n; i++) {
+      const kindCode = r.u8();
+      const x = uqCoord(r.i16()), y = uqCoord(r.i16());
+      const radius = uqCoord(r.i16()), mass = uqF10(r.i16());
+      const fieldRadius = uqCoord(r.i16()), drawRadius = uqCoord(r.i16());
+      if (kindCode === 2) {
+        const ocx = uqCoord(r.i16()), ocy = uqCoord(r.i16());
+        const orbitRadius = uqCoord(r.i16());
+        const periodTicks = r.i16();
+        const phase0 = uqF100(r.i16());
+        arr.push(moon(ocx, ocy, orbitRadius, radius, mass, periodTicks, {
+          fieldRadius, drawRadius, orbitPhase0: phase0,
+        }));
+      } else if (kindCode === 1) {
+        arr.push(blackHole(x, y, radius, mass, { fieldRadius, drawRadius }));
+      } else {
+        arr.push(planet(x, y, radius, mass, { fieldRadius, drawRadius }));
+      }
+    }
+    return arr;
+  }
+
+  const raw = {
+    name, par, tee, cup,
+    walls: readWalls(),
+    sand: readRects(),
+    water: readWater(),
+    boost: readBoost(),
+    ramps: readRamp(),
+    sticky: readRects(),
+    pendulums: readPend(),
+    gates: readGates(),
+    windmills: readMills(),
+    gravityBodies: readBodies(),
+  };
+  return normalizeHole(raw);
+}
+
+function encodeHole(raw) {
+  const v = validateHole(raw);
+  if (!v.ok) {
+    const err = new Error(v.error || 'invalid');
+    err.code = v.error;
+    err.detail = v;
+    throw err;
+  }
+  return base64UrlFromBytes(packHoleBytes(v.hole));
+}
+
+function decodeHole(str) {
+  if (typeof str !== 'string' || !str.length) {
+    return { ok: false, error: 'empty' };
+  }
+  if (str.length > LEVEL_MAX_B64_LEN) {
+    return { ok: false, error: 'oversize', size: str.length, max: LEVEL_MAX_B64_LEN };
+  }
+  // Reject characters outside base64url alphabet early.
+  if (!/^[A-Za-z0-9\-_]+$/.test(str)) {
+    return { ok: false, error: 'garbage' };
+  }
+  const bytes = bytesFromBase64Url(str);
+  if (!bytes || !bytes.length) return { ok: false, error: 'garbage' };
+  let hole;
+  try {
+    hole = unpackHoleBytes(bytes);
+  } catch (e) {
+    if (e && e.code === 'bad_version') return { ok: false, error: 'bad_version', version: e.version };
+    return { ok: false, error: 'garbage' };
+  }
+  const v = validateHole(hole);
+  if (!v.ok) return v;
+  return { ok: true, hole: v.hole };
+}
+
+/**
+ * Ghost path for editor Test aim. Clones hole obstacle phase; does not mutate inputs.
+ * @param {object} hole
+ * @param {{x,y,z?,vz?,stuckStickyIndex?,wet?,wetStroke?}} startBall
+ * @param {number} vx
+ * @param {number} vy
+ * @param {{maxTicks?,sampleEvery?,advanceMovers?}} opts
+ *   advanceMovers default false (matches freeze-on-aim ghost).
+ */
+function simulateTrajectory(hole, startBall, vx, vy, opts) {
+  opts = opts || {};
+  const maxTicks = opts.maxTicks != null ? opts.maxTicks : TICK_HZ * 10;
+  const sampleEvery = opts.sampleEvery != null ? opts.sampleEvery : 2;
+  const advanceMovers = !!opts.advanceMovers;
+
+  const h = normalizeHole(JSON.parse(JSON.stringify({
+    name: hole.name,
+    par: hole.par,
+    tee: hole.tee,
+    cup: hole.cup,
+    walls: hole.walls,
+    sand: hole.sand,
+    water: hole.water,
+    boost: hole.boost,
+    ramps: hole.ramps,
+    sticky: hole.sticky,
+    pendulums: hole.pendulums,
+    gates: hole.gates,
+    windmills: hole.windmills,
+    gravityBodies: hole.gravityBodies,
+  })));
+  // Preserve current obstacle phases from the live hole when frozen.
+  if (hole.windmills) {
+    for (let i = 0; i < h.windmills.length && i < hole.windmills.length; i++) {
+      h.windmills[i].angle = hole.windmills[i].angle || 0;
+    }
+  }
+  if (hole.pendulums) {
+    for (let i = 0; i < h.pendulums.length && i < hole.pendulums.length; i++) {
+      h.pendulums[i].phase = hole.pendulums[i].phase || 0;
+    }
+  }
+  if (hole.gates) {
+    for (let i = 0; i < h.gates.length && i < hole.gates.length; i++) {
+      h.gates[i].phase = hole.gates[i].phase || 0;
+    }
+  }
+  h._orbitTick = hole._orbitTick || 0;
+  if (hole.gravityBodies) {
+    for (let i = 0; i < h.gravityBodies.length && i < hole.gravityBodies.length; i++) {
+      const src = hole.gravityBodies[i];
+      const dst = h.gravityBodies[i];
+      if (src.kind === 'moon' && dst.kind === 'moon') {
+        dst.x = src.x; dst.y = src.y;
+        if (src._omega != null) dst._omega = src._omega;
+      }
+    }
+  }
+
+  const ball = createBallState(h.tee);
+  ball.x = startBall.x;
+  ball.y = startBall.y;
+  ball.z = startBall.z || 0;
+  ball.vz = startBall.vz || 0;
+  ball.stuckStickyIndex = typeof startBall.stuckStickyIndex === 'number' ? startBall.stuckStickyIndex : -1;
+  ball.wet = !!startBall.wet;
+  ball.wetStroke = !!startBall.wetStroke;
+  ball.vx = vx;
+  ball.vy = vy;
+  ball.firedBoosts = new Set();
+
+  const pts = [{ x: ball.x, y: ball.y }];
+  for (let t = 0; t < maxTicks; t++) {
+    if (advanceMovers) advanceHoleObstacles(h, TICK_DT);
+    const ev = stepBallPhysics(ball, h, TICK_DT);
+    if (t % sampleEvery === 0) pts.push({ x: ball.x, y: ball.y });
+    if (ev.holed || ev.water || ev.blackHole) {
+      pts.push({ x: ball.x, y: ball.y });
+      break;
+    }
+    const speed = Math.hypot(ball.vx, ball.vy);
+    if (speed < STOP_THRESHOLD && (ball.z || 0) === 0 && ballMayRestForAim(ball, h)) {
+      pts.push({ x: ball.x, y: ball.y });
+      break;
+    }
+  }
+  return pts;
+}
+
+function deepCloneHole(hole) {
+  return normalizeHole(JSON.parse(JSON.stringify(hole)));
+}
+
 return {
   TICK_HZ, TICK_DT, TICK_MS, tickToElapsedMs, elapsedMsToTick,
   LOGICAL_W, LOGICAL_H, BALL_RADIUS, FRICTION_GRASS, FRICTION_SAND, SAND_GRAVITY_HOLD, STOP_THRESHOLD,
@@ -1672,6 +2409,7 @@ return {
   GRAVITY_G, PLANET_RESTITUTION, ESCAPE_SPEED_MARGIN,
   wall, sandRect, waterRect, boostRect, rampRect, stickyRect, pendulum, getPendulumSegment, slidingGate,
   getSlidingGateSegment, ringBumpers, pointInZone, circleTouchesZone, zoneBounds, cupHasGravity,
+  zoneCenterXY, orientedRectCorners, circleTouchesOrientedRect, circleTouchesRamp,
   gravityBody, planet, blackHole, moon, escapeSpeed, bodyCanEscapeAtMaxLaunch,
   planetContactRadius, ballOnPlanetCrust, ballFloatingInGravity, ballMayRestForAim,
   ballInSand, effectiveGravityMag, gravityAccelAt, REST_GRAVITY_EPS, SAND_GRAVITY_HOLD,
@@ -1682,6 +2420,9 @@ return {
   computeLaunchVelocity, clampDragVector, stickyLaunchFactor, stickyIndexAt, latchStickyAfterPutt,
   markWetFromWater, noteWetPutt,
   resolveBallBallCollision, teePositionFor,
+  LEVEL_CODEC_VERSION, LEVEL_MAX_B64_LEN, LEVEL_CAPS, LEVEL_MAX_NAME_LEN,
+  blankHole, normalizeHole, validateHole, encodeHole, decodeHole,
+  packHoleBytes, unpackHoleBytes, simulateTrajectory, deepCloneHole, holeObjectCounts,
 };
 
 });
