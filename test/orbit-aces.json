@@ -1,0 +1,180 @@
+{
+  "version": 1,
+  "microcloud": {
+    "dAng": 0.004,
+    "dPow": 0.01
+  },
+  "seeds": [
+    {
+      "holeIndex": 0,
+      "name": "First Pull",
+      "drag": {
+        "x": -111.484061,
+        "y": 28.218863
+      },
+      "startTick": 0
+    },
+    {
+      "holeIndex": 1,
+      "name": "Keep Clear",
+      "drag": {
+        "x": -120.338161,
+        "y": 33.819032
+      },
+      "startTick": 0
+    },
+    {
+      "holeIndex": 2,
+      "name": "Bank the Crust",
+      "drag": {
+        "x": -120.920716,
+        "y": 38.822423
+      },
+      "startTick": 0
+    },
+    {
+      "holeIndex": 3,
+      "name": "Event Horizon 101",
+      "drag": {
+        "x": -116.721556,
+        "y": 23.174951
+      },
+      "startTick": 0
+    },
+    {
+      "holeIndex": 4,
+      "name": "Binary Drift",
+      "drag": {
+        "x": -124.995191,
+        "y": 1.096472
+      },
+      "startTick": 0
+    },
+    {
+      "holeIndex": 5,
+      "name": "Dust Lane",
+      "drag": {
+        "x": -108.468787,
+        "y": -90.086193
+      },
+      "startTick": 0
+    },
+    {
+      "holeIndex": 6,
+      "name": "Sling Corridor",
+      "drag": {
+        "x": -112.053735,
+        "y": 50.724358
+      },
+      "startTick": 0
+    },
+    {
+      "holeIndex": 7,
+      "name": "Needle Thread",
+      "drag": {
+        "x": -124.856203,
+        "y": 23.236365
+      },
+      "startTick": 0
+    },
+    {
+      "holeIndex": 8,
+      "name": "Well Between",
+      "drag": {
+        "x": -112.191359,
+        "y": -85.405497
+      },
+      "startTick": 0
+    },
+    {
+      "holeIndex": 9,
+      "name": "Twin Sling",
+      "drag": {
+        "x": -129.128975,
+        "y": -39.379028
+      },
+      "startTick": 0
+    },
+    {
+      "holeIndex": 10,
+      "name": "Thruster Assist",
+      "drag": {
+        "x": -62.005986,
+        "y": 45.653671
+      },
+      "startTick": 0
+    },
+    {
+      "holeIndex": 11,
+      "name": "Horizon Gauntlet",
+      "drag": {
+        "x": -134.067452,
+        "y": 28.194294
+      },
+      "startTick": 0
+    },
+    {
+      "holeIndex": 12,
+      "name": "Grand Tour",
+      "drag": {
+        "x": -112.301226,
+        "y": 54.894759
+      },
+      "startTick": 0
+    },
+    {
+      "holeIndex": 13,
+      "name": "Lagrange Squeeze",
+      "drag": {
+        "x": -121.17664,
+        "y": 38.016076
+      },
+      "startTick": 0
+    },
+    {
+      "holeIndex": 14,
+      "name": "Aphelion Run",
+      "drag": {
+        "x": -62.884552,
+        "y": -51.054217
+      },
+      "startTick": 0
+    },
+    {
+      "holeIndex": 15,
+      "name": "Three Body Problem",
+      "drag": {
+        "x": -112.496514,
+        "y": 70.947405
+      },
+      "startTick": 0
+    },
+    {
+      "holeIndex": 16,
+      "name": "Dark Matter",
+      "drag": {
+        "x": -125.543896,
+        "y": 29.660247
+      },
+      "startTick": 0
+    },
+    {
+      "holeIndex": 17,
+      "name": "Periapsis",
+      "drag": {
+        "x": -116.223742,
+        "y": 72.533039
+      },
+      "startTick": 0
+    },
+    {
+      "holeIndex": 18,
+      "name": "Lunar Window",
+      "drag": {
+        "x": -126.273937,
+        "y": 30.901341
+      },
+      "startTick": 80
+    }
+  ]
+}

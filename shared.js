@@ -23,6 +23,9 @@ const LOGICAL_W = 800, LOGICAL_H = 500;
 const BALL_RADIUS = 7;
 const FRICTION_GRASS = 1.15;
 const FRICTION_SAND = 8.0;
+// Max gravitational acceleration sand can cancel (Coulomb-style hold). If |g| is below this
+// while you're in sand and nearly stopped, the well cannot drag you; excess |g| still pulls.
+const SAND_GRAVITY_HOLD = 280;
 const STOP_THRESHOLD = 18;
 // Cup "divot": within this radius a slow-enough ball gets pulled toward the cup, so
 // near-misses that would have trickled past the lip tend to drop in instead.
@@ -66,7 +69,275 @@ const FRICTION_STICKY = 22;
 const STICKY_STOP_SPEED = 50;
 const STICKY_LAUNCH_FACTOR = 0.45;
 const FRICTION_WET_GOO = 0.35; // < FRICTION_GRASS (1.15) — slides through goo while wet
+// Orbit pack: continuous 1/r² gravity (docs/orbit-spec.md). ε = 0; never sample inside solid/horizon.
+const GRAVITY_G = 100;
+const PLANET_RESTITUTION = WALL_RESTITUTION; // 0.8 — wall-like, not bumper gain
+const ESCAPE_SPEED_MARGIN = 0.85; // v_esc must be < MAX_LAUNCH * margin
 const BOUND = { left: 20, top: 20, right: 780, bottom: 480 };
+
+/** Planet / moon / black-hole body. Centers are logical px; mass is abstract. */
+function gravityBody(kind, x, y, radius, mass, opts) {
+  opts = opts || {};
+  const body = {
+    kind: kind, // 'planet' | 'blackHole' | 'moon'
+    x: x,
+    y: y,
+    radius: radius,
+    mass: mass,
+    fieldRadius: opts.fieldRadius != null ? opts.fieldRadius : radius * 6,
+    drawRadius: opts.drawRadius != null ? opts.drawRadius : radius,
+  };
+  if (kind === 'moon') {
+    body.orbitCenter = opts.orbitCenter || { x: x, y: y };
+    body.orbitRadius = opts.orbitRadius != null ? opts.orbitRadius : 80;
+    body.orbitPeriodTicks = opts.orbitPeriodTicks != null ? opts.orbitPeriodTicks : 240;
+    body.orbitPhase0 = opts.orbitPhase0 || 0;
+  }
+  return body;
+}
+
+function planet(x, y, radius, mass, opts) {
+  return gravityBody('planet', x, y, radius, mass, opts);
+}
+function blackHole(x, y, radius, mass, opts) {
+  // Visually smaller than cup (11); horizon may be a few px larger than art.
+  opts = opts || {};
+  if (opts.drawRadius == null) opts.drawRadius = Math.min(radius, 5);
+  return gravityBody('blackHole', x, y, radius, mass, opts);
+}
+function moon(orbitCx, orbitCy, orbitRadius, bodyRadius, mass, periodTicks, opts) {
+  opts = opts || {};
+  opts.orbitCenter = { x: orbitCx, y: orbitCy };
+  opts.orbitRadius = orbitRadius;
+  opts.orbitPeriodTicks = periodTicks;
+  const ang = opts.orbitPhase0 || 0;
+  const x = orbitCx + Math.cos(ang) * orbitRadius;
+  const y = orbitCy + Math.sin(ang) * orbitRadius;
+  return gravityBody('moon', x, y, bodyRadius, mass, opts);
+}
+
+/** Escape speed at contact radius for a solid body (planet/moon). */
+function escapeSpeed(body) {
+  const r = body.radius + BALL_RADIUS;
+  if (r <= 0 || body.mass <= 0) return 0;
+  return Math.sqrt((2 * GRAVITY_G * body.mass) / r);
+}
+
+function bodyCanEscapeAtMaxLaunch(body) {
+  return escapeSpeed(body) < MAX_LAUNCH_SPEED * ESCAPE_SPEED_MARGIN;
+}
+
+/** Absolute moon pose from sim tick (host/client lockstep). */
+function setMoonPoseAtTick(body, tick) {
+  if (!body || body.kind !== 'moon') return;
+  const period = body.orbitPeriodTicks || 240;
+  const ang = body.orbitPhase0 + (tick / period) * Math.PI * 2;
+  const c = body.orbitCenter;
+  body.x = c.x + Math.cos(ang) * body.orbitRadius;
+  body.y = c.y + Math.sin(ang) * body.orbitRadius;
+  // rad/s for surface velocity on bounce
+  body._omega = (Math.PI * 2) / (period * TICK_DT);
+}
+
+function planetContactRadius(body) {
+  return body.radius + BALL_RADIUS;
+}
+
+/** True if ball center is on (or in) a planet/moon crust. */
+function ballOnPlanetCrust(ball, hole, slack) {
+  slack = slack == null ? 1.25 : slack;
+  const bodies = hole.gravityBodies || [];
+  for (let i = 0; i < bodies.length; i++) {
+    const b = bodies[i];
+    if (b.kind === 'blackHole') continue;
+    const r = Math.hypot(ball.x - b.x, ball.y - b.y);
+    if (r <= planetContactRadius(b) + slack) return true;
+  }
+  return false;
+}
+
+/**
+ * True if the ball is inside some attractor's field but not resting on a crust.
+ * Used to forbid "mid-air rest" (STOP freeze) and skip crawl drag that kills orbital fall.
+ */
+function ballFloatingInGravity(ball, hole) {
+  if ((ball.z || 0) > 0) return false;
+  if (ballOnPlanetCrust(ball, hole, 1.5)) return false;
+  const bodies = hole.gravityBodies || [];
+  for (let i = 0; i < bodies.length; i++) {
+    const b = bodies[i];
+    const r = Math.hypot(ball.x - b.x, ball.y - b.y);
+    if (b.fieldRadius && r > b.fieldRadius) continue;
+    if (b.kind === 'blackHole') {
+      if (r > b.radius) return true;
+    } else if (r > planetContactRadius(b)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Net gravitational acceleration at the ball (same sampling as applyGravityAcceleration).
+ * Used to decide whether a "stopped" ball is truly at rest or about to be yanked by a
+ * moving well (e.g. moon sliding its field over a stationary ball).
+ *
+ * When the ball is on a planet/moon crust, that body's *radial* pull is cancelled (surface
+ * normal force). Tangential pulls from *other* bodies (a passing moon) still apply — so a
+ * parked ball gets dragged when the moon's well sweeps over it.
+ */
+function gravityAccelAt(ball, hole) {
+  let ax = 0;
+  let ay = 0;
+  const bodies = hole.gravityBodies || [];
+  for (let i = 0; i < bodies.length; i++) {
+    const b = bodies[i];
+    const dx = b.x - ball.x; // toward body
+    const dy = b.y - ball.y;
+    const r = Math.hypot(dx, dy);
+    if (r < 1e-6) continue;
+    if (b.fieldRadius && r > b.fieldRadius) continue;
+    if (b.kind === 'blackHole') {
+      if (r <= b.radius) continue;
+    } else if (r < planetContactRadius(b) - 0.5) {
+      continue;
+    }
+    const a = (GRAVITY_G * b.mass) / (r * r);
+    let gx = (dx / r) * a;
+    let gy = (dy / r) * a;
+    // On this body's crust: cancel into-surface component (normal force balances radial g).
+    if (b.kind !== 'blackHole' && r <= planetContactRadius(b) + 1.5) {
+      const onx = (ball.x - b.x) / r; // outward normal
+      const ony = (ball.y - b.y) / r;
+      const into = gx * (-onx) + gy * (-ony); // accel toward body (into surface)
+      if (into > 0) {
+        gx -= into * (-onx);
+        gy -= into * (-ony);
+      }
+    }
+    ax += gx;
+    ay += gy;
+  }
+  return { ax, ay, mag: Math.hypot(ax, ay) };
+}
+
+// If |g| exceeds this while "stopped", keep simulating — moon (etc.) is pulling.
+const REST_GRAVITY_EPS = 25;
+
+function ballInSand(ball, hole) {
+  for (const z of hole.sand || []) {
+    if (circleTouchesZone(ball.x, ball.y, BALL_RADIUS, z)) return true;
+  }
+  return false;
+}
+
+/** Effective |g| after sand hold (0 if sand fully cancels the well). */
+function effectiveGravityMag(ball, hole) {
+  const g = gravityAccelAt(ball, hole);
+  if (!ballInSand(ball, hole) || g.mag < 1e-9) return g.mag;
+  if (g.mag <= SAND_GRAVITY_HOLD) return 0;
+  return g.mag - SAND_GRAVITY_HOLD;
+}
+
+/** Solo/MP: freeze for aim only when not floating and effective gravity is negligible. */
+function ballMayRestForAim(ball, hole) {
+  if ((ball.z || 0) > 0) return false;
+  // On a planet/moon crust (optionally in sand): radial g is cancelled by the surface.
+  // Always allow a putt once nearly stopped — prevents infinite crust-collision soft-loops.
+  if (ballOnPlanetCrust(ball, hole, 2.0)) {
+    if (Math.hypot(ball.vx || 0, ball.vy || 0) < STOP_THRESHOLD * 1.5) return true;
+  }
+  // Floating in a field on grass: keep falling. Sand can pin you in a field (hold).
+  if (ballFloatingInGravity(ball, hole) && !ballInSand(ball, hole)) return false;
+  // Free grass / sand bunker: still no rest if net pull (after sand) is strong (moon yank).
+  if (effectiveGravityMag(ball, hole) >= REST_GRAVITY_EPS) return false;
+  return true;
+}
+
+/**
+ * Apply gravity, optionally opposed by sand. Sand acts like a force that can balance a
+ * weak well: static hold cancels g entirely when |g| ≤ SAND_GRAVITY_HOLD and speed is low;
+ * when moving or overpowered, only the excess acceleration is applied (kinetic feel still
+ * comes from FRICTION_SAND velocity damping).
+ */
+function applyGravityAcceleration(ball, hole, subDt, inSand) {
+  let g = gravityAccelAt(ball, hole);
+  if (inSand && g.mag > 1e-9) {
+    const speed = Math.hypot(ball.vx, ball.vy);
+    const hold = SAND_GRAVITY_HOLD;
+    if (speed < STOP_THRESHOLD * 1.75 && g.mag <= hold) {
+      // Sand wins — parked against the pull.
+      g = { ax: 0, ay: 0, mag: 0 };
+    } else {
+      // Kinetic / overpower: sand subtracts up to `hold` along -ĝ.
+      const scale = Math.max(0, 1 - hold / g.mag);
+      g = { ax: g.ax * scale, ay: g.ay * scale, mag: g.mag * scale };
+    }
+  }
+  ball.vx += g.ax * subDt;
+  ball.vy += g.ay * subDt;
+}
+
+/** Circle collider for planet/moon. Restitution wall-like; soft impact settles on crust. */
+function resolvePlanetCollision(ball, body) {
+  if (body.kind === 'blackHole') return false;
+  const minDist = planetContactRadius(body);
+  let dx = ball.x - body.x;
+  let dy = ball.y - body.y;
+  let dist = Math.hypot(dx, dy);
+  if (dist >= minDist) return false;
+  if (dist < 1e-6) {
+    dx = 1;
+    dy = 0;
+    dist = 1e-6;
+  }
+  const nx = dx / dist;
+  const ny = dy / dist;
+  // Pin exactly to the crust — no +epsilon gap that looks like a hover dead-zone.
+  ball.x = body.x + nx * minDist;
+  ball.y = body.y + ny * minDist;
+
+  let svx = 0;
+  let svy = 0;
+  if (body.kind === 'moon' && body._omega) {
+    const rx = ball.x - body.x;
+    const ry = ball.y - body.y;
+    svx = -body._omega * ry;
+    svy = body._omega * rx;
+  }
+  const rvx = ball.vx - svx;
+  const rvy = ball.vy - svy;
+  const vn = rvx * nx + rvy * ny;
+  if (vn >= 0) return false;
+
+  const tvx = rvx - vn * nx;
+  const tvy = rvy - vn * ny;
+  const tangential = Math.hypot(tvx, tvy);
+  // Soft contact / settle: pin to crust and kill relative motion when slow.
+  // Return false so we do NOT spam bounce events (infinite "wall collision" juice).
+  if (-vn < 50 && tangential < LOW_SPEED_CUTOFF) {
+    if (body.kind === 'moon') {
+      // Ride the moon surface; kill only into-surface component.
+      ball.vx = svx + tvx * 0.5;
+      ball.vy = svy + tvy * 0.5;
+    } else {
+      // Static planet: full stop on crust so the player can putt again (incl. sand bunkers).
+      ball.vx = 0;
+      ball.vy = 0;
+    }
+    return false;
+  }
+  // Hard bounce (wall-like restitution).
+  ball.vx = svx + rvx - (1 + PLANET_RESTITUTION) * vn * nx;
+  ball.vy = svy + rvy - (1 + PLANET_RESTITUTION) * vn * ny;
+  return true;
+}
+
+function blackHoleCaptures(ball, body) {
+  if (body.kind !== 'blackHole') return false;
+  const r = Math.hypot(ball.x - body.x, ball.y - body.y);
+  return r < body.radius + BALL_RADIUS;
+}
 
 // ---- Small geometry / data helpers ----
 function wall(x1, y1, x2, y2, opts) {
@@ -764,18 +1035,224 @@ const STICKY_HOLES = [
   },
 ];
 
+// ---- Orbit (docs/orbit-spec.md) ----
+// Curriculum: 1–4 teach, 5–12 puzzle, 13–19 spectacle (19 = moon).
+// Toy box: walls/sand/water/boost/cup + gravity bodies. No ramps/windmills/pendulums/gates/goo.
+// Masses tuned so every planet escapes at max launch (escapeSpeed tests enforce).
+const ORBIT_HOLES = [
+  // 1–4 teach
+  {
+    name: 'First Pull', par: 2,
+    // Cup above the tee line so full-power pure +x cannot fall in without aim.
+    tee: { x: 80, y: 280 }, cup: { x: 700, y: 180, radius: 11 },
+    walls: [], sand: [], water: [], boost: [],
+    pendulums: [], gates: [], windmills: [], ramps: [], sticky: [],
+    gravityBodies: [planet(420, 360, 38, 24000, { fieldRadius: 210 })],
+  },
+  {
+    name: 'Keep Clear', par: 2,
+    tee: { x: 70, y: 250 }, cup: { x: 710, y: 200, radius: 11 },
+    walls: [], sand: [], water: [], boost: [],
+    pendulums: [], gates: [], windmills: [], ramps: [], sticky: [],
+    // Stronger body near the lane so pure horizontal is deflected off the cup line.
+    gravityBodies: [planet(400, 250, 36, 28000, { fieldRadius: 220 })],
+  },
+  {
+    name: 'Bank the Crust', par: 3,
+    tee: { x: 80, y: 400 }, cup: { x: 700, y: 100, radius: 11 },
+    walls: [wall(300, 200, 500, 200)],
+    sand: [], water: [], boost: [],
+    pendulums: [], gates: [], windmills: [], ramps: [], sticky: [],
+    gravityBodies: [planet(250, 280, 34, 20000, { fieldRadius: 190 })],
+  },
+  {
+    name: 'Event Horizon 101', par: 2,
+    tee: { x: 80, y: 250 }, cup: { x: 700, y: 250, radius: 11 },
+    walls: [], sand: [], water: [], boost: [],
+    pendulums: [], gates: [], windmills: [], ramps: [], sticky: [],
+    // Tiny high-mass BH below the line — pull then avoid the disk
+    gravityBodies: [blackHole(400, 340, 6, 48000, { fieldRadius: 220, drawRadius: 4 })],
+  },
+  // 5–12 puzzle
+  {
+    name: 'Binary Drift', par: 3,
+    tee: { x: 70, y: 250 }, cup: { x: 720, y: 200, radius: 11 },
+    walls: [], sand: [], water: [], boost: [],
+    pendulums: [], gates: [], windmills: [], ramps: [], sticky: [],
+    gravityBodies: [
+      planet(320, 200, 32, 20000, { fieldRadius: 180 }),
+      planet(500, 320, 32, 20000, { fieldRadius: 180 }),
+    ],
+  },
+  {
+    name: 'Dust Lane', par: 3,
+    // Diagonal fairway: sand sits on the short-cut so the clean line arcs around the planet.
+    tee: { x: 80, y: 120 }, cup: { x: 700, y: 380, radius: 11 },
+    walls: [], sand: [sandRect(360, 220, 480, 300)], water: [], boost: [],
+    pendulums: [], gates: [], windmills: [], ramps: [], sticky: [],
+    gravityBodies: [planet(400, 250, 32, 21000, { fieldRadius: 180 })],
+  },
+  {
+    name: 'Sling Corridor', par: 3,
+    tee: { x: 80, y: 380 }, cup: { x: 700, y: 120, radius: 11 },
+    walls: [wall(400, 250, 400, 450)],
+    sand: [], water: [], boost: [],
+    pendulums: [], gates: [], windmills: [], ramps: [], sticky: [],
+    // Planet low-right; open diagonal above wall.
+    gravityBodies: [planet(500, 380, 30, 14000, { fieldRadius: 140 })],
+  },
+  {
+    name: 'Needle Thread', par: 3,
+    tee: { x: 80, y: 250 }, cup: { x: 710, y: 250, radius: 11 },
+    walls: [], sand: [], water: [], boost: [],
+    pendulums: [], gates: [], windmills: [], ramps: [], sticky: [],
+    gravityBodies: [
+      planet(350, 160, 28, 16000, { fieldRadius: 150 }),
+      blackHole(400, 250, 5, 42000, { fieldRadius: 160, drawRadius: 4 }),
+      planet(450, 340, 28, 16000, { fieldRadius: 150 }),
+    ],
+  },
+  {
+    name: 'Well Between', par: 3,
+    tee: { x: 80, y: 100 }, cup: { x: 700, y: 400, radius: 11 },
+    walls: [], sand: [], water: [waterRect(360, 200, 440, 300, { x: 200, y: 250 })],
+    boost: [],
+    pendulums: [], gates: [], windmills: [], ramps: [], sticky: [],
+    gravityBodies: [planet(520, 180, 34, 20000, { fieldRadius: 180 })],
+  },
+  {
+    name: 'Twin Sling', par: 3,
+    tee: { x: 60, y: 250 }, cup: { x: 730, y: 250, radius: 11 },
+    walls: [], sand: [], water: [], boost: [],
+    pendulums: [], gates: [], windmills: [], ramps: [], sticky: [],
+    gravityBodies: [
+      planet(300, 250, 36, 25000, { fieldRadius: 190 }),
+      planet(520, 250, 36, 25000, { fieldRadius: 190 }),
+    ],
+  },
+  {
+    name: 'Thruster Assist', par: 3,
+    tee: { x: 80, y: 400 }, cup: { x: 700, y: 100, radius: 11 },
+    walls: [], sand: [], water: [],
+    boost: [boostRect(200, 220, 280, 280, -Math.PI / 4, 420)],
+    pendulums: [], gates: [], windmills: [], ramps: [], sticky: [],
+    gravityBodies: [planet(450, 300, 34, 22000, { fieldRadius: 190 })],
+  },
+  {
+    name: 'Horizon Gauntlet', par: 4,
+    tee: { x: 70, y: 250 }, cup: { x: 720, y: 180, radius: 11 },
+    // Sand on the low dodge past the first BH — the lazy low line pays a friction tax.
+    walls: [], sand: [sandRect(300, 290, 390, 360)], water: [], boost: [],
+    pendulums: [], gates: [], windmills: [], ramps: [], sticky: [],
+    gravityBodies: [
+      blackHole(340, 250, 5, 38000, { fieldRadius: 140, drawRadius: 4 }),
+      planet(500, 360, 30, 16000, { fieldRadius: 150 }),
+      blackHole(600, 140, 5, 36000, { fieldRadius: 130, drawRadius: 4 }),
+    ],
+  },
+  // 13–19 spectacle
+  {
+    name: 'Grand Tour', par: 4,
+    tee: { x: 80, y: 400 }, cup: { x: 700, y: 100, radius: 11 },
+    walls: [],
+    sand: [], water: [], boost: [],
+    pendulums: [], gates: [], windmills: [], ramps: [], sticky: [],
+    gravityBodies: [
+      planet(280, 160, 32, 15000, { fieldRadius: 140 }),
+      planet(520, 340, 32, 15000, { fieldRadius: 140 }),
+    ],
+  },
+  {
+    name: 'Lagrange Squeeze', par: 3,
+    tee: { x: 80, y: 250 }, cup: { x: 700, y: 250, radius: 11 },
+    walls: [], sand: [], water: [], boost: [],
+    pendulums: [], gates: [], windmills: [], ramps: [], sticky: [],
+    gravityBodies: [
+      planet(350, 250, 42, 30000, { fieldRadius: 200 }),
+      planet(520, 250, 28, 16000, { fieldRadius: 160 }),
+    ],
+  },
+  {
+    name: 'Aphelion Run', par: 3,
+    tee: { x: 70, y: 80 }, cup: { x: 720, y: 420, radius: 11 },
+    walls: [], sand: [], water: [], boost: [boostRect(150, 200, 210, 260, Math.PI / 5, 380)],
+    pendulums: [], gates: [], windmills: [], ramps: [], sticky: [],
+    gravityBodies: [
+      planet(400, 250, 38, 26000, { fieldRadius: 200 }),
+      blackHole(560, 140, 5, 45000, { fieldRadius: 160, drawRadius: 4 }),
+    ],
+  },
+  {
+    name: 'Three Body Problem', par: 4,
+    tee: { x: 80, y: 400 }, cup: { x: 700, y: 100, radius: 11 },
+    // Sand on the lower corner shortcut between planets 2 and 3.
+    walls: [], sand: [sandRect(420, 280, 520, 360)], water: [], boost: [],
+    pendulums: [], gates: [], windmills: [], ramps: [], sticky: [],
+    gravityBodies: [
+      planet(250, 200, 30, 18000, { fieldRadius: 160 }),
+      planet(400, 350, 34, 22000, { fieldRadius: 170 }),
+      planet(560, 200, 30, 18000, { fieldRadius: 160 }),
+    ],
+  },
+  {
+    name: 'Dark Matter', par: 3,
+    tee: { x: 80, y: 250 }, cup: { x: 700, y: 250, radius: 11 },
+    walls: [wall(250, 100, 250, 200), wall(250, 300, 250, 400)],
+    sand: [], water: [], boost: [],
+    pendulums: [], gates: [], windmills: [], ramps: [], sticky: [],
+    gravityBodies: [
+      blackHole(400, 250, 6, 55000, { fieldRadius: 200, drawRadius: 5 }),
+      planet(580, 140, 30, 17000, { fieldRadius: 150 }),
+    ],
+  },
+  {
+    name: 'Periapsis', par: 4,
+    tee: { x: 70, y: 420 }, cup: { x: 720, y: 80, radius: 11 },
+    walls: [], sand: [], water: [waterRect(200, 180, 280, 280, { x: 160, y: 380 })],
+    boost: [],
+    pendulums: [], gates: [], windmills: [], ramps: [], sticky: [],
+    gravityBodies: [
+      planet(420, 300, 34, 18000, { fieldRadius: 160 }),
+      blackHole(580, 400, 5, 32000, { fieldRadius: 130, drawRadius: 4 }),
+    ],
+  },
+  {
+    name: 'Lunar Window', par: 4,
+    // Central world blocks the fairway; top/bottom walls kill free bypasses. The moon's
+    // gravity assist is required for a clean HIO — same seed must fail if the moon is removed.
+    tee: { x: 70, y: 250 }, cup: { x: 730, y: 250, radius: 11 },
+    walls: [
+      wall(250, 90, 550, 90),
+      wall(250, 410, 550, 410),
+      wall(250, 90, 250, 170),
+      wall(250, 330, 250, 410),
+      wall(550, 90, 550, 170),
+      wall(550, 330, 550, 410),
+    ],
+    sand: [], water: [], boost: [],
+    pendulums: [], gates: [], windmills: [], ramps: [], sticky: [],
+    gravityBodies: [
+      planet(400, 250, 52, 32000, { fieldRadius: 160 }),
+      // Wide field so a park next to the planet still feels the moon as it slides by.
+      moon(400, 250, 118, 24, 22000, 280, { fieldRadius: 200, orbitPhase0: 0 }),
+    ],
+  },
+];
+
 const COURSES = [
   { id: 'classic', name: 'Classic', holes: HOLES },
   { id: 'canyon', name: 'Canyon Jumps', holes: CANYON_HOLES },
   { id: 'goo', name: 'Goo Lagoon', holes: STICKY_HOLES },
+  { id: 'orbit', name: 'Orbit', holes: ORBIT_HOLES },
 ];
 
-// Classic's hole literals predate ramps/sticky — fill the two new arrays in one pass so the
-// "every hole carries every array" invariant keeps holding without editing 19 literals.
+// Classic's hole literals predate ramps/sticky/gravity — fill arrays in one pass so the
+// "every hole carries every array" invariant keeps holding without editing every literal.
 for (const c of COURSES) {
   for (const h of c.holes) {
     h.ramps = h.ramps || [];
     h.sticky = h.sticky || [];
+    h.gravityBodies = h.gravityBodies || [];
   }
 }
 
@@ -891,7 +1368,10 @@ function stepBallPhysics(ball, hole, dt) {
   const substeps = 4;
   const subDt = dt / substeps;
   let inSandLastStep = false;
-  const events = { holed: false, water: null, boosts: [], bounced: false, enteredSand: false, launched: false, landed: false, stuck: false };
+  const events = {
+    holed: false, water: null, blackHole: null, boosts: [],
+    bounced: false, enteredSand: false, launched: false, landed: false, stuck: false,
+  };
 
   for (let s = 0; s < substeps; s++) {
     const airborne = (ball.z || 0) > 0;
@@ -923,6 +1403,12 @@ function stepBallPhysics(ball, hole, dt) {
     if (inSand && !inSandLastStep) events.enteredSand = true;
     inSandLastStep = inSand;
 
+    // Orbit gravity (grounded only — airborne ramps are non-Orbit; still skip z>0 for purity).
+    // Sand can oppose g (see SAND_GRAVITY_HOLD) so a bunker may hold you against a weak well.
+    if (!airborne) {
+      applyGravityAcceleration(ball, hole, subDt, inSand);
+    }
+
     // Cup divot: slow balls near the cup get tugged toward it, fast ones fly over.
     const dcx = hole.cup.x - ball.x, dcy = hole.cup.y - ball.y;
     const dCup0 = Math.hypot(dcx, dcy);
@@ -937,8 +1423,15 @@ function stepBallPhysics(ball, hole, dt) {
     ball.vx *= decay;
     ball.vy *= decay;
     // Rolling resistance at crawl speeds (outside the divot) so the ball settles fast
-    // instead of trickling on forever.
-    if (!airborne && (dCup0 >= CUP_GRAVITY_RADIUS || !cupHasGravity(hole)) && Math.hypot(ball.vx, ball.vy) < LOW_SPEED_CUTOFF) {
+    // instead of trickling on forever. Skip while floating in a gravity field on grass —
+    // but keep it in sand so bunker friction still fights residual creep.
+    const floating = !airborne && ballFloatingInGravity(ball, hole) && !inSand;
+    if (
+      !airborne &&
+      !floating &&
+      (dCup0 >= CUP_GRAVITY_RADIUS || !cupHasGravity(hole)) &&
+      Math.hypot(ball.vx, ball.vy) < LOW_SPEED_CUTOFF
+    ) {
       const extra = Math.exp(-LOW_SPEED_DRAG * subDt);
       ball.vx *= extra;
       ball.vy *= extra;
@@ -964,6 +1457,14 @@ function stepBallPhysics(ball, hole, dt) {
     const wallList = ball.z > 0 ? BOUNDARY_WALLS : walls;
     for (const w of wallList) {
       if (resolveWallCollision(ball, w)) events.bounced = true;
+    }
+
+    // Planets / moons: solid bounce (Orbit). Airborne skips interior solids like walls.
+    if (ball.z <= 0) {
+      const bodies = hole.gravityBodies || [];
+      for (let bi = 0; bi < bodies.length; bi++) {
+        if (resolvePlanetCollision(ball, bodies[bi])) events.bounced = true;
+      }
     }
 
     if (ball.z <= 0) {
@@ -1024,6 +1525,17 @@ function stepBallPhysics(ball, hole, dt) {
       if (circleTouchesZone(ball.x, ball.y, BALL_RADIUS, z)) { events.water = z; return events; }
     }
 
+    // Black hole capture: +1 stroke + tee reset handled by caller (not the cup win).
+    {
+      const bodies = hole.gravityBodies || [];
+      for (let bi = 0; bi < bodies.length; bi++) {
+        if (blackHoleCaptures(ball, bodies[bi])) {
+          events.blackHole = bodies[bi];
+          return events;
+        }
+      }
+    }
+
     const dCup = Math.hypot(ball.x - hole.cup.x, ball.y - hole.cup.y);
     if (dCup < hole.cup.radius) { events.holed = true; return events; }
   }
@@ -1044,6 +1556,13 @@ function advanceHoleObstacles(hole, dt) {
   for (const wm of hole.windmills) wm.angle += wm.rotationSpeed * dt;
   for (const p of hole.pendulums) p.phase += dt;
   for (const g of hole.gates) g.phase += dt;
+  // Solo path: accumulate fractional ticks so moons stay tick-formula compatible.
+  hole._orbitTick = (hole._orbitTick || 0) + dt / TICK_DT;
+  const bodies = hole.gravityBodies || [];
+  const tick = Math.floor(hole._orbitTick);
+  for (let i = 0; i < bodies.length; i++) {
+    if (bodies[i].kind === 'moon') setMoonPoseAtTick(bodies[i], tick);
+  }
 }
 
 // Absolute obstacle pose from an integer sim tick. Multiplayer host and clients both use
@@ -1054,12 +1573,21 @@ function setHoleObstaclesAtTick(hole, tick) {
   for (const wm of hole.windmills) wm.angle = wm.rotationSpeed * t;
   for (const p of hole.pendulums) p.phase = t;
   for (const g of hole.gates) g.phase = t;
+  const bodies = hole.gravityBodies || [];
+  for (let i = 0; i < bodies.length; i++) {
+    if (bodies[i].kind === 'moon') setMoonPoseAtTick(bodies[i], tick);
+  }
 }
 
 function resetHoleObstacles(hole) {
   for (const wm of hole.windmills) wm.angle = 0;
   for (const p of hole.pendulums) p.phase = 0;
   for (const g of hole.gates) g.phase = 0;
+  hole._orbitTick = 0;
+  const bodies = hole.gravityBodies || [];
+  for (let i = 0; i < bodies.length; i++) {
+    if (bodies[i].kind === 'moon') setMoonPoseAtTick(bodies[i], 0);
+  }
 }
 
 // Equal-mass elastic collision between two balls. Separates the overlap and exchanges the
@@ -1135,15 +1663,20 @@ function clampDragVector(v) {
 
 return {
   TICK_HZ, TICK_DT, TICK_MS, tickToElapsedMs, elapsedMsToTick,
-  LOGICAL_W, LOGICAL_H, BALL_RADIUS, FRICTION_GRASS, FRICTION_SAND, STOP_THRESHOLD,
+  LOGICAL_W, LOGICAL_H, BALL_RADIUS, FRICTION_GRASS, FRICTION_SAND, SAND_GRAVITY_HOLD, STOP_THRESHOLD,
   CUP_GRAVITY_RADIUS,
   WALL_RESTITUTION, BUMPER_RESTITUTION, PENDULUM_RESTITUTION, GATE_RESTITUTION,
   MAX_DRAG_DIST, MIN_DRAG_DIST, POWER_MULTIPLIER, MAX_LAUNCH_SPEED, BOOST_MAX_SPEED, BOUND,
   RAMP_MIN_SPEED, RAMP_GRAVITY, RAMP_VZ_SCALE, RAMP_VZ_MIN, RAMP_VZ_MAX,
   FRICTION_STICKY, STICKY_STOP_SPEED, STICKY_LAUNCH_FACTOR, FRICTION_WET_GOO,
+  GRAVITY_G, PLANET_RESTITUTION, ESCAPE_SPEED_MARGIN,
   wall, sandRect, waterRect, boostRect, rampRect, stickyRect, pendulum, getPendulumSegment, slidingGate,
   getSlidingGateSegment, ringBumpers, pointInZone, circleTouchesZone, zoneBounds, cupHasGravity,
-  BOUNDARY_WALLS, HOLES, COURSES,
+  gravityBody, planet, blackHole, moon, escapeSpeed, bodyCanEscapeAtMaxLaunch,
+  planetContactRadius, ballOnPlanetCrust, ballFloatingInGravity, ballMayRestForAim,
+  ballInSand, effectiveGravityMag, gravityAccelAt, REST_GRAVITY_EPS, SAND_GRAVITY_HOLD,
+  setMoonPoseAtTick, applyGravityAcceleration, resolvePlanetCollision, blackHoleCaptures,
+  BOUNDARY_WALLS, HOLES, ORBIT_HOLES, COURSES,
   resolveWallCollision, getWindmillBlades,
   createBallState, stepBallPhysics, advanceHoleObstacles, setHoleObstaclesAtTick, resetHoleObstacles,
   computeLaunchVelocity, clampDragVector, stickyLaunchFactor, stickyIndexAt, latchStickyAfterPutt,

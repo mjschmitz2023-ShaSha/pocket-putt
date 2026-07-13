@@ -304,7 +304,9 @@ class GameSession {
    */
   eventsNeedHardSnap(events) {
     for (const ev of events || []) {
-      if (ev.kind === 'water' || ev.kind === 'holed' || ev.kind === 'clash') return true;
+      if (ev.kind === 'water' || ev.kind === 'blackHole' || ev.kind === 'holed' || ev.kind === 'clash') {
+        return true;
+      }
     }
     return false;
   }
@@ -402,6 +404,22 @@ class GameSession {
           p.ball.vz = 0;
           p.ball.stuckStickyIndex = -1;
           Shared.markWetFromWater(p.ball);
+        }
+        if (events.blackHole) {
+          p.strokes++;
+          const hole = this.currentHoles()[this.currentHoleIndex];
+          tickEvents.push({ id: p.id, kind: 'blackHole', x: p.ball.x, y: p.ball.y });
+          // Spec: +1 stroke, reset to hole tee (not a custom drop pad); no wet.
+          p.ball.x = hole.tee.x;
+          p.ball.y = hole.tee.y;
+          p.ball.vx = 0;
+          p.ball.vy = 0;
+          p.ball.z = 0;
+          p.ball.vz = 0;
+          p.ball.stuckStickyIndex = -1;
+          p.ball.wet = false;
+          p.ball.wetStroke = false;
+          p.ball.firedBoosts = new Set();
         }
         if (events.holed) {
           this.finishPlayerHole(p, false);

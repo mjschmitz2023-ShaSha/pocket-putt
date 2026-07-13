@@ -8,8 +8,9 @@
     "lan": "node relay.js",
     "relay": "node relay.js",
     "lan-legacy": "node server.js",
-    "test": "node test/sticky-latch.js && node test/rubberband-harness.js --all",
+    "test": "node test/sticky-latch.js && node test/orbit-hio.js && node test/rubberband-harness.js --all",
     "test:sticky": "node test/sticky-latch.js",
+    "test:orbit": "node test/orbit-hio.js",
     "test:rubberband": "node test/rubberband-harness.js --all",
     "test:lockstep": "node test/rubberband-harness.js lockstep_coast"
   },

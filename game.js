@@ -11,7 +11,7 @@ const {
   getPendulumSegment, getSlidingGateSegment,
   createBallState, stepBallPhysics, advanceHoleObstacles, setHoleObstaclesAtTick, resetHoleObstacles,
   computeLaunchVelocity, clampDragVector, stickyLaunchFactor, stickyIndexAt, latchStickyAfterPutt,
-  markWetFromWater, noteWetPutt,
+  markWetFromWater, noteWetPutt, ballMayRestForAim,
 } = window.Shared;
 // Must match gameSession PHYSICS_SUBTICKS — same dt schedule keeps sticky latch deterministic.
 const MP_PHYSICS_SUBTICKS = 4;
@@ -219,6 +219,30 @@ function handleWaterHazard(zone) {
   const hazardMsg = document.getElementById('hazard-text');
   if (hazardMsg) hazardMsg.textContent = 'Splash! +1  ·  WET — goo is slick this putt';
 }
+function handleBlackHoleHazard() {
+  Game.strokes++;
+  Game.totalStrokes++;
+  const hole = currentHoles()[Game.currentHoleIndex];
+  Game.ball.x = hole.tee.x;
+  Game.ball.y = hole.tee.y;
+  Game.ball.vx = 0;
+  Game.ball.vy = 0;
+  Game.ball.z = 0;
+  Game.ball.vz = 0;
+  Game.ball.wet = false;
+  Game.ball.wetStroke = false;
+  Game.ball.firedBoosts = new Set();
+  Game.trail = [];
+  // Visual only — black holes are not water; do not count toward Pond Lover / bubble trail.
+  spawnSplash(hole.tee.x, hole.tee.y);
+  soundWater();
+  updateHUD();
+  Game.hazardTimer = 0.9;
+  Game.state = 'HAZARD_RESET';
+  showScreen('screen-hazard');
+  const hazardMsg = document.getElementById('hazard-text');
+  if (hazardMsg) hazardMsg.textContent = 'Event horizon! +1  ·  Reset to tee';
+}
 // Thin wrapper around shared.js's stepBallPhysics: the physics itself is identical to what
 // the multiplayer server runs, this just reacts to the returned events with solo-mode
 // sound/particles/scoring so the two never have to agree on anything beyond ball motion.
@@ -233,6 +257,7 @@ function updateBallPhysics(dt) {
     soundBoost();
   }
   if (events.water) { handleWaterHazard(events.water); return; }
+  if (events.blackHole) { handleBlackHoleHazard(); return; }
   if (events.holed) { onHoleComplete(); return; }
 
   const speed = Math.hypot(Game.ball.vx, Game.ball.vy);
@@ -245,11 +270,16 @@ function updateBallPhysics(dt) {
   if (speed < STOP_THRESHOLD) {
     // Inside the cup divot, let gravity keep working instead of freezing the ball on the lip.
     // On goo-guarded holes the magnet is off, so never hold the ball "live" near the cup.
+    // Never freeze mid-air in a field, or when a moving well (moon) is pulling hard enough
+    // that a "stationary" ball should start rolling again.
     const nearCup = cupHasGravity(hole) && Math.hypot(Game.ball.x - hole.cup.x, Game.ball.y - hole.cup.y) < CUP_GRAVITY_RADIUS;
-    if (!nearCup) {
+    if (!nearCup && ballMayRestForAim(Game.ball, hole)) {
       Game.ball.vx = 0;
       Game.ball.vy = 0;
       Game.state = 'AIMING';
+    } else if (!nearCup) {
+      // Keep simulating (e.g. moon field just overlapped a resting ball).
+      Game.state = 'BALL_MOVING';
     }
   }
 }
@@ -378,6 +408,54 @@ function drawWaterZone(z) {
     ctx.lineTo(b.x2 - 6, yOff);
     ctx.stroke();
   }
+}
+function drawGravityBody(b) {
+  if (b.kind === 'blackHole') {
+    const hr = b.radius;
+    const dr = b.drawRadius != null ? b.drawRadius : Math.min(hr, 5);
+    // Soft field halo
+    const glow = ctx.createRadialGradient(b.x, b.y, dr, b.x, b.y, Math.min(b.fieldRadius || 80, 90));
+    glow.addColorStop(0, 'rgba(80,40,120,0.35)');
+    glow.addColorStop(1, 'rgba(20,0,40,0)');
+    ctx.fillStyle = glow;
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, Math.min(b.fieldRadius || 80, 90), 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#0a0612';
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, dr, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(180,120,255,0.7)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, hr, 0, Math.PI * 2);
+    ctx.stroke();
+    return;
+  }
+  // planet / moon
+  const r = b.radius;
+  const bodyGrad = ctx.createRadialGradient(b.x - r * 0.3, b.y - r * 0.3, r * 0.2, b.x, b.y, r);
+  if (b.kind === 'moon') {
+    bodyGrad.addColorStop(0, '#d8dce8');
+    bodyGrad.addColorStop(1, '#6a7388');
+  } else {
+    bodyGrad.addColorStop(0, '#7ec8ff');
+    bodyGrad.addColorStop(0.55, '#2a6db0');
+    bodyGrad.addColorStop(1, '#0d2a4a');
+  }
+  // faint SOI
+  ctx.strokeStyle = 'rgba(120,180,255,0.15)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.arc(b.x, b.y, Math.min(b.fieldRadius || r * 4, r * 5), 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.fillStyle = bodyGrad;
+  ctx.beginPath();
+  ctx.arc(b.x, b.y, r, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+  ctx.lineWidth = 2;
+  ctx.stroke();
 }
 function drawBoostZone(z) {
   const b = zoneBounds(z);
@@ -879,6 +957,7 @@ function drawWorld() {
   for (const z of hole.sticky || []) drawStickyZone(z);
   for (const z of hole.boost) drawBoostZone(z);
   for (const z of hole.ramps || []) drawRampZone(z);
+  for (const b of hole.gravityBodies || []) drawGravityBody(b);
   for (const w of BOUNDARY_WALLS) drawWallSegment(w);
   for (const w of hole.walls) drawWallSegment(w);
   for (const wm of hole.windmills) drawWindmill(wm);
@@ -1107,7 +1186,16 @@ function update(dt) {
     advanceHoleObstacles(hole, dt);
   }
   Game.flagPhase += dt;
-  if (Game.state === 'BALL_MOVING') updateBallPhysics(dt);
+  // Orbit: while AIMING, only wake physics when a field is actually yanking the ball
+  // (moon sweep, fall into well). Do NOT force BALL_MOVING every frame while at rest on a
+  // planet crust/sand — that caused an infinite soft-collision loop and blocked putting.
+  const hasGravity = (hole.gravityBodies || []).length > 0;
+  if (Game.state === 'BALL_MOVING') {
+    updateBallPhysics(dt);
+  } else if (Game.state === 'AIMING' && hasGravity && !ballMayRestForAim(Game.ball, hole)) {
+    Game.state = 'BALL_MOVING';
+    updateBallPhysics(dt);
+  }
   if (Game.state === 'HAZARD_RESET') {
     Game.hazardTimer -= dt;
     if (Game.hazardTimer <= 0) {
@@ -1600,7 +1688,12 @@ function mpSyncSelfFromPlayer(p) {
   Game.ball.z = p.z || 0;
   Game.ball.vz = p.vz || 0;
   const speed = Math.hypot(p.vx, p.vy);
-  mpCanPutt = !p.holedOut && speed < STOP_THRESHOLD && (p.z || 0) === 0;
+  const hole = currentHoles()[Game.currentHoleIndex];
+  mpCanPutt =
+    !p.holedOut &&
+    speed < STOP_THRESHOLD &&
+    (p.z || 0) === 0 &&
+    ballMayRestForAim(p, hole);
   setHudText(hudStrokes, `Strokes: ${p.strokes}`);
 }
 
@@ -1795,6 +1888,30 @@ function mpStepOneTick() {
           achvOnSplash();
         }
       }
+      if (events.blackHole) {
+        const tee = hole.tee;
+        p.x = tee.x;
+        p.y = tee.y;
+        p.vx = 0;
+        p.vy = 0;
+        p.z = 0;
+        p.vz = 0;
+        p.stuckStickyIndex = -1;
+        p.wet = false;
+        p.wetStroke = false;
+        p.firedBoosts = new Set();
+        p.strokes += 1;
+        p.errX = 0;
+        p.errY = 0;
+        p.rx = p.x;
+        p.ry = p.y;
+        spawnSplash(tee.x, tee.y);
+        if (mine) {
+          soundWater();
+          mpShowBanner('EVENT HORIZON! +1  ·  Tee');
+          // Not a water splash — pond3 / bubble trail only from actual water.
+        }
+      }
       if (events.holed) {
         p.holedOut = true;
         p.vx = 0;
@@ -1983,6 +2100,14 @@ function mpHandleEvent(ev, hole) {
         soundWater();
         mpShowBanner('SPLASH! +1');
         achvOnSplash();
+      }
+      break;
+    case 'blackHole':
+      if (typeof ev.x === 'number') spawnSplash(ev.x, ev.y);
+      if (mine) {
+        soundWater();
+        mpShowBanner('EVENT HORIZON! +1');
+        // Do not achvOnSplash — water skin is for water hazards only.
       }
       break;
     case 'clash':
