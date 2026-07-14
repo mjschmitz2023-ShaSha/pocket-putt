@@ -38,11 +38,15 @@ html, body {
 }
 
 canvas#game {
+  position: absolute;
+  left: 0;
+  top: 0;
   display: block;
   width: 800px;
   height: 500px;
   touch-action: none;
   cursor: crosshair;
+  z-index: 0;
 }
 
 #hud {
@@ -91,6 +95,58 @@ canvas#game {
   animation: bounceIn 0.35s ease;
   white-space: nowrap;
 }
+
+/* Escape hatch when the ball never settles (Orbit gravity loops, etc.) */
+#respawn-offer {
+  position: absolute;
+  left: 50%;
+  bottom: 22px;
+  transform: translateX(-50%);
+  /* Above canvas (z=0) and HUD so the button always receives clicks. */
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 14px 18px;
+  border-radius: 12px;
+  background: rgba(12, 18, 14, 0.88);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+  pointer-events: auto;
+  animation: bounceIn 0.3s ease;
+}
+#respawn-offer p {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  opacity: 0.9;
+}
+#respawn-offer button {
+  position: relative;
+  z-index: 1;
+  min-width: 160px;
+  padding: 8px 14px;
+  border-radius: 8px;
+  border: none;
+  font-size: 14px;
+  font-weight: 700;
+  cursor: pointer;
+  pointer-events: auto;
+}
+#btn-respawn {
+  background: #3d8f5a;
+  color: #fff;
+}
+#btn-respawn:hover { background: #48a86a; }
+#btn-respawn-dismiss,
+.btn-quiet {
+  background: transparent;
+  color: rgba(238, 247, 238, 0.75);
+  border: 1px solid rgba(255, 255, 255, 0.15) !important;
+  font-weight: 600 !important;
+}
+#btn-respawn-dismiss:hover { color: #fff; }
 
 .screen {
   position: absolute;
@@ -350,6 +406,34 @@ button:active {
   padding: 7px 16px;
 }
 
+/* Anchors use .btn-small but do not match the `button` selector — give them the same chrome. */
+a.btn-small {
+  display: inline-block;
+  font-family: inherit;
+  font-weight: 700;
+  border: none;
+  border-radius: 30px;
+  background: #f4c542;
+  color: #1b2a1f;
+  cursor: pointer;
+  text-decoration: none;
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.35);
+  transition: transform 0.08s ease, box-shadow 0.08s ease;
+  line-height: 1.2;
+}
+a.btn-small:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.4);
+  color: #1b2a1f;
+  text-decoration: none;
+}
+a.btn-small:active {
+  transform: translateY(0) scale(0.97);
+}
+a.btn-small:visited {
+  color: #1b2a1f;
+}
+
 .swatch-row {
   display: flex;
   flex-wrap: wrap;
@@ -548,3 +632,22 @@ button:active {
   display: flex;
   align-items: center;
   gap: 8px;
+
+/* Custom level share link panel (start screen) */
+#custom-level-panel {
+  margin: 12px 0 4px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.28);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+}
+.custom-level-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: center;
+  margin-top: 8px;
+}
+#lobby-custom-label {
+  margin-top: 8px;
+}

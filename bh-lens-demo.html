@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Black hole lens lab — Pocket Putt</title>
+<style>
+  :root {
+    --bg: #12161a;
+    --panel: #1c2228;
+    --text: #e8eef2;
+    --muted: #8a9aa6;
+    --accent: #7eb8ff;
+    --border: #2c3640;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+  }
+  header {
+    padding: 16px 20px 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  header h1 { margin: 0 0 4px; font-size: 18px; font-weight: 700; }
+  header p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.45; max-width: 70em; }
+  .layout {
+    display: grid;
+    grid-template-columns: 1fr 320px;
+    gap: 0;
+    flex: 1;
+    min-height: 0;
+  }
+  @media (max-width: 900px) {
+    .layout { grid-template-columns: 1fr; }
+  }
+  .stage-wrap {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+    background: #0b0e11;
+  }
+  canvas {
+    background: #1a3d24;
+    border-radius: 10px;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.45);
+    max-width: 100%;
+    height: auto;
+    cursor: crosshair;
+  }
+  aside {
+    border-left: 1px solid var(--border);
+    background: var(--panel);
+    padding: 14px 16px 24px;
+    overflow: auto;
+  }
+  .row {
+    margin-bottom: 14px;
+  }
+  .row label {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--muted);
+    margin-bottom: 4px;
+  }
+  .row label strong { color: var(--text); font-variant-numeric: tabular-nums; }
+  input[type="range"] { width: 100%; }
+  .checks label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--text);
+    font-size: 13px;
+    margin: 8px 0;
+  }
+  button, .btn {
+    appearance: none;
+    border: 1px solid var(--border);
+    background: #24303a;
+    color: var(--text);
+    border-radius: 8px;
+    padding: 8px 12px;
+    font-size: 13px;
+    cursor: pointer;
+    width: 100%;
+    margin-top: 6px;
+  }
+  button:hover { border-color: var(--accent); }
+  pre {
+    background: #0f1418;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px;
+    font-size: 11px;
+    line-height: 1.4;
+    overflow: auto;
+    color: #b8d4ea;
+    white-space: pre-wrap;
+  }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 10px; line-height: 1.4; }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 18px 0 8px; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>Black hole lens lab</h1>
+    <p>
+      Drag the hole on the fairway. Tune the screen-space warp (approach B).
+      This is the same family of map as the game: sample farther out near the horizon so grass packs into a ring — not full GR ray-tracing.
+      Click <em>Copy snippet</em> once you like the numbers, then we can paste them into <code>game.js</code>.
+    </p>
+  </header>
+  <div class="layout">
+    <div class="stage-wrap">
+      <canvas id="c" width="800" height="500"></canvas>
+    </div>
+    <aside>
+      <h2>Geometry</h2>
+      <div class="row">
+        <label>Horizon radius Rs <strong id="v-rs">8</strong></label>
+        <input id="rs" type="range" min="3" max="40" step="0.5" value="8">
+      </div>
+      <div class="row">
+        <label>Lens radius (warp extent) <strong id="v-rout">140</strong></label>
+        <input id="rout" type="range" min="40" max="280" step="2" value="140">
+      </div>
+      <div class="row">
+        <label>Black disk size (draw) <strong id="v-disk">8</strong></label>
+        <input id="disk" type="range" min="2" max="40" step="0.5" value="8">
+      </div>
+
+      <h2>Warp map</h2>
+      <div class="row">
+        <label>lensK (Schwarzschild-ish) <strong id="v-k">1.35</strong></label>
+        <input id="k" type="range" min="0.2" max="3.5" step="0.05" value="1.35">
+      </div>
+      <div class="row">
+        <label>Falloff power <strong id="v-fall">1.1</strong></label>
+        <input id="fall" type="range" min="0.3" max="3.5" step="0.05" value="1.1">
+      </div>
+      <div class="row">
+        <label>Min denom clamp <strong id="v-den">0.18</strong></label>
+        <input id="den" type="range" min="0.05" max="0.6" step="0.01" value="0.18">
+      </div>
+      <div class="row">
+        <label>Blend mix (0=raw r, 1=full schwarz) <strong id="v-mix">1</strong></label>
+        <input id="mix" type="range" min="0" max="1.5" step="0.05" value="1">
+      </div>
+
+      <h2>Look</h2>
+      <div class="checks">
+        <label><input id="showDisk" type="checkbox" checked> Solid black event horizon</label>
+        <label><input id="showRing" type="checkbox"> Thin photon ring (no glow)</label>
+        <label><input id="showSOI" type="checkbox"> Dashed lens boundary</label>
+        <label><input id="showStripes" type="checkbox" checked> Strong grass stripes (easier to see warp)</label>
+      </div>
+
+      <h2>Presets</h2>
+      <button type="button" id="preset-current">Game default-ish</button>
+      <button type="button" id="preset-big">Bigger + stronger</button>
+      <button type="button" id="preset-extreme">Extreme (may pinwheel)</button>
+
+      <h2>Export</h2>
+      <button type="button" id="copy">Copy snippet for game.js</button>
+      <pre id="out"></pre>
+      <p class="hint">Drag on the canvas to move the hole. Values are in logical pixels (800×500), same as the game.</p>
+    </aside>
+  </div>
+<script>
+const W = 800, H = 500;
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const dpr = window.devicePixelRatio || 1;
+canvas.width = W * dpr;
+canvas.height = H * dpr;
+canvas.style.width = W + 'px';
+canvas.style.height = H + 'px';
+ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+const state = {
+  x: 400,
+  y: 280,
+  rs: 8,
+  rout: 140,
+  disk: 8,
+  k: 1.35,
+  fall: 1.1,
+  den: 0.18,
+  mix: 1,
+  showDisk: true,
+  showRing: false,
+  showSOI: false,
+  showStripes: true,
+};
+
+const els = {
+  rs: document.getElementById('rs'),
+  rout: document.getElementById('rout'),
+  disk: document.getElementById('disk'),
+  k: document.getElementById('k'),
+  fall: document.getElementById('fall'),
+  den: document.getElementById('den'),
+  mix: document.getElementById('mix'),
+  showDisk: document.getElementById('showDisk'),
+  showRing: document.getElementById('showRing'),
+  showSOI: document.getElementById('showSOI'),
+  showStripes: document.getElementById('showStripes'),
+};
+
+function bind() {
+  const map = [
+    ['rs', 'rs', 'v-rs'],
+    ['rout', 'rout', 'v-rout'],
+    ['disk', 'disk', 'v-disk'],
+    ['k', 'k', 'v-k'],
+    ['fall', 'fall', 'v-fall'],
+    ['den', 'den', 'v-den'],
+    ['mix', 'mix', 'v-mix'],
+  ];
+  for (const [id, key, vid] of map) {
+    els[id].addEventListener('input', () => {
+      state[key] = Number(els[id].value);
+      document.getElementById(vid).textContent = String(state[key]);
+      render();
+    });
+    document.getElementById(vid).textContent = String(state[key]);
+  }
+  for (const id of ['showDisk', 'showRing', 'showSOI', 'showStripes']) {
+    els[id].addEventListener('change', () => {
+      state[id] = els[id].checked;
+      render();
+    });
+  }
+}
+bind();
+
+function applyPreset(p) {
+  Object.assign(state, p);
+  for (const [id, key] of [['rs','rs'],['rout','rout'],['disk','disk'],['k','k'],['fall','fall'],['den','den'],['mix','mix']]) {
+    els[id].value = state[key];
+    document.getElementById('v-' + key.replace('rout','rout').replace('fall','fall')).textContent = String(state[key]);
+  }
+  // fix labels
+  document.getElementById('v-rs').textContent = state.rs;
+  document.getElementById('v-rout').textContent = state.rout;
+  document.getElementById('v-disk').textContent = state.disk;
+  document.getElementById('v-k').textContent = state.k;
+  document.getElementById('v-fall').textContent = state.fall;
+  document.getElementById('v-den').textContent = state.den;
+  document.getElementById('v-mix').textContent = state.mix;
+  els.showDisk.checked = state.showDisk;
+  els.showRing.checked = state.showRing;
+  els.showSOI.checked = state.showSOI;
+  els.showStripes.checked = state.showStripes;
+  render();
+}
+
+document.getElementById('preset-current').onclick = () => applyPreset({
+  rs: 6, rout: 140, disk: 6, k: 1.15, fall: 1.25, den: 0.2, mix: 1,
+  showDisk: true, showRing: false, showSOI: false, showStripes: true,
+});
+document.getElementById('preset-big').onclick = () => applyPreset({
+  rs: 8, rout: 180, disk: 8, k: 1.6, fall: 1.0, den: 0.15, mix: 1.15,
+  showDisk: true, showRing: false, showSOI: false, showStripes: true,
+});
+document.getElementById('preset-extreme').onclick = () => applyPreset({
+  rs: 10, rout: 240, disk: 10, k: 2.4, fall: 0.75, den: 0.1, mix: 1.35,
+  showDisk: true, showRing: true, showSOI: true, showStripes: true,
+});
+
+function sampleBilinearRGBA(data, w, h, x, y) {
+  x = Math.max(0, Math.min(w - 1.001, x));
+  y = Math.max(0, Math.min(h - 1.001, y));
+  const x0 = x | 0, y0 = y | 0;
+  const x1 = x0 + 1, y1 = y0 + 1;
+  const fx = x - x0, fy = y - y0;
+  const ifx = 1 - fx, ify = 1 - fy;
+  const i00 = (y0 * w + x0) * 4;
+  const i10 = (y0 * w + x1) * 4;
+  const i01 = (y1 * w + x0) * 4;
+  const i11 = (y1 * w + x1) * 4;
+  return [
+    data[i00] * ifx * ify + data[i10] * fx * ify + data[i01] * ifx * fy + data[i11] * fx * fy,
+    data[i00 + 1] * ifx * ify + data[i10 + 1] * fx * ify + data[i01 + 1] * ifx * fy + data[i11 + 1] * fx * fy,
+    data[i00 + 2] * ifx * ify + data[i10 + 2] * fx * ify + data[i01 + 2] * ifx * fy + data[i11 + 2] * fx * fy,
+    data[i00 + 3] * ifx * ify + data[i10 + 3] * fx * ify + data[i01 + 3] * ifx * fy + data[i11 + 3] * fx * fy,
+  ];
+}
+
+function drawFairway() {
+  ctx.fillStyle = '#2f6b3a';
+  ctx.fillRect(0, 0, W, H);
+  const stripeW = state.showStripes ? 28 : 42;
+  ctx.fillStyle = 'rgba(255,255,255,0.06)';
+  for (let x = 0, i = 0; x < W; x += stripeW, i++) {
+    if (i % 2 === 0) ctx.fillRect(x, 0, stripeW, H);
+  }
+  // sand blob
+  ctx.fillStyle = '#dcc27a';
+  roundRect(120, 160, 160, 100, 12);
+  ctx.fill();
+  // water
+  ctx.fillStyle = '#3b82c4';
+  roundRect(520, 300, 180, 90, 12);
+  ctx.fill();
+  // wall
+  ctx.strokeStyle = '#6b4423';
+  ctx.lineWidth = 8;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(200, 80);
+  ctx.lineTo(600, 80);
+  ctx.stroke();
+  // cup
+  ctx.fillStyle = '#111';
+  ctx.beginPath();
+  ctx.arc(700, 200, 11, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = '#eee';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(700, 196);
+  ctx.lineTo(700, 164);
+  ctx.stroke();
+  ctx.fillStyle = '#e6483f';
+  ctx.beginPath();
+  ctx.moveTo(700, 164);
+  ctx.lineTo(714, 169);
+  ctx.lineTo(700, 174);
+  ctx.closePath();
+  ctx.fill();
+  // ball
+  const g = ctx.createRadialGradient(140, 360, 1, 148, 368, 10);
+  g.addColorStop(0, '#fff');
+  g.addColorStop(1, '#f4a020');
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.arc(148, 368, 9, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function warp() {
+  const cx = state.x * dpr;
+  const cy = state.y * dpr;
+  const rs = Math.max(state.rs, 2) * dpr;
+  const rOut = Math.max(state.rout, state.rs + 8) * dpr;
+  const lensK = state.k;
+  const fallPow = state.fall;
+  const denMin = state.den;
+  const mix = state.mix;
+
+  const pad = Math.ceil(rOut) + 2;
+  const x0 = Math.max(0, Math.floor(cx - pad));
+  const y0 = Math.max(0, Math.floor(cy - pad));
+  const x1 = Math.min(canvas.width, Math.ceil(cx + pad));
+  const y1 = Math.min(canvas.height, Math.ceil(cy + pad));
+  const w = x1 - x0;
+  const h = y1 - y0;
+  if (w < 4 || h < 4) return;
+
+  let src;
+  try {
+    src = ctx.getImageData(x0, y0, w, h);
+  } catch {
+    return;
+  }
+  const dst = ctx.createImageData(w, h);
+  const s = src.data;
+  const d = dst.data;
+
+  for (let j = 0; j < h; j++) {
+    for (let i = 0; i < w; i++) {
+      const di = (j * w + i) * 4;
+      const px = x0 + i + 0.5;
+      const py = y0 + j + 0.5;
+      const dx = px - cx;
+      const dy = py - cy;
+      const r = Math.hypot(dx, dy);
+
+      if (r < rs) {
+        d[di] = d[di + 1] = d[di + 2] = 0;
+        d[di + 3] = 255;
+        continue;
+      }
+      if (r >= rOut || r < 1e-4) {
+        d[di] = s[di];
+        d[di + 1] = s[di + 1];
+        d[di + 2] = s[di + 2];
+        d[di + 3] = s[di + 3];
+        continue;
+      }
+
+      const fall = 1 - (r - rs) / (rOut - rs);
+      const schwarz = r / Math.max(denMin, 1 - (lensK * rs) / r);
+      let rSrc = r + (schwarz - r) * mix * Math.pow(Math.max(0, fall), fallPow);
+      rSrc = Math.min(Math.max(rSrc, r), rOut * 0.998);
+      const scale = rSrc / r;
+      const rgba = sampleBilinearRGBA(s, w, h, cx + dx * scale - x0, cy + dy * scale - y0);
+      d[di] = rgba[0];
+      d[di + 1] = rgba[1];
+      d[di + 2] = rgba[2];
+      d[di + 3] = rgba[3];
+    }
+  }
+  ctx.putImageData(dst, x0, y0);
+}
+
+function overlay() {
+  if (state.showSOI) {
+    ctx.strokeStyle = 'rgba(255,255,255,0.2)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 6]);
+    ctx.beginPath();
+    ctx.arc(state.x, state.y, state.rout, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  if (state.showRing) {
+    ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(state.x, state.y, state.rs * 1.5, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  if (state.showDisk) {
+    ctx.fillStyle = '#000';
+    ctx.beginPath();
+    ctx.arc(state.x, state.y, state.disk, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+function snippet() {
+  return `// paste into warpBlackHoleLens (logical px; dpr applied inside)
+const rsLogical = ${state.rs};          // horizon / capture disk radius
+const rOutLogical = ${state.rout};      // warp extent
+const lensK = ${state.k};               // Schwarzschild-ish strength
+const fallPow = ${state.fall};          // edge falloff power
+const denMin = ${state.den};            // clamp in r/(1 - k Rs/r)
+const mix = ${state.mix};               // blend of schwarz term
+// disk draw radius: ${state.disk}
+// map: fall = 1 - (r-rs)/(rOut-rs)
+//      schwarz = r / max(denMin, 1 - lensK*rs/r)
+//      rSrc = r + (schwarz-r)*mix*fall^fallPow`;
+}
+
+function render() {
+  // reset transform for clear, then logical drawing
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  drawFairway();
+  warp();
+  // putImageData left transform alone; re-apply logical transform for overlay
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  overlay();
+  document.getElementById('out').textContent = snippet();
+}
+
+document.getElementById('copy').onclick = async () => {
+  const text = snippet();
+  try {
+    await navigator.clipboard.writeText(text);
+    document.getElementById('copy').textContent = 'Copied!';
+    setTimeout(() => { document.getElementById('copy').textContent = 'Copy snippet for game.js'; }, 1200);
+  } catch {
+    document.getElementById('copy').textContent = 'Select text below to copy';
+  }
+};
+
+let dragging = false;
+function posFromEvent(e) {
+  const rect = canvas.getBoundingClientRect();
+  const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+  const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+  return {
+    x: (clientX - rect.left) * (W / rect.width),
+    y: (clientY - rect.top) * (H / rect.height),
+  };
+}
+function onDown(e) {
+  dragging = true;
+  const p = posFromEvent(e);
+  state.x = Math.max(20, Math.min(W - 20, p.x));
+  state.y = Math.max(20, Math.min(H - 20, p.y));
+  render();
+  e.preventDefault();
+}
+function onMove(e) {
+  if (!dragging) return;
+  const p = posFromEvent(e);
+  state.x = Math.max(20, Math.min(W - 20, p.x));
+  state.y = Math.max(20, Math.min(H - 20, p.y));
+  render();
+  e.preventDefault();
+}
+function onUp() { dragging = false; }
+canvas.addEventListener('mousedown', onDown);
+window.addEventListener('mousemove', onMove);
+window.addEventListener('mouseup', onUp);
+canvas.addEventListener('touchstart', onDown, { passive: false });
+canvas.addEventListener('touchmove', onMove, { passive: false });
+canvas.addEventListener('touchend', onUp);
+
+render();
+</script>
+</body>
+</html>

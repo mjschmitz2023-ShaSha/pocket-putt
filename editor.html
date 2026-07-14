@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Pocket Putt — Level Editor</title>
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="editor.css">
+</head>
+<body class="editor-body">
+  <div id="editor-app">
+    <header id="editor-toolbar">
+      <a class="btn-small" href="index.html">← Game</a>
+      <h1>Level Editor</h1>
+      <label class="toolbar-check"><input type="checkbox" id="snap-toggle" checked> Snap 5px</label>
+      <button type="button" id="btn-import" class="btn-small">Import hole…</button>
+      <button type="button" id="btn-test" class="btn-small">Test ▶</button>
+      <button type="button" id="btn-stop-test" class="btn-small hidden">Stop test</button>
+      <button type="button" id="btn-share" class="btn-small">Copy share link</button>
+      <button type="button" id="btn-open-game" class="btn-small">Open in game</button>
+      <span id="editor-status"></span>
+    </header>
+
+    <div id="editor-main">
+      <aside id="editor-palette">
+        <p class="palette-label">Tools</p>
+        <button type="button" class="tool-btn active" data-tool="select">Select</button>
+        <button type="button" class="tool-btn" data-tool="tee">Tee</button>
+        <button type="button" class="tool-btn" data-tool="cup">Cup</button>
+        <button type="button" class="tool-btn" data-tool="wall">Wall</button>
+        <button type="button" class="tool-btn" data-tool="bumper">Bumper</button>
+        <button type="button" class="tool-btn" data-tool="sand">Sand</button>
+        <button type="button" class="tool-btn" data-tool="water">Water</button>
+        <button type="button" class="tool-btn" data-tool="boost">Boost</button>
+        <button type="button" class="tool-btn" data-tool="ramp">Ramp</button>
+        <button type="button" class="tool-btn" data-tool="sticky">Sticky</button>
+        <button type="button" class="tool-btn" data-tool="pendulum">Pendulum</button>
+        <button type="button" class="tool-btn" data-tool="gate">Gate</button>
+        <button type="button" class="tool-btn" data-tool="windmill">Windmill</button>
+        <button type="button" class="tool-btn" data-tool="planet">Planet</button>
+        <button type="button" class="tool-btn" data-tool="blackHole">Black hole</button>
+        <button type="button" class="tool-btn" data-tool="moon">Moon</button>
+        <button type="button" id="btn-delete" class="btn-small btn-danger" style="margin-top:12px">Delete selection</button>
+      </aside>
+
+      <div id="editor-stage-wrap">
+        <div id="editor-stage">
+          <canvas id="editor-canvas" width="800" height="500"></canvas>
+          <div id="editor-test-hud" class="hidden">
+            <span id="test-strokes">Strokes: 0</span>
+            <span class="hint">While dragging aim: world freezes · dotted path = ghost · release to putt</span>
+          </div>
+          <div id="editor-respawn-offer" class="hidden">
+            <p>Still rolling… stuck?</p>
+            <button type="button" id="btn-editor-respawn">Respawn at tee</button>
+          </div>
+          <div id="editor-power" class="hidden"></div>
+        </div>
+      </div>
+
+      <aside id="editor-props">
+        <p class="palette-label">Hole</p>
+        <label>Name <input id="prop-name" type="text" maxlength="40"></label>
+        <label>Par <input id="prop-par" type="number" min="1" max="10" step="1"></label>
+        <hr>
+        <p class="palette-label">Selection</p>
+        <div id="prop-fields"><p class="muted">Select an object</p></div>
+      </aside>
+    </div>
+  </div>
+
+  <div id="import-modal" class="editor-modal hidden">
+    <div class="editor-modal-card">
+      <h2>Import built-in hole</h2>
+      <label>Course
+        <select id="import-course"></select>
+      </label>
+      <label>Hole
+        <select id="import-hole"></select>
+      </label>
+      <p id="import-warn" class="muted"></p>
+      <div class="modal-actions">
+        <button type="button" id="import-cancel" class="btn-small">Cancel</button>
+        <button type="button" id="import-ok" class="btn-small">Import</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="shared.js?v=lvl1"></script>
+  <script src="draw.js?v=lvl1"></script>
+  <script src="editor-snap.js?v=lvl1"></script>
+  <script src="editor-gizmos.js?v=lvl1"></script>
+  <script src="editor.js?v=lvl1"></script>
+</body>
+</html>

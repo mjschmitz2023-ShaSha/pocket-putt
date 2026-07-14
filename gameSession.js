@@ -40,14 +40,18 @@ class GameSession {
     this.players = new Map();
     this.hostPlayerId = null;
     this.courseIndex = 0;
+    /** @type {object|null} validated single custom hole; when set, round is 1 hole */
+    this.customHole = null;
     this.currentHoleIndex = 0;
     this.holeStartedAtMs = 0;
     this.simTick = 0;
     this.holeEnding = false;
+    this.holeEndingAtMs = 0;
+    this.holeResultsAtMs = 0;
     this.pendingEvents = [];
     this.wasIdle = false;
     this.lastActivity = Date.now();
-    this._holeAdvanceTimer = null;
+    this._holeAdvanceTimer = null; // legacy; progression is wall-clock in tickDriver
     this._destroyed = false;
   }
 
@@ -72,7 +76,25 @@ class GameSession {
   }
 
   currentHoles() {
+    if (this.customHole) return [this.customHole];
     return COURSES[this.courseIndex].holes;
+  }
+
+  customHoleLobbyFields() {
+    if (!this.customHole) {
+      return { hasCustomHole: false, customHoleName: null, customLvl: null };
+    }
+    let customLvl = null;
+    try {
+      customLvl = Shared.encodeHole(this.customHole);
+    } catch {
+      customLvl = null;
+    }
+    return {
+      hasCustomHole: true,
+      customHoleName: this.customHole.name || 'Custom',
+      customLvl,
+    };
   }
 
   roundStatePayload() {
@@ -85,6 +107,12 @@ class GameSession {
       par: hole.par,
       tick: this.simTick,
       tickHz: TICK_HZ,
+      ...this.customHoleLobbyFields(),
+      // Reliable tee seed — clients must not depend solely on an unreliable resync
+      // snapshot to populate Game.players (dropped resync → empty roster / vanished ball).
+      balls: [...this.players.values()]
+        .filter((p) => p.connected && p.ball)
+        .map((p) => this.ballWire(p)),
     };
   }
 
@@ -125,6 +153,7 @@ class GameSession {
       joinUrl: this.joinUrl,
       joinUrlFallback: this.joinUrlFallback,
       roomCode: this.code,
+      ...this.customHoleLobbyFields(),
     });
   }
 
@@ -161,16 +190,23 @@ class GameSession {
       p.ball = Shared.createBallState(Shared.teePositionFor(slot, roster.length, hole));
       p.strokes = 0;
       p.holedOut = false;
+      p.speedTracker = Shared.createSpeedAvgTracker();
     });
     this.holeStartedAtMs = Date.now();
     this.simTick = 0;
     this.holeEnding = false;
+    this.holeEndingAtMs = 0;
+    this.holeResultsAtMs = 0;
     this.pendingEvents = [];
     this.wasIdle = false;
     this.state = 'PLAYING';
     this.touch();
+    // Reliable roundState now carries tee balls; also push a hard resync for obstacles.
     this.broadcastReliable(this.roundStatePayload());
-    this.sendCorrectionNow([], { reason: 'resync', includeObstacles: true, hard: true });
+    this.broadcastReliable(
+      this.buildCorrection([], { reason: 'resync', includeObstacles: true, hard: true })
+    );
+    this.pendingEvents = [];
   }
 
   startNewRound() {
@@ -202,6 +238,9 @@ class GameSession {
   endHole() {
     if (this._destroyed) return;
     this.state = 'HOLE_RESULTS';
+    this.holeEnding = false;
+    this.holeEndingAtMs = 0;
+    this.holeResultsAtMs = Date.now();
     const connected = [...this.players.values()].filter((p) => p.connected);
     for (const p of connected) {
       const last = p.perHoleScores[p.perHoleScores.length - 1];
@@ -218,29 +257,34 @@ class GameSession {
         timedOut: last.timedOut,
       };
     });
-    const standings = connected
+    this._standingsSnapshot = connected
       .map((p) => ({ id: p.id, name: p.name, totalScore: p.totalScore }))
       .sort((a, b) => a.totalScore - b.totalScore);
     this.broadcastReliable({
       type: 'holeResults',
       holeIndex: this.currentHoleIndex,
       results,
-      standings,
+      standings: this._standingsSnapshot,
     });
+    // Next-hole / final advancement is driven by tickDriver wall clock (not setTimeout),
+    // so free-tier freezes or a blocked event loop can't drop the transition forever.
+  }
 
-    if (this._holeAdvanceTimer) clearTimeout(this._holeAdvanceTimer);
-    this._holeAdvanceTimer = setTimeout(() => {
-      this._holeAdvanceTimer = null;
-      if (this._destroyed) return;
-      // Restart/end may have changed state during the results delay.
-      if (this.state !== 'HOLE_RESULTS') return;
-      if (this.currentHoleIndex >= this.currentHoles().length - 1) {
-        this.state = 'FINAL_RESULTS';
-        this.broadcastReliable({ type: 'finalResults', standings });
-      } else {
-        this.beginHole(this.currentHoleIndex + 1);
-      }
-    }, HOLE_RESULTS_DELAY_MS);
+  /** Advance HOLE_RESULTS → next hole or FINAL_RESULTS once the results delay has elapsed. */
+  maybeAdvanceFromResults() {
+    if (this.state !== 'HOLE_RESULTS' || this._destroyed) return;
+    if (!this.holeResultsAtMs) return;
+    if (Date.now() - this.holeResultsAtMs < HOLE_RESULTS_DELAY_MS) return;
+    this.holeResultsAtMs = 0;
+    if (this.currentHoleIndex >= this.currentHoles().length - 1) {
+      this.state = 'FINAL_RESULTS';
+      this.broadcastReliable({
+        type: 'finalResults',
+        standings: this._standingsSnapshot || [],
+      });
+    } else {
+      this.beginHole(this.currentHoleIndex + 1);
+    }
   }
 
   ballWire(p) {
@@ -261,6 +305,15 @@ class GameSession {
       // Index latch (not object ref) so clients keep escape-grass vs trap-sticky correct.
       stuckStickyIndex: typeof p.ball.stuckStickyIndex === 'number' ? p.ball.stuckStickyIndex : -1,
     };
+    // Per-stroke boost latch — clients must not re-arm on idle snaps while still on a pad.
+    if (p.ball.firedBoosts instanceof Set && p.ball.firedBoosts.size > 0) {
+      wire.firedBoosts = [...p.ball.firedBoosts];
+    }
+    // Only send wet flags when armed (keeps idle packets small).
+    if (p.ball.wet) {
+      wire.wet = true;
+      if (p.ball.wetStroke) wire.wetStroke = true;
+    }
     // Omit grounded z/vz to keep idle packets small.
     if (p.ball.z > 0) {
       wire.z = p.ball.z;
@@ -269,14 +322,39 @@ class GameSession {
     return wire;
   }
 
+  /**
+   * hard policy (rubber-band reduction):
+   *  - resync / becameIdle: hard (clean settled authority)
+   *  - event water/holed/clash: hard (discrete authority)
+   *  - event bounce/sand/boost: soft (juice + gentle pose)
+   *  - periodic idle keepalive: soft (don't yank mid-aim drift)
+   */
+  eventsNeedHardSnap(events) {
+    for (const ev of events || []) {
+      if (ev.kind === 'water' || ev.kind === 'blackHole' || ev.kind === 'holed' || ev.kind === 'clash') {
+        return true;
+      }
+    }
+    return false;
+  }
+
   buildCorrection(events, opts) {
     opts = opts || {};
     const reason = opts.reason || 'idle';
     const includeObstacles = !!opts.includeObstacles || reason === 'resync' || reason === 'idle';
-    const hard =
-      opts.hard !== undefined
-        ? !!opts.hard
-        : reason === 'resync' || reason === 'event' || reason === 'idle';
+    let hard;
+    if (opts.hard !== undefined) {
+      hard = !!opts.hard;
+    } else if (reason === 'resync') {
+      hard = true;
+    } else if (reason === 'event') {
+      hard = this.eventsNeedHardSnap(events);
+    } else if (reason === 'idle') {
+      // becameIdle should pass hard:true explicitly; periodic keepalives stay soft
+      hard = false;
+    } else {
+      hard = false;
+    }
     const hole = this.currentHoles()[this.currentHoleIndex];
     const msg = {
       type: 'snapshot',
@@ -325,6 +403,12 @@ class GameSession {
       for (const p of this.players.values()) {
         if (!p.connected || p.holedOut || !p.ball) continue;
         const events = Shared.stepBallPhysics(p.ball, hole, TICK_DT / PHYSICS_SUBTICKS);
+        if (!p.speedTracker) p.speedTracker = Shared.createSpeedAvgTracker();
+        Shared.noteSpeedSample(
+          p.speedTracker,
+          Math.hypot(p.ball.vx, p.ball.vy),
+          TICK_DT / PHYSICS_SUBTICKS
+        );
         if (events.bounced && !bouncedThisTick.has(p.id)) {
           bouncedThisTick.add(p.id);
           tickEvents.push({ id: p.id, kind: 'bounce' });
@@ -352,6 +436,23 @@ class GameSession {
           p.ball.z = 0;
           p.ball.vz = 0;
           p.ball.stuckStickyIndex = -1;
+          Shared.markWetFromWater(p.ball);
+        }
+        if (events.blackHole) {
+          p.strokes++;
+          const hole = this.currentHoles()[this.currentHoleIndex];
+          tickEvents.push({ id: p.id, kind: 'blackHole', x: p.ball.x, y: p.ball.y });
+          // Spec: +1 stroke, reset to hole tee (not a custom drop pad); no wet.
+          p.ball.x = hole.tee.x;
+          p.ball.y = hole.tee.y;
+          p.ball.vx = 0;
+          p.ball.vy = 0;
+          p.ball.z = 0;
+          p.ball.vz = 0;
+          p.ball.stuckStickyIndex = -1;
+          p.ball.wet = false;
+          p.ball.wetStroke = false;
+          p.ball.firedBoosts = new Set();
         }
         if (events.holed) {
           this.finishPlayerHole(p, false);
@@ -399,33 +500,47 @@ class GameSession {
     const becameIdle = idle && !this.wasIdle;
     this.wasIdle = idle;
     if (tickEvents.length > 0) {
-      this.sendCorrectionNow(tickEvents, { reason: 'event', hard: true });
+      // hard decided by event kinds (clash/water/holed hard; bounce/sand/boost soft)
+      this.sendCorrectionNow(tickEvents, { reason: 'event' });
     } else if (becameIdle) {
+      // Everyone just stopped — hard snap so aim poses match before next putt.
       this.sendCorrectionNow([], { reason: 'idle', includeObstacles: true, hard: true });
     } else if (idle && this.simTick % CORRECTION_IDLE_EVERY === 0) {
-      this.sendCorrectionNow([], { reason: 'idle', includeObstacles: true, hard: true });
+      // Periodic keepalive: soft — corrects drift without rubber-banding.
+      this.sendCorrectionNow([], { reason: 'idle', includeObstacles: true, hard: false });
     }
 
-    const allHoledOut = connected.length > 0 && connected.every((p) => p.holedOut);
+    // Treat ball-less connected players as done so a glitched join can't block forever.
+    const allHoledOut =
+      connected.length > 0 &&
+      connected.every((p) => p.holedOut || !p.ball);
     const timedOut = this.simTick >= HOLE_TIMEOUT_TICKS;
     if ((allHoledOut || timedOut) && !this.holeEnding) {
       this.holeEnding = true;
+      this.holeEndingAtMs = Date.now();
       if (timedOut) {
         for (const p of connected) {
           if (!p.holedOut) this.finishPlayerHole(p, true);
         }
       }
       this.sendCorrectionNow(this.pendingEvents, { reason: 'resync', includeObstacles: true, hard: true });
-      setTimeout(() => {
-        if (this._destroyed) return;
-        this.holeEnding = false;
-        this.endHole();
-      }, 1400);
     }
+    // Celebration pause then results — wall-clock in tickDriver (see maybeEndHoleAfterPause).
+  }
+
+  maybeEndHoleAfterPause() {
+    if (!this.holeEnding || this.state !== 'PLAYING' || this._destroyed) return;
+    if (!this.holeEndingAtMs) return;
+    if (Date.now() - this.holeEndingAtMs < 1400) return;
+    this.endHole();
   }
 
   tickDriver() {
-    if (this.state !== 'PLAYING' || this._destroyed) return;
+    if (this._destroyed) return;
+    // Always drive hole-results progression even when not PLAYING.
+    this.maybeEndHoleAfterPause();
+    this.maybeAdvanceFromResults();
+    if (this.state !== 'PLAYING') return;
     const wallTarget = Math.floor((Date.now() - this.holeStartedAtMs) / TICK_MS);
     let steps = 0;
     while (this.simTick < wallTarget && steps < MAX_CATCH_UP_TICKS) {
@@ -502,6 +617,7 @@ class GameSession {
       strokes: 0,
       holedOut: false,
       ball: null,
+      speedTracker: Shared.createSpeedAvgTracker(),
       perHoleScores: [],
       totalScore: 0,
     };
@@ -541,8 +657,23 @@ class GameSession {
         msg.courseIndex < COURSES.length
       ) {
         this.courseIndex = msg.courseIndex;
+        this.customHole = null; // built-in course selection clears custom
         this.broadcastLobbyState();
       }
+    } else if (msg.type === 'setCustomHole') {
+      if (player.id !== this.hostPlayerId || this.state !== 'WAITING_FOR_PLAYERS') return;
+      if (typeof msg.lvl !== 'string' || !msg.lvl) return;
+      const decoded = Shared.decodeHole(msg.lvl);
+      if (!decoded.ok) {
+        this.send(player.ws, { type: 'notice', text: `Custom hole rejected: ${decoded.error}` });
+        return;
+      }
+      this.customHole = decoded.hole;
+      this.broadcastLobbyState();
+    } else if (msg.type === 'clearCustomHole') {
+      if (player.id !== this.hostPlayerId || this.state !== 'WAITING_FOR_PLAYERS') return;
+      this.customHole = null;
+      this.broadcastLobbyState();
     } else if (msg.type === 'startRound') {
       if (
         player.id === this.hostPlayerId &&
@@ -554,7 +685,10 @@ class GameSession {
           msg.courseIndex < COURSES.length
         ) {
           this.courseIndex = msg.courseIndex;
+          // Explicit course index on start means built-in course (clears custom).
+          this.customHole = null;
         }
+        // If customHole is set and no courseIndex in message, keep single custom hole.
         this.startNewRound();
       }
     } else if (msg.type === 'restartGame') {
@@ -566,6 +700,8 @@ class GameSession {
       if (this.state !== 'WAITING_FOR_PLAYERS') {
         this.state = 'WAITING_FOR_PLAYERS';
         this.holeEnding = false;
+        this.holeEndingAtMs = 0;
+        this.holeResultsAtMs = 0;
         if (this._holeAdvanceTimer) {
           clearTimeout(this._holeAdvanceTimer);
           this._holeAdvanceTimer = null;
@@ -574,27 +710,52 @@ class GameSession {
         this.broadcast({ type: 'notice', text: `${player.name} ended the game` });
         this.broadcastLobbyState();
       }
+    } else if (msg.type === 'respawn') {
+      // Escape hatch when a ball never settles (e.g. Orbit gravity loops). No stroke penalty.
+      if (this.state !== 'PLAYING' || !player.ball || player.holedOut) return;
+      const hole = this.currentHoles()[this.currentHoleIndex];
+      const roster = [...this.players.values()];
+      const slot = Math.max(0, roster.indexOf(player));
+      const spot = Shared.teePositionFor(slot, roster.length, hole);
+      player.ball.x = spot.x;
+      player.ball.y = spot.y;
+      player.ball.vx = 0;
+      player.ball.vy = 0;
+      player.ball.z = 0;
+      player.ball.vz = 0;
+      player.ball.stuckStickyIndex = -1;
+      player.ball.wet = false;
+      player.ball.wetStroke = false;
+      player.ball.firedBoosts = new Set();
+      player.speedTracker = Shared.createSpeedAvgTracker();
+      // Always deliver — do not use broadcastCorrection's buffer skip (respawn is rare + critical).
+      this.broadcastReliable(
+        this.buildCorrection([], { reason: 'resync', includeObstacles: true, hard: true })
+      );
     } else if (msg.type === 'putt') {
       if (this.state !== 'PLAYING' || !player.ball || player.holedOut) return;
-      if (Math.hypot(player.ball.vx, player.ball.vy) >= Shared.STOP_THRESHOLD) return;
+      const hole = this.currentHoles()[this.currentHoleIndex];
+      if (!player.speedTracker) player.speedTracker = Shared.createSpeedAvgTracker();
+      // Clean rest, or quasi-rest (avg |v| near 0 for ~5s) e.g. bumper chatter in gravity.
+      if (!Shared.mayPuttBall(player.ball, hole, player.speedTracker)) return;
       const v = msg.dragVector;
       if (!v || typeof v.x !== 'number' || typeof v.y !== 'number') return;
       const clamped = Shared.clampDragVector(v);
       if (!clamped) return;
       const launch = Shared.computeLaunchVelocity(clamped);
-      const hole = this.currentHoles()[this.currentHoleIndex];
       const factor = Shared.stickyLaunchFactor(player.ball, hole);
       player.ball.firedBoosts = new Set();
-      // Latch to current goo patch (if any) so escape rolls on grass until exit —
-      // do NOT clear the latch or the next microstep re-applies sticky drag and forks.
+      // Goo stays sticky while inside the patch (no grass escape latch).
       Shared.latchStickyAfterPutt(player.ball, hole);
+      Shared.noteWetPutt(player.ball);
       player.ball.vx = launch.vx * factor;
       player.ball.vy = launch.vy * factor;
       player.ball.z = 0;
       player.ball.vz = 0;
       player.strokes++;
+      Shared.resetSpeedAvgTracker(player.speedTracker);
       // One reliable event — no pose stream while the ball is rolling.
-      this.broadcastReliable({
+      const puttMsg = {
         type: 'puttApplied',
         playerId: player.id,
         tick: this.simTick,
@@ -607,7 +768,12 @@ class GameSession {
         z: player.ball.z,
         vz: player.ball.vz,
         stuckStickyIndex: player.ball.stuckStickyIndex,
-      });
+      };
+      if (player.ball.wet) {
+        puttMsg.wet = true;
+        if (player.ball.wetStroke) puttMsg.wetStroke = true;
+      }
+      this.broadcastReliable(puttMsg);
     }
   }
 

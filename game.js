@@ -7,23 +7,28 @@ const {
   CUP_GRAVITY_RADIUS, cupHasGravity,
   WALL_RESTITUTION, BUMPER_RESTITUTION, PENDULUM_RESTITUTION, GATE_RESTITUTION,
   MAX_DRAG_DIST, MIN_DRAG_DIST, POWER_MULTIPLIER, MAX_LAUNCH_SPEED, BOOST_MAX_SPEED, BOUND,
-  BOUNDARY_WALLS, COURSES, pointInZone, zoneBounds, resolveWallCollision, getWindmillBlades,
-  getPendulumSegment, getSlidingGateSegment,
+  COURSES,
   createBallState, stepBallPhysics, advanceHoleObstacles, setHoleObstaclesAtTick, resetHoleObstacles,
   computeLaunchVelocity, clampDragVector, stickyLaunchFactor, stickyIndexAt, latchStickyAfterPutt,
+  markWetFromWater, noteWetPutt, ballMayRestForAim,
+  createSpeedAvgTracker, resetSpeedAvgTracker, noteSpeedSample, isQuasiRest, mayPuttBall,
+  teePositionFor,
+  decodeHole, encodeHole, normalizeHole, blankHole,
 } = window.Shared;
 // Must match gameSession PHYSICS_SUBTICKS — same dt schedule keeps sticky latch deterministic.
 const MP_PHYSICS_SUBTICKS = 4;
-// Every hole lookup goes through the selected course.
-function currentHoles() { return COURSES[Game.courseIndex].holes; }
-
-const BOOST_COLOR_A = '#8b2fd1';
-const BOOST_COLOR_B = '#2fd1c8';
+// Every hole lookup goes through custom hole (if any) or the selected course.
+function currentHoles() {
+  if (Game.customHole) return [Game.customHole];
+  return COURSES[Game.courseIndex].holes;
+}
 
 // ---- Game state ----
 const Game = {
   state: 'START',
   courseIndex: 0,
+  customHole: null, // normalized single hole when playing/hosting a shared custom level
+  pendingCustomLvl: null, // encoded string to attach on create room
   currentHoleIndex: 0,
   strokes: 0,
   totalStrokes: 0,
@@ -37,6 +42,8 @@ const Game = {
   lastTime: 0,
   lastBounceSoundAt: 0,
   players: new Map(), // multiplayer only: id -> latest snapshot ball {x,y,vx,vy,hue,name,strokes,holedOut}
+  /** Rolling speed average for quasi-rest putt escape (solo). */
+  speedTracker: createSpeedAvgTracker(),
 };
 
 // ---- Canvas setup ----
@@ -49,6 +56,133 @@ const hudPar = document.getElementById('hud-par');
 const hudStrokes = document.getElementById('hud-strokes');
 const hudTotal = document.getElementById('hud-total');
 const powerLabelEl = document.getElementById('power-label');
+const respawnOfferEl = document.getElementById('respawn-offer');
+const RESPAWN_OFFER_SEC = 15;
+/** Ignore soft host poses for this long after local respawn (soft snaps undid the tee). */
+const RESPAWN_SOFT_GRACE_MS = 1500;
+let unsettledSec = 0;
+let settledSec = 0;
+let respawnOfferVisible = false;
+let respawnDismissedUntilSettle = false;
+let respawnSoftGraceUntil = 0;
+
+function hideRespawnOffer() {
+  if (respawnOfferEl) respawnOfferEl.classList.add('hidden');
+  respawnOfferVisible = false;
+}
+function showRespawnOffer() {
+  if (!respawnOfferEl || respawnOfferVisible || respawnDismissedUntilSettle) return;
+  respawnOfferEl.classList.remove('hidden');
+  respawnOfferVisible = true;
+}
+/** True while local ball is in play and not ready for a normal putt. */
+function isBallUnsettled() {
+  if (MULTIPLAYER) {
+    if (!mpPlaying || !mpPlayerId) return false;
+    const me = Game.players.get(mpPlayerId);
+    if (!me || me.holedOut) return false;
+    return !mpCanPutt;
+  }
+  // Solo: rolling, or gravity-wake thrash that never hands AIMING cleanly.
+  if (Game.state === 'BALL_MOVING') return true;
+  if (Game.state === 'AIMING') {
+    const hole = currentHoles()[Game.currentHoleIndex];
+    return !mayPuttBall(Game.ball, hole, Game.speedTracker);
+  }
+  return false;
+}
+function resetUnsettledTimer() {
+  unsettledSec = 0;
+  settledSec = 0;
+  respawnDismissedUntilSettle = false;
+  hideRespawnOffer();
+}
+function doLocalRespawnToTee() {
+  const hole = currentHoles()[Game.currentHoleIndex];
+  Game.drag.active = false;
+  if (powerLabelEl) powerLabelEl.classList.add('hidden');
+  resetSpeedAvgTracker(Game.speedTracker);
+  respawnSoftGraceUntil = performance.now() + RESPAWN_SOFT_GRACE_MS;
+  if (MULTIPLAYER) {
+    const me = Game.players.get(mpPlayerId);
+    if (me) {
+      // Match host slot layout so optimistic tee agrees with authority.
+      let idx = 0;
+      let i = 0;
+      for (const p of Game.players.values()) {
+        if (p.id === mpPlayerId) { idx = i; break; }
+        i++;
+      }
+      const tee = teePositionFor(idx, Game.players.size, hole);
+      me.x = tee.x;
+      me.y = tee.y;
+      me.vx = 0;
+      me.vy = 0;
+      me.z = 0;
+      me.vz = 0;
+      me.errX = 0;
+      me.errY = 0;
+      me.rx = me.x;
+      me.ry = me.y;
+      me.wet = false;
+      me.wetStroke = false;
+      me.firedBoosts = new Set();
+      me.stuckStickyIndex = -1;
+      mpSyncSelfFromPlayer(me);
+      // Force putt unlock at tee (soft host snaps must not re-lock for grace window).
+      if (!me.holedOut) mpCanPutt = true;
+    }
+  } else {
+    Game.ball.x = hole.tee.x;
+    Game.ball.y = hole.tee.y;
+    Game.ball.vx = 0;
+    Game.ball.vy = 0;
+    Game.ball.z = 0;
+    Game.ball.vz = 0;
+    Game.ball.wet = false;
+    Game.ball.wetStroke = false;
+    Game.ball.firedBoosts = new Set();
+    Game.ball.stuckStickyIndex = -1;
+    Game.trail = [];
+    Game.state = 'AIMING';
+  }
+  resetUnsettledTimer();
+  hideAllScreens();
+}
+function requestRespawn(ev) {
+  if (ev && typeof ev.preventDefault === 'function') {
+    ev.preventDefault();
+    ev.stopPropagation();
+  }
+  soundClick();
+  if (MULTIPLAYER) {
+    if (mpSocketOpen()) {
+      mpSocket.send(JSON.stringify({ type: 'respawn' }));
+    }
+    // Optimistic local tee so the UI unlocks immediately; host hard-resync confirms.
+    doLocalRespawnToTee();
+  } else {
+    doLocalRespawnToTee();
+  }
+}
+function updateRespawnOffer(dt) {
+  if (isBallUnsettled()) {
+    unsettledSec += dt;
+    settledSec = 0;
+    if (unsettledSec >= RESPAWN_OFFER_SEC) showRespawnOffer();
+  } else {
+    settledSec += dt;
+    // Hysteresis: brief AIMING flicker mid-bounce must not wipe a nearly-ready offer.
+    if (settledSec >= 0.45) {
+      if (respawnOfferVisible) {
+        // Can putt again — drop the offer.
+        resetUnsettledTimer();
+      } else if (unsettledSec > 0) {
+        unsettledSec = 0;
+      }
+    }
+  }
+}
 
 function setupCanvasDPR() {
   const dpr = window.devicePixelRatio || 1;
@@ -189,8 +323,7 @@ function soundBoost() {
 }
 
 // ---- Physics ----
-// resolveWallCollision / getWindmillBlades / getPendulumSegment / getSlidingGateSegment
-// come from shared.js (destructured above) so solo play and the multiplayer host agree exactly.
+// stepBallPhysics / obstacle helpers come from shared.js so solo and multiplayer host agree.
 function maybePlayBounceSound() {
   const now = performance.now();
   if (now - Game.lastBounceSoundAt > 70) {
@@ -206,6 +339,7 @@ function handleWaterHazard(zone) {
   Game.ball.y = zone.dropPoint.y;
   Game.ball.vx = 0;
   Game.ball.vy = 0;
+  markWetFromWater(Game.ball);
   Game.trail = [];
   spawnSplash(zone.dropPoint.x, zone.dropPoint.y);
   soundWater();
@@ -214,6 +348,32 @@ function handleWaterHazard(zone) {
   Game.hazardTimer = 0.9;
   Game.state = 'HAZARD_RESET';
   showScreen('screen-hazard');
+  const hazardMsg = document.getElementById('hazard-text');
+  if (hazardMsg) hazardMsg.textContent = 'Splash! +1  ·  WET — goo is slick this putt';
+}
+function handleBlackHoleHazard() {
+  Game.strokes++;
+  Game.totalStrokes++;
+  const hole = currentHoles()[Game.currentHoleIndex];
+  Game.ball.x = hole.tee.x;
+  Game.ball.y = hole.tee.y;
+  Game.ball.vx = 0;
+  Game.ball.vy = 0;
+  Game.ball.z = 0;
+  Game.ball.vz = 0;
+  Game.ball.wet = false;
+  Game.ball.wetStroke = false;
+  Game.ball.firedBoosts = new Set();
+  Game.trail = [];
+  // Visual only — black holes are not water; do not count toward Pond Lover / bubble trail.
+  spawnSplash(hole.tee.x, hole.tee.y);
+  soundWater();
+  updateHUD();
+  Game.hazardTimer = 0.9;
+  Game.state = 'HAZARD_RESET';
+  showScreen('screen-hazard');
+  const hazardMsg = document.getElementById('hazard-text');
+  if (hazardMsg) hazardMsg.textContent = 'Event horizon! +1  ·  Reset to tee';
 }
 // Thin wrapper around shared.js's stepBallPhysics: the physics itself is identical to what
 // the multiplayer server runs, this just reacts to the returned events with solo-mode
@@ -229,6 +389,7 @@ function updateBallPhysics(dt) {
     soundBoost();
   }
   if (events.water) { handleWaterHazard(events.water); return; }
+  if (events.blackHole) { handleBlackHoleHazard(); return; }
   if (events.holed) { onHoleComplete(); return; }
 
   const speed = Math.hypot(Game.ball.vx, Game.ball.vy);
@@ -241,11 +402,18 @@ function updateBallPhysics(dt) {
   if (speed < STOP_THRESHOLD) {
     // Inside the cup divot, let gravity keep working instead of freezing the ball on the lip.
     // On goo-guarded holes the magnet is off, so never hold the ball "live" near the cup.
+    // Never freeze mid-air in a field, or when a moving well (moon) is pulling hard enough
+    // that a "stationary" ball should start rolling again.
+    // Clean rest only → AIMING. Crawl/quasi-rest putts interrupt from handlePointerDown
+    // while still BALL_MOVING (do not freeze AIMING or gravity wake breaks).
     const nearCup = cupHasGravity(hole) && Math.hypot(Game.ball.x - hole.cup.x, Game.ball.y - hole.cup.y) < CUP_GRAVITY_RADIUS;
-    if (!nearCup) {
+    if (!nearCup && ballMayRestForAim(Game.ball, hole)) {
       Game.ball.vx = 0;
       Game.ball.vy = 0;
       Game.state = 'AIMING';
+    } else if (!nearCup) {
+      // Keep simulating (e.g. moon field just overlapped a resting ball).
+      Game.state = 'BALL_MOVING';
     }
   }
 }
@@ -323,237 +491,7 @@ function drawParticles() {
   ctx.globalAlpha = 1;
 }
 
-// ---- Rendering ----
-function roundRectPath(c, x, y, w, h, r) {
-  c.beginPath();
-  c.moveTo(x + r, y);
-  c.arcTo(x + w, y, x + w, y + h, r);
-  c.arcTo(x + w, y + h, x, y + h, r);
-  c.arcTo(x, y + h, x, y, r);
-  c.arcTo(x, y, x + w, y, r);
-  c.closePath();
-}
-function drawZonePath(z) {
-  if (z.shape === 'circle') {
-    ctx.beginPath();
-    ctx.arc(z.cx, z.cy, z.r, 0, Math.PI * 2);
-  } else {
-    roundRectPath(ctx, z.x1, z.y1, z.x2 - z.x1, z.y2 - z.y1, 8);
-  }
-}
-function drawSandZone(z) {
-  ctx.fillStyle = '#dcc27a';
-  drawZonePath(z);
-  ctx.fill();
-  if (!z._speckles) {
-    z._speckles = [];
-    const b = zoneBounds(z);
-    for (let i = 0; i < 40; i++) {
-      z._speckles.push({ x: b.x1 + Math.random() * (b.x2 - b.x1), y: b.y1 + Math.random() * (b.y2 - b.y1), r: 1 + Math.random() * 1.5 });
-    }
-  }
-  ctx.fillStyle = 'rgba(150,120,60,0.28)';
-  for (const d of z._speckles) {
-    ctx.beginPath();
-    ctx.arc(d.x, d.y, d.r, 0, Math.PI * 2);
-    ctx.fill();
-  }
-}
-function drawWaterZone(z) {
-  ctx.fillStyle = '#3b82c4';
-  drawZonePath(z);
-  ctx.fill();
-  ctx.strokeStyle = 'rgba(255,255,255,0.25)';
-  ctx.lineWidth = 2;
-  const b = zoneBounds(z);
-  const t = performance.now() / 1000;
-  for (let i = 0; i < 3; i++) {
-    const yOff = b.y1 + ((b.y2 - b.y1) * (i + 1)) / 4 + Math.sin(t * 1.5 + i) * 4;
-    ctx.beginPath();
-    ctx.moveTo(b.x1 + 6, yOff);
-    ctx.lineTo(b.x2 - 6, yOff);
-    ctx.stroke();
-  }
-}
-function drawBoostZone(z) {
-  const b = zoneBounds(z);
-  const grad = ctx.createLinearGradient(b.x1, b.y1, b.x2, b.y2);
-  grad.addColorStop(0, BOOST_COLOR_A);
-  grad.addColorStop(1, BOOST_COLOR_B);
-  ctx.fillStyle = grad;
-  roundRectPath(ctx, b.x1, b.y1, b.x2 - b.x1, b.y2 - b.y1, 6);
-  ctx.fill();
-
-  ctx.save();
-  roundRectPath(ctx, b.x1, b.y1, b.x2 - b.x1, b.y2 - b.y1, 6);
-  ctx.clip();
-  const t = performance.now() / 1000;
-  const dirX = Math.cos(z.angle), dirY = Math.sin(z.angle);
-  const perpX = -dirY, perpY = dirX;
-  const spacing = 30;
-  const cx = (b.x1 + b.x2) / 2, cy = (b.y1 + b.y2) / 2;
-  const diag = Math.hypot(b.x2 - b.x1, b.y2 - b.y1);
-  const offset = ((t * 170) % spacing + spacing) % spacing;
-  ctx.strokeStyle = 'rgba(255,255,255,0.85)';
-  ctx.lineWidth = 4;
-  ctx.lineCap = 'round';
-  for (let d = -diag; d < diag; d += spacing) {
-    const along = d + offset;
-    const bx = cx + dirX * along, by = cy + dirY * along;
-    const wing = 9;
-    ctx.beginPath();
-    ctx.moveTo(bx - dirX * wing + perpX * wing, by - dirY * wing + perpY * wing);
-    ctx.lineTo(bx + dirX * wing, by + dirY * wing);
-    ctx.lineTo(bx - dirX * wing - perpX * wing, by - dirY * wing - perpY * wing);
-    ctx.stroke();
-  }
-  ctx.restore();
-}
-function drawWallSegment(w) {
-  ctx.lineCap = 'round';
-  if (w.bumper) {
-    ctx.strokeStyle = '#e6483f';
-    ctx.lineWidth = 10;
-    ctx.beginPath();
-    ctx.moveTo(w.x1, w.y1);
-    ctx.lineTo(w.x2, w.y2);
-    ctx.stroke();
-    ctx.strokeStyle = 'rgba(255,255,255,0.85)';
-    ctx.lineWidth = 3;
-    ctx.setLineDash([8, 8]);
-    ctx.beginPath();
-    ctx.moveTo(w.x1, w.y1);
-    ctx.lineTo(w.x2, w.y2);
-    ctx.stroke();
-    ctx.setLineDash([]);
-  } else {
-    ctx.strokeStyle = '#6b4a2b';
-    ctx.lineWidth = 10;
-    ctx.beginPath();
-    ctx.moveTo(w.x1, w.y1);
-    ctx.lineTo(w.x2, w.y2);
-    ctx.stroke();
-    ctx.strokeStyle = '#5a3d22';
-    ctx.lineWidth = 3;
-    ctx.beginPath();
-    ctx.moveTo(w.x1, w.y1);
-    ctx.lineTo(w.x2, w.y2);
-    ctx.stroke();
-  }
-}
-function drawWindmill(wm) {
-  const blades = getWindmillBlades(wm);
-  ctx.fillStyle = '#8a8a8a';
-  ctx.fillRect(wm.cx - 6, wm.cy, 12, 70);
-  ctx.strokeStyle = '#e8e8e8';
-  ctx.lineWidth = 9;
-  ctx.lineCap = 'round';
-  for (const b of blades) {
-    ctx.beginPath();
-    ctx.moveTo(b.x1, b.y1);
-    ctx.lineTo(b.x2, b.y2);
-    ctx.stroke();
-  }
-  ctx.fillStyle = '#444';
-  ctx.beginPath();
-  ctx.arc(wm.cx, wm.cy, 10, 0, Math.PI * 2);
-  ctx.fill();
-}
-function drawPendulum(p) {
-  const seg = getPendulumSegment(p);
-  ctx.lineCap = 'round';
-  ctx.strokeStyle = '#9aa0a6';
-  ctx.lineWidth = 6;
-  ctx.beginPath();
-  ctx.moveTo(seg.x1, seg.y1);
-  ctx.lineTo(seg.x2, seg.y2);
-  ctx.stroke();
-  ctx.strokeStyle = 'rgba(255,255,255,0.55)';
-  ctx.lineWidth = 2;
-  ctx.setLineDash([5, 5]);
-  ctx.beginPath();
-  ctx.moveTo(seg.x1, seg.y1);
-  ctx.lineTo(seg.x2, seg.y2);
-  ctx.stroke();
-  ctx.setLineDash([]);
-  ctx.fillStyle = '#444';
-  ctx.beginPath();
-  ctx.arc(p.cx, p.cy, 7, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.fillStyle = '#e6483f';
-  ctx.beginPath();
-  ctx.arc(seg.x2, seg.y2, 9, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.strokeStyle = 'rgba(0,0,0,0.3)';
-  ctx.lineWidth = 1.5;
-  ctx.stroke();
-}
-function drawSlidingGate(g) {
-  const seg = getSlidingGateSegment(g);
-  const dx = g.axis === 'x' ? g.amplitude : 0, dy = g.axis === 'y' ? g.amplitude : 0;
-  ctx.lineCap = 'round';
-  ctx.strokeStyle = 'rgba(255,255,255,0.18)';
-  ctx.lineWidth = 3;
-  ctx.beginPath();
-  ctx.moveTo(g.x1 - dx, g.y1 - dy);
-  ctx.lineTo(g.x2 - dx, g.y2 - dy);
-  ctx.moveTo(g.x1 + dx, g.y1 + dy);
-  ctx.lineTo(g.x2 + dx, g.y2 + dy);
-  ctx.stroke();
-  ctx.strokeStyle = '#c9a24b';
-  ctx.lineWidth = 9;
-  ctx.beginPath();
-  ctx.moveTo(seg.x1, seg.y1);
-  ctx.lineTo(seg.x2, seg.y2);
-  ctx.stroke();
-  ctx.strokeStyle = 'rgba(0,0,0,0.35)';
-  ctx.lineWidth = 3;
-  ctx.setLineDash([6, 6]);
-  ctx.beginPath();
-  ctx.moveTo(seg.x1, seg.y1);
-  ctx.lineTo(seg.x2, seg.y2);
-  ctx.stroke();
-  ctx.setLineDash([]);
-}
-function drawHoleAndFlag(hole) {
-  const { x, y } = hole.cup;
-  const grad = ctx.createRadialGradient(x, y, 2, x, y, hole.cup.radius + 6);
-  grad.addColorStop(0, 'rgba(0,0,0,0.75)');
-  grad.addColorStop(1, 'rgba(0,0,0,0)');
-  ctx.fillStyle = grad;
-  ctx.beginPath();
-  ctx.arc(x, y, hole.cup.radius + 6, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.fillStyle = '#111';
-  ctx.beginPath();
-  ctx.arc(x, y, hole.cup.radius, 0, Math.PI * 2);
-  ctx.fill();
-
-  const stickTop = y - 46;
-  ctx.strokeStyle = '#eee';
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.moveTo(x, y - 4);
-  ctx.lineTo(x, stickTop);
-  ctx.stroke();
-  const flutter = Math.sin(Game.flagPhase * 3) * 3;
-  ctx.fillStyle = '#e6483f';
-  ctx.beginPath();
-  ctx.moveTo(x, stickTop);
-  ctx.lineTo(x + 18 + flutter, stickTop + 6);
-  ctx.lineTo(x, stickTop + 12);
-  ctx.closePath();
-  ctx.fill();
-}
-function drawGrass() {
-  ctx.fillStyle = '#3a7d44';
-  ctx.fillRect(0, 0, LOGICAL_W, LOGICAL_H);
-  const stripeW = 42;
-  ctx.fillStyle = 'rgba(255,255,255,0.035)';
-  for (let x = 0, i = 0; x < LOGICAL_W; x += stripeW, i++) {
-    if (i % 2 === 0) ctx.fillRect(x, 0, stripeW, LOGICAL_H);
-  }
-}
+// ---- Rendering (hole art lives in draw.js as window.Draw) ----
 function trailColor(style, alpha, x) {
   switch (style) {
     case 'comet': return `rgba(255,255,255,${alpha * 0.55})`;
@@ -602,14 +540,21 @@ function drawBall() {
   const stretch = b.squash || 0;
   ctx.scale(1 + stretch * 0.5, 1 - stretch * 0.35);
 
-  // outer glow, pulsing gently
+  // outer glow, pulsing gently (wet = cool water sheen)
   const glowR = BALL_RADIUS + 5 + Math.sin(t * 4) * 1.5;
-  const glow = ctx.createRadialGradient(0, 0, BALL_RADIUS * 0.5, 0, 0, glowR);
-  glow.addColorStop(0, `hsla(${baseHue}, 100%, 65%, 0.55)`);
-  glow.addColorStop(1, `hsla(${baseHue}, 100%, 65%, 0)`);
-  ctx.fillStyle = glow;
+  if (b.wet) {
+    const wetGlow = ctx.createRadialGradient(0, 0, BALL_RADIUS * 0.4, 0, 0, glowR + 2);
+    wetGlow.addColorStop(0, 'rgba(120, 210, 255, 0.65)');
+    wetGlow.addColorStop(1, 'rgba(40, 140, 255, 0)');
+    ctx.fillStyle = wetGlow;
+  } else {
+    const glow = ctx.createRadialGradient(0, 0, BALL_RADIUS * 0.5, 0, 0, glowR);
+    glow.addColorStop(0, `hsla(${baseHue}, 100%, 65%, 0.55)`);
+    glow.addColorStop(1, `hsla(${baseHue}, 100%, 65%, 0)`);
+    ctx.fillStyle = glow;
+  }
   ctx.beginPath();
-  ctx.arc(0, 0, glowR, 0, Math.PI * 2);
+  ctx.arc(0, 0, glowR + (b.wet ? 2 : 0), 0, Math.PI * 2);
   ctx.fill();
 
   // rainbow gradient body
@@ -703,6 +648,12 @@ function drawMultiplayerBall(b, isSelf) {
     ctx.arc(0, 0, BALL_RADIUS + 4, 0, Math.PI * 2);
     ctx.fill();
   }
+  if (b.wet) {
+    ctx.fillStyle = 'rgba(80, 190, 255, 0.35)';
+    ctx.beginPath();
+    ctx.arc(0, 0, BALL_RADIUS + 5, 0, Math.PI * 2);
+    ctx.fill();
+  }
   if (b.special === 'sunburst') {
     const glow = ctx.createRadialGradient(0, 0, BALL_RADIUS * 0.4, 0, 0, BALL_RADIUS + 6);
     glow.addColorStop(0, 'rgba(255,210,90,0.65)');
@@ -769,83 +720,12 @@ function drawMultiplayerBall(b, isSelf) {
   const textW = ctx.measureText(label).width;
   const boxW = textW + 12;
   ctx.fillStyle = 'rgba(0,0,0,0.55)';
-  roundRectPath(ctx, bx - boxW / 2, by - BALL_RADIUS - 22, boxW, 16, 8);
+  Draw.roundRectPath(ctx, bx - boxW / 2, by - BALL_RADIUS - 22, boxW, 16, 8);
   ctx.fill();
   ctx.fillStyle = '#ffffff';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   ctx.fillText(label, bx, by - BALL_RADIUS - 14);
-}
-function drawStickyZone(z) {
-  ctx.fillStyle = '#d99a1f';
-  drawZonePath(z);
-  ctx.fill();
-  if (!z._speckles) {
-    z._speckles = [];
-    const b = zoneBounds(z);
-    const n = Math.max(6, Math.floor((b.x2 - b.x1) * (b.y2 - b.y1) / 2200));
-    for (let i = 0; i < n; i++) {
-      z._speckles.push({
-        x: b.x1 + Math.random() * (b.x2 - b.x1),
-        y: b.y1 + Math.random() * (b.y2 - b.y1),
-        r: 2 + Math.random() * 3,
-      });
-    }
-  }
-  ctx.fillStyle = 'rgba(120,70,10,0.4)';
-  for (const d of z._speckles) {
-    ctx.beginPath();
-    ctx.arc(d.x, d.y, d.r, 0, Math.PI * 2);
-    ctx.fill();
-  }
-  const b = zoneBounds(z);
-  const t = performance.now() / 1000;
-  const sheenY = b.y1 + ((t * 12) % Math.max(1, b.y2 - b.y1));
-  ctx.strokeStyle = 'rgba(255,230,160,0.35)';
-  ctx.lineWidth = 3;
-  ctx.beginPath();
-  ctx.moveTo(b.x1 + 6, sheenY);
-  ctx.lineTo(b.x2 - 6, sheenY);
-  ctx.stroke();
-}
-function drawRampZone(z) {
-  const b = zoneBounds(z);
-  const cx = (b.x1 + b.x2) / 2, cy = (b.y1 + b.y2) / 2;
-  const hw = (b.x2 - b.x1) / 2, hh = (b.y2 - b.y1) / 2;
-  const dx = Math.cos(z.angle), dy = Math.sin(z.angle);
-  const ext = Math.abs(dx) * hw + Math.abs(dy) * hh;
-  const grad = ctx.createLinearGradient(cx - dx * ext, cy - dy * ext, cx + dx * ext, cy + dy * ext);
-  grad.addColorStop(0, '#8a6a3f');
-  grad.addColorStop(1, '#e0c188');
-  ctx.fillStyle = grad;
-  roundRectPath(ctx, b.x1, b.y1, b.x2 - b.x1, b.y2 - b.y1, 6);
-  ctx.fill();
-  ctx.save();
-  roundRectPath(ctx, b.x1, b.y1, b.x2 - b.x1, b.y2 - b.y1, 6);
-  ctx.clip();
-  ctx.strokeStyle = 'rgba(255,255,255,0.75)';
-  ctx.lineWidth = 3;
-  ctx.lineCap = 'round';
-  const perpX = -dy, perpY = dx;
-  for (let d = -ext + 14; d < ext - 4; d += 22) {
-    const bx = cx + dx * d, by = cy + dy * d;
-    const wing = 8;
-    ctx.beginPath();
-    ctx.moveTo(bx - dx * wing + perpX * wing, by - dy * wing + perpY * wing);
-    ctx.lineTo(bx + dx * wing, by + dy * wing);
-    ctx.lineTo(bx - dx * wing - perpX * wing, by - dy * wing - perpY * wing);
-    ctx.stroke();
-  }
-  ctx.restore();
-  const lipX = cx + dx * ext, lipY = cy + dy * ext;
-  const lipHalf = Math.min(hw, hh);
-  ctx.strokeStyle = '#fff';
-  ctx.lineWidth = 4;
-  ctx.lineCap = 'round';
-  ctx.beginPath();
-  ctx.moveTo(lipX - perpX * lipHalf, lipY - perpY * lipHalf);
-  ctx.lineTo(lipX + perpX * lipHalf, lipY + perpY * lipHalf);
-  ctx.stroke();
 }
 function drawBallShadow(x, y, z) {
   const shrink = Math.max(0.45, 1 - z / 600);
@@ -856,18 +736,10 @@ function drawBallShadow(x, y, z) {
 }
 function drawWorld() {
   const hole = currentHoles()[Game.currentHoleIndex];
-  drawGrass();
-  for (const z of hole.sand) drawSandZone(z);
-  for (const z of hole.water) drawWaterZone(z);
-  for (const z of hole.sticky || []) drawStickyZone(z);
-  for (const z of hole.boost) drawBoostZone(z);
-  for (const z of hole.ramps || []) drawRampZone(z);
-  for (const w of BOUNDARY_WALLS) drawWallSegment(w);
-  for (const w of hole.walls) drawWallSegment(w);
-  for (const wm of hole.windmills) drawWindmill(wm);
-  for (const p of hole.pendulums) drawPendulum(p);
-  for (const g of hole.gates) drawSlidingGate(g);
-  drawHoleAndFlag(hole);
+  Draw.drawHoleStatic(ctx, hole, {
+    time: performance.now() / 1000,
+    flagPhase: Game.flagPhase,
+  });
 
   if (MULTIPLAYER) {
     for (const b of Game.players.values()) {
@@ -946,6 +818,8 @@ function loadHole(i) {
   hud.classList.remove('hidden');
   hideAllScreens();
   Game.state = 'AIMING';
+  resetSpeedAvgTracker(Game.speedTracker);
+  resetUnsettledTimer();
   updateHUD();
 }
 function startGame() {
@@ -963,8 +837,13 @@ function onHoleComplete() {
   if (Game.strokes === 1) unlockAchievement('ace');
   document.getElementById('banner-text').textContent = ratingText(diff, Game.strokes);
   document.getElementById('hole-complete-strokes').textContent = `${Game.strokes} stroke${Game.strokes === 1 ? '' : 's'} (Par ${hole.par})`;
-  document.getElementById('btn-next').textContent = Game.currentHoleIndex === currentHoles().length - 1 ? 'See Scorecard →' : 'Next Hole →';
+  if (Game.customHole) {
+    document.getElementById('btn-next').textContent = 'Play again ▶';
+  } else {
+    document.getElementById('btn-next').textContent = Game.currentHoleIndex === currentHoles().length - 1 ? 'See Scorecard →' : 'Next Hole →';
+  }
   Game.state = 'HOLE_COMPLETE';
+  resetUnsettledTimer();
   showScreen('screen-hole-complete');
 }
 function showRoundComplete() {
@@ -992,7 +871,16 @@ function showRoundComplete() {
 // ---- Input ----
 function handlePointerDown(x, y) {
   if (Game.drag.active) return;
-  if (MULTIPLAYER ? !mpCanPutt : Game.state !== 'AIMING') return;
+  if (MULTIPLAYER) {
+    if (!mpCanPutt) return;
+  } else {
+    const hole = currentHoles()[Game.currentHoleIndex];
+    // Crawl / quasi-rest: allow aim while still BALL_MOVING at low speed.
+    if (!mayPuttBall(Game.ball, hole, Game.speedTracker)) return;
+    Game.ball.vx = 0;
+    Game.ball.vy = 0;
+    Game.state = 'AIMING';
+  }
   Game.drag.active = true;
   Game.drag.pointerVec = { x: 0, y: 0 };
 }
@@ -1012,6 +900,7 @@ function launchBall(dragLen, pointerVec) {
   const v = computeLaunchVelocity(pointerVec);
   const factor = stickyLaunchFactor(Game.ball, hole);
   latchStickyAfterPutt(Game.ball, hole);
+  noteWetPutt(Game.ball);
   Game.ball.vx = v.vx * factor;
   Game.ball.vy = v.vy * factor;
   Game.ball.squash = 0.6;
@@ -1021,6 +910,7 @@ function launchBall(dragLen, pointerVec) {
   updateHUD();
   soundPutt(v.speed / MAX_LAUNCH_SPEED);
   Game.state = 'BALL_MOVING';
+  resetSpeedAvgTracker(Game.speedTracker);
 }
 function handlePointerUp(x, y) {
   if (!Game.drag.active) return;
@@ -1067,16 +957,51 @@ window.addEventListener('touchend', (e) => {
 document.getElementById('btn-play').addEventListener('click', () => {
   unlockAudio();
   soundClick();
+  // Production (http/s): always play via relay — open lobby. file:// keeps offline solo for local dev.
+  if (MULTIPLAYER) {
+    Game.customHole = null;
+    Game.pendingCustomLvl = null;
+    showScreen('screen-lobby');
+    return;
+  }
+  Game.customHole = null;
   const soloCourse = document.getElementById('solo-course-select');
   if (soloCourse) Game.courseIndex = Number(soloCourse.value) || 0;
   startGame();
 });
 document.getElementById('btn-next').addEventListener('click', () => {
   soundClick();
+  if (Game.customHole && !MULTIPLAYER) {
+    // file:// offline custom: replay the single hole.
+    loadHole(0);
+    return;
+  }
   if (Game.currentHoleIndex === currentHoles().length - 1) showRoundComplete();
   else loadHole(Game.currentHoleIndex + 1);
 });
 document.getElementById('btn-replay').addEventListener('click', () => { soundClick(); startGame(); });
+const btnRespawn = document.getElementById('btn-respawn');
+const btnRespawnDismiss = document.getElementById('btn-respawn-dismiss');
+if (btnRespawn) {
+  btnRespawn.addEventListener('click', requestRespawn);
+  // Pointerdown so a canvas-style drag never steals the press on touch devices.
+  btnRespawn.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+  });
+}
+if (btnRespawnDismiss) {
+  btnRespawnDismiss.addEventListener('click', (e) => {
+    if (e && e.stopPropagation) e.stopPropagation();
+    soundClick();
+    hideRespawnOffer();
+    respawnDismissedUntilSettle = true;
+  });
+  btnRespawnDismiss.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+  });
+}
 
 // ---- Main loop ----
 function update(dt) {
@@ -1089,14 +1014,39 @@ function update(dt) {
     advanceHoleObstacles(hole, dt);
   }
   Game.flagPhase += dt;
-  if (Game.state === 'BALL_MOVING') updateBallPhysics(dt);
+  // Track speed for quasi-rest putt escape (solo). MP uses per-player trackers in sim.
+  if (!MULTIPLAYER) {
+    noteSpeedSample(Game.speedTracker, Math.hypot(Game.ball.vx, Game.ball.vy), dt);
+  }
+  // Orbit gravity wake vs aim:
+  // - AIMING without drag + field yank (!ballMayRestForAim) → BALL_MOVING (roll again)
+  // - drag.active = user is lining up a shot → hold still, never clear the drag
+  // "Can click the ball" (mayPuttBall) is independent and must NOT suppress wake.
+  const hasGravity = (hole.gravityBodies || []).length > 0;
+  if (Game.state === 'BALL_MOVING') {
+    updateBallPhysics(dt);
+  } else if (Game.state === 'AIMING' && Game.drag.active) {
+    // Actively lining up: freeze pose for a clean aim (crawl/quasi-rest interrupt).
+    Game.ball.vx = 0;
+    Game.ball.vy = 0;
+  } else if (
+    Game.state === 'AIMING' &&
+    !Game.drag.active &&
+    hasGravity &&
+    !ballMayRestForAim(Game.ball, hole)
+  ) {
+    Game.state = 'BALL_MOVING';
+    updateBallPhysics(dt);
+  }
   if (Game.state === 'HAZARD_RESET') {
     Game.hazardTimer -= dt;
     if (Game.hazardTimer <= 0) {
       hideAllScreens();
       Game.state = 'AIMING';
+      resetUnsettledTimer();
     }
   }
+  updateRespawnOffer(dt);
   for (const pt of Game.trail) pt.age += dt;
   Game.trail = Game.trail.filter((pt) => pt.age < 0.6);
   updateParticles(dt);
@@ -1227,7 +1177,9 @@ function buildCustomizeUI() {
 
 // ---- Multiplayer (lobby) ----
 // ---- Multiplayer ----
-// Coast netcode: puttApplied + local tick-locked sim + sparse soft/hard corrections.
+// Coast netcode: puttApplied impulse + local tick-locked sim + sparse hard corrections.
+// Soft packets never rewrite in-flight velocity/pose (instant Δv mid-coast = rubber band).
+// puttApplied for self is confirm-only after optimistic launch (pose is putt-tick history).
 // Multi-room relay protocol (create/join). Cosmetics + menu from main still apply.
 const MULTIPLAYER = location.protocol !== 'file:';
 const MP_PARAMS = new URLSearchParams(location.search);
@@ -1250,6 +1202,8 @@ let mpIsHost = false;
 let mpCanPutt = false;
 let mpPlaying = false;
 let mpRoomCode = null;
+// Frozen hole clock while results / lobby (hostTargetTick free-runs with wall time).
+let mpFrozenTimerMs = 0;
 // Local sim tick (integer). Host clock sample drives how far we may advance.
 let mpSimTick = 0;
 let mpHostTick = 0;
@@ -1279,22 +1233,54 @@ function populateCourseSelect(el) {
   });
 }
 
+function mpApplyCustomFromLobby(msg) {
+  if (msg.hasCustomHole && msg.customLvl) {
+    const d = decodeHole(msg.customLvl);
+    if (d.ok) {
+      Game.customHole = d.hole;
+      Game.pendingCustomLvl = msg.customLvl;
+    }
+  } else if (msg.hasCustomHole === false) {
+    Game.customHole = null;
+  }
+  const customLabel = document.getElementById('lobby-custom-label');
+  const clearBtn = document.getElementById('btn-clear-custom');
+  if (customLabel) {
+    if (msg.hasCustomHole && (msg.customHoleName || Game.customHole)) {
+      customLabel.textContent = `Custom hole: ${msg.customHoleName || (Game.customHole && Game.customHole.name) || 'Custom'}`;
+      customLabel.classList.remove('hidden');
+    } else {
+      customLabel.classList.add('hidden');
+      customLabel.textContent = '';
+    }
+  }
+  if (clearBtn) {
+    clearBtn.classList.toggle('hidden', !(mpIsHost && msg.hasCustomHole));
+  }
+}
+
 function mpRenderLobby(msg) {
   const me = msg.players.find((p) => p.id === mpPlayerId);
   if (me) mpIsHost = me.isHost;
 
   if (msg.roomCode) mpRoomCode = msg.roomCode;
   mpCourseIndex = msg.courseIndex ?? 0;
+  mpApplyCustomFromLobby(msg);
   const courseSelect = document.getElementById('course-select');
   const courseDisplay = document.getElementById('course-display');
   if (courseSelect) {
     populateCourseSelect(courseSelect);
     if (document.activeElement !== courseSelect) courseSelect.value = String(mpCourseIndex);
-    courseSelect.classList.toggle('hidden', !mpIsHost);
+    courseSelect.classList.toggle('hidden', !mpIsHost || !!msg.hasCustomHole);
   }
   if (courseDisplay) {
-    courseDisplay.classList.toggle('hidden', mpIsHost);
-    courseDisplay.textContent = COURSES[mpCourseIndex].name;
+    courseDisplay.classList.toggle('hidden', mpIsHost && !msg.hasCustomHole);
+    if (msg.hasCustomHole) {
+      courseDisplay.classList.remove('hidden');
+      courseDisplay.textContent = msg.customHoleName || 'Custom hole';
+    } else {
+      courseDisplay.textContent = COURSES[mpCourseIndex].name;
+    }
   }
   const joinUrlEl = document.getElementById('lobby-join-url');
   const labelEl = document.getElementById('lobby-join-label');
@@ -1443,6 +1429,10 @@ function mpConnect(opts = {}) {
       if (rename) rename.value = localStorage.getItem('pocketPuttName') || '';
       buildCustomizeUI();
       sendMyStyle();
+      // Host with a share-link level: attach custom hole to the room (joiners get it via lobbyState).
+      if (mpIsHost && Game.pendingCustomLvl && mpSocket && mpSocket.readyState === WebSocket.OPEN) {
+        mpSocket.send(JSON.stringify({ type: 'setCustomHole', lvl: Game.pendingCustomLvl }));
+      }
     } else if (msg.type === 'notice') {
       mpShowBanner(msg.text);
     } else if (msg.type === 'lobbyState') {
@@ -1450,6 +1440,7 @@ function mpConnect(opts = {}) {
       if (msg.state === 'WAITING_FOR_PLAYERS' && mpInRound) {
         mpInRound = false;
         mpPlaying = false;
+        mpFrozenTimerMs = 0;
         gameMenuEl.classList.add('hidden');
         hud.classList.add('hidden');
         Game.players.clear();
@@ -1459,36 +1450,82 @@ function mpConnect(opts = {}) {
     } else if (msg.type === 'roundState') {
       mpBeginHole(msg);
     } else if (msg.type === 'puttApplied') {
+      if (!mpPlaying) return; // ignore late putts while on results/lobby
       mpOnPuttApplied(msg);
     } else if (msg.type === 'snapshot') {
+      // Never resurrect "playing" from a stale snapshot during results — that left the
+      // timer free-running and blocked feeling like the next hole would never start.
+      if (!mpPlaying) return;
       mpApplyCorrection(msg);
     } else if (msg.type === 'holeResults') {
       mpPlaying = false;
+      mpFrozenTimerMs = mpEstimatedElapsedMs();
       mpRenderHoleResults(msg);
     } else if (msg.type === 'finalResults') {
       mpPlaying = false;
+      mpFrozenTimerMs = mpEstimatedElapsedMs();
       mpRenderFinalResults(msg);
     }
   });
 }
 
 function mpBeginHole(msg) {
-  if (msg.courseIndex !== undefined) Game.courseIndex = msg.courseIndex;
+  if (msg.customLvl) {
+    const d = decodeHole(msg.customLvl);
+    if (d.ok) {
+      Game.customHole = d.hole;
+      Game.pendingCustomLvl = msg.customLvl;
+    }
+  } else if (msg.hasCustomHole === false) {
+    Game.customHole = null;
+  }
+  if (msg.courseIndex !== undefined && !Game.customHole) Game.courseIndex = msg.courseIndex;
   Game.currentHoleIndex = msg.holeIndex;
   Game.players.clear();
   const hole = currentHoles()[msg.holeIndex];
+  if (!hole) {
+    console.error('No hole for roundState', msg);
+    return;
+  }
   resetHoleObstacles(hole);
   const startTick = typeof msg.tick === 'number' ? msg.tick : 0;
   mpSimTick = startTick;
   mpNoteHostTick(startTick);
   setHoleObstaclesAtTick(hole, startTick);
+  // Seed balls from reliable roundState so a dropped resync snapshot can't leave an
+  // empty roster (ball "disappears" until the next idle correction).
+  for (const b of msg.balls || []) {
+    const p = mpUpsertPlayer(b);
+    p.x = b.x;
+    p.y = b.y;
+    p.vx = b.vx || 0;
+    p.vy = b.vy || 0;
+    p.z = b.z || 0;
+    p.vz = b.vz || 0;
+    p.strokes = b.strokes || 0;
+    p.holedOut = !!b.holedOut;
+    p.errX = 0;
+    p.errY = 0;
+    p.rx = p.x;
+    p.ry = p.y;
+    p.rz = p.z;
+    if (typeof b.stuckStickyIndex === 'number') p.stuckStickyIndex = b.stuckStickyIndex;
+    p.firedBoosts = new Set();
+  }
+  const me = Game.players.get(mpPlayerId);
+  if (me) mpSyncSelfFromPlayer(me);
   mpCanPutt = false;
   mpPlaying = true;
+  mpFrozenTimerMs = 0;
+  resetUnsettledTimer();
   resetAchvHoleCounters();
   mpInRound = true;
   gameMenuEl.classList.remove('hidden');
   hud.classList.remove('hidden');
   hideAllScreens();
+  setHudText(hudTotal, `Time: 0.0s`);
+  setHudText(hudHole, `Hole ${msg.holeIndex + 1}/${currentHoles().length} — ${hole.name}`);
+  setHudText(hudPar, `Par ${hole.par}`);
 }
 
 function mpNoteHostTick(tick) {
@@ -1501,6 +1538,8 @@ function mpHostTargetTick() {
 }
 
 function mpEstimatedElapsedMs() {
+  // Between holes the host clock sample is frozen but wall time isn't — freeze the HUD.
+  if (!mpPlaying) return mpFrozenTimerMs;
   return tickToElapsedMs(Math.max(mpSimTick, mpHostTargetTick()));
 }
 
@@ -1518,6 +1557,8 @@ function mpUpsertPlayer(b) {
       squash: 0, spin: 0, angleDir: 0,
       firedBoosts: new Set(),
       stuckStickyIndex: typeof b.stuckStickyIndex === 'number' ? b.stuckStickyIndex : -1,
+      wet: !!b.wet,
+      wetStroke: !!b.wetStroke,
       trailPts: null,
     };
     Game.players.set(b.id, p);
@@ -1540,42 +1581,72 @@ function mpSyncSelfFromPlayer(p) {
   Game.ball.vy = p.vy;
   Game.ball.z = p.z || 0;
   Game.ball.vz = p.vz || 0;
-  const speed = Math.hypot(p.vx, p.vy);
-  mpCanPutt = !p.holedOut && speed < STOP_THRESHOLD && (p.z || 0) === 0;
+  const hole = currentHoles()[Game.currentHoleIndex];
+  mpCanPutt = !p.holedOut && mayPuttBall(p, hole, Game.speedTracker);
   setHudText(hudStrokes, `Strokes: ${p.strokes}`);
 }
 
 function mpApplyAuthorityPose(p, b, hard) {
   const visX = p.rx, visY = p.ry;
-  const dist = Math.hypot((p.x - b.x), (p.y - b.y));
+  const clientMoving = Math.hypot(p.vx, p.vy) >= STOP_THRESHOLD;
+  const hostMoving = Math.hypot(b.vx || 0, b.vy || 0) >= STOP_THRESHOLD;
+  const moving = clientMoving || hostMoving;
+  const distBefore = Math.hypot((p.x - b.x), (p.y - b.y));
+
+  // Soft + in-flight: never touch sim pose or velocity.
+  // Instant Δv (or mid-coast x/y snap) rewrites the integration path under the ball —
+  // visual error decay cannot hide that kink. Soft packets are juice/meta only until
+  // a hard discrete event (clash/water/holed/idle/resync) or catastrophic error.
+  // Also ignore soft poses for self during post-respawn grace (soft idle undid tee reset).
+  const selfRespawnGrace =
+    p.id === mpPlayerId && performance.now() < respawnSoftGraceUntil;
+  if (!hard && selfRespawnGrace) {
+    if (typeof b.strokes === 'number' && b.strokes > p.strokes) p.strokes = b.strokes;
+    return;
+  }
+  if (!hard && moving && !b.holedOut) {
+    if (typeof b.strokes === 'number' && b.strokes > p.strokes) p.strokes = b.strokes;
+    p.rx = p.x + p.errX;
+    p.ry = p.y + p.errY;
+    p.rz = p.z || 0;
+    return;
+  }
+
+  // Hard authority, settled soft, or hole-out: adopt host sim state.
   p.strokes = b.strokes;
   p.holedOut = !!b.holedOut;
   p.x = b.x;
   p.y = b.y;
-  p.vx = b.vx;
-  p.vy = b.vy;
+  p.vx = b.vx || 0;
+  p.vy = b.vy || 0;
   p.z = b.z || 0;
   p.vz = b.vz || 0;
   if (typeof b.stuckStickyIndex === 'number') p.stuckStickyIndex = b.stuckStickyIndex;
-  if (Math.hypot(b.vx, b.vy) < STOP_THRESHOLD && p.z === 0) p.firedBoosts = new Set();
+  // Absent wet on wire means dry (ballWire only sets the flag when true).
+  p.wet = !!b.wet;
+  p.wetStroke = !!b.wetStroke;
+  // Boost latch is leave-to-rearm (cleared when ball exits pad). Wire must preserve
+  // firedBoosts while still on a pad — clearing on rest snaps re-fires and can loop.
+  if (Array.isArray(b.firedBoosts)) {
+    p.firedBoosts = new Set(b.firedBoosts.filter((i) => typeof i === 'number'));
+  }
 
-  const forceHard = hard || dist >= MP_HARD_ERR_PX || b.holedOut;
+  const visGap = Math.hypot(visX - p.x, visY - p.y);
+  // Hard / hole-out / catastrophic / already aligned → clean snap.
+  // Soft settled with leftover offset → glide via err decay (no pop).
+  const forceHard =
+    b.holedOut || hard || distBefore >= MP_HARD_ERR_PX || visGap < MP_SOFT_ERR_PX;
   if (forceHard) {
     p.errX = 0;
     p.errY = 0;
-    p.rx = b.x;
-    p.ry = b.y;
+    p.rx = p.x;
+    p.ry = p.y;
     p.rz = p.z;
   } else {
-    p.errX = visX - b.x;
-    p.errY = visY - b.y;
-    const elen = Math.hypot(p.errX, p.errY);
-    if (elen < MP_SOFT_ERR_PX) {
-      p.errX = 0;
-      p.errY = 0;
-      p.rx = b.x;
-      p.ry = b.y;
-    }
+    p.errX = visX - p.x;
+    p.errY = visY - p.y;
+    p.rx = p.x + p.errX;
+    p.ry = p.y + p.errY;
     p.rz = p.z;
   }
 }
@@ -1603,9 +1674,12 @@ function mpApplyPuttLocal(playerId, dragVector, fromServer, playSound) {
     } else {
       latchStickyAfterPutt(p, hole);
     }
+    if (fromServer.wet !== undefined) p.wet = !!fromServer.wet;
+    if (fromServer.wetStroke !== undefined) p.wetStroke = !!fromServer.wetStroke;
   } else {
     const factor = stickyLaunchFactor(p, hole);
     latchStickyAfterPutt(p, hole);
+    noteWetPutt(p);
     p.vx = launch.vx * factor;
     p.vy = launch.vy * factor;
     p.z = 0;
@@ -1618,6 +1692,7 @@ function mpApplyPuttLocal(playerId, dragVector, fromServer, playSound) {
   p.ry = p.y;
   if (playSound) soundPutt(Math.hypot(p.vx, p.vy) / MAX_LAUNCH_SPEED);
   if (playerId === mpPlayerId) {
+    resetSpeedAvgTracker(Game.speedTracker);
     mpSyncSelfFromPlayer(p);
     mpCanPutt = false;
   }
@@ -1627,28 +1702,48 @@ function mpOnPuttApplied(msg) {
   if (!mpPlaying) return;
   if (typeof msg.tick === 'number') {
     mpNoteHostTick(msg.tick);
+    // Never rewind simTick for a late puttApplied — that yanks a coasting ball backward.
     if (msg.tick >= mpSimTick) {
       mpSimTick = msg.tick;
       setHoleObstaclesAtTick(currentHoles()[Game.currentHoleIndex], mpSimTick);
     }
   }
   const isSelf = msg.playerId === mpPlayerId;
-  const p = Game.players.get(msg.playerId);
+  let p = Game.players.get(msg.playerId);
+  const hostPose = {
+    x: msg.x, y: msg.y, vx: msg.vx, vy: msg.vy, strokes: msg.strokes,
+    stuckStickyIndex: msg.stuckStickyIndex, z: msg.z, vz: msg.vz,
+    wet: msg.wet, wetStroke: msg.wetStroke,
+  };
+
+  // puttApplied carries pose *at the putt tick* (rest x/y + full launch v). That is an
+  // impulse sample, not a live pose. Re-applying it after any coast re-fires Δv and
+  // teleports back to the tee — the classic launch rubber band.
   if (isSelf && p) {
-    const dist = Math.hypot(p.x - msg.x, p.y - msg.y);
-    const dv = Math.hypot(p.vx - msg.vx, p.vy - msg.vy);
-    if (dist > 1 || dv > 1) {
-      mpApplyPuttLocal(msg.playerId, msg.dragVector, {
-        x: msg.x, y: msg.y, vx: msg.vx, vy: msg.vy, strokes: msg.strokes,
-      }, false);
-    } else {
-      p.strokes = msg.strokes;
+    const alreadyLaunched =
+      Math.hypot(p.vx, p.vy) >= STOP_THRESHOLD || p.strokes >= (msg.strokes || 0);
+    if (alreadyLaunched) {
+      // Confirm only. Optimistic coast is truth until a real hard correction.
+      p.strokes = Math.max(p.strokes, msg.strokes || 0);
+      if (typeof msg.stuckStickyIndex === 'number') p.stuckStickyIndex = msg.stuckStickyIndex;
+      if (msg.wet !== undefined) p.wet = !!msg.wet;
+      if (msg.wetStroke !== undefined) p.wetStroke = !!msg.wetStroke;
       mpSyncSelfFromPlayer(p);
+    } else {
+      // Missed optimistic launch (or input arrived before local apply) — take impulse once.
+      mpApplyPuttLocal(msg.playerId, msg.dragVector, hostPose, false);
     }
   } else {
-    mpApplyPuttLocal(msg.playerId, msg.dragVector, {
-      x: msg.x, y: msg.y, vx: msg.vx, vy: msg.vy, strokes: msg.strokes,
-    }, true);
+    // Remote (or self with no local player yet): apply the launch impulse once.
+    if (!p) {
+      p = mpUpsertPlayer({
+        id: msg.playerId, name: '?', hue: 0,
+        x: msg.x, y: msg.y, vx: msg.vx, vy: msg.vy,
+        strokes: msg.strokes || 0, holedOut: false,
+        stuckStickyIndex: msg.stuckStickyIndex,
+      });
+    }
+    mpApplyPuttLocal(msg.playerId, msg.dragVector, hostPose, !isSelf);
   }
 }
 
@@ -1681,6 +1776,7 @@ function mpStepOneTick() {
         p.z = 0;
         p.vz = 0;
         p.stuckStickyIndex = -1;
+        markWetFromWater(p);
         p.strokes += 1;
         p.errX = 0;
         p.errY = 0;
@@ -1689,8 +1785,32 @@ function mpStepOneTick() {
         spawnSplash(events.water.dropPoint.x, events.water.dropPoint.y);
         if (mine) {
           soundWater();
-          mpShowBanner('SPLASH! +1');
+          mpShowBanner('SPLASH! +1  ·  WET');
           achvOnSplash();
+        }
+      }
+      if (events.blackHole) {
+        const tee = hole.tee;
+        p.x = tee.x;
+        p.y = tee.y;
+        p.vx = 0;
+        p.vy = 0;
+        p.z = 0;
+        p.vz = 0;
+        p.stuckStickyIndex = -1;
+        p.wet = false;
+        p.wetStroke = false;
+        p.firedBoosts = new Set();
+        p.strokes += 1;
+        p.errX = 0;
+        p.errY = 0;
+        p.rx = p.x;
+        p.ry = p.y;
+        spawnSplash(tee.x, tee.y);
+        if (mine) {
+          soundWater();
+          mpShowBanner('EVENT HORIZON! +1  ·  Tee');
+          // Not a water splash — pond3 / bubble trail only from actual water.
         }
       }
       if (events.holed) {
@@ -1713,11 +1833,18 @@ function mpStepOneTick() {
       }
     }
   }
+  // Quasi-rest window for local player (host validates with its own tracker).
+  const me = Game.players.get(mpPlayerId);
+  if (me && !me.holedOut) {
+    noteSpeedSample(Game.speedTracker, Math.hypot(me.vx || 0, me.vy || 0), TICK_DT);
+    mpSyncSelfFromPlayer(me);
+  }
 }
 
 function mpUpdateLocalSim(dt) {
   if (!mpPlaying) {
-    setHudText(hudTotal, `Time: ${(mpEstimatedElapsedMs() / 1000).toFixed(1)}s`);
+    // Frozen clock on results / between holes — do not free-run hostTargetTick.
+    setHudText(hudTotal, `Time: ${(mpFrozenTimerMs / 1000).toFixed(1)}s`);
     return;
   }
   const targetTick = mpHostTargetTick();
@@ -1762,8 +1889,10 @@ function mpApplyCorrection(msg) {
   const hole = currentHoles()[msg.holeIndex];
   const tick = typeof msg.tick === 'number' ? msg.tick : elapsedMsToTick(msg.elapsedMs || 0);
   const reason = msg.reason || 'heartbeat';
-  const hard = !!msg.hard || reason === 'event' || reason === 'resync';
-  mpPlaying = true;
+  // Trust host hard flag (idle keepalives / juice events are soft). Always hard on resync.
+  const hard = reason === 'resync' ? true : !!msg.hard;
+  // Do NOT set mpPlaying here — only roundState / mpBeginHole starts a hole. Snapshots
+  // during holeEnding celebration stay in the active hole; after holeResults we ignore them.
   mpNoteHostTick(tick);
 
   if (msg.obstacles) {
@@ -1774,6 +1903,8 @@ function mpApplyCorrection(msg) {
     setHoleObstaclesAtTick(hole, tick);
   }
 
+  // Only rewind the local tick clock on hard authority or if we're badly ahead.
+  // Soft keepalives must not yank simTick backward mid-coast.
   if (hard || mpSimTick > tick + 2) {
     mpSimTick = tick;
     if (!msg.obstacles) setHoleObstaclesAtTick(hole, tick);
@@ -1784,10 +1915,18 @@ function mpApplyCorrection(msg) {
     seen.add(b.id);
     const existed = Game.players.has(b.id);
     const p = mpUpsertPlayer(b);
+    // First sighting is always hard seed (need a starting pose).
     mpApplyAuthorityPose(p, b, hard || !existed);
   }
-  for (const id of Game.players.keys()) {
-    if (!seen.has(id)) Game.players.delete(id);
+  // Never evaporate balls from soft/partial snapshots. Soft event packets can race;
+  // deleting missing ids made the local ball vanish mid-hole. Only prune on hard
+  // authority, and never delete self while a hole is active.
+  if (hard && (msg.balls || []).length > 0) {
+    for (const id of Game.players.keys()) {
+      if (seen.has(id)) continue;
+      if (id === mpPlayerId) continue;
+      Game.players.delete(id);
+    }
   }
 
   for (const ev of msg.events || []) mpHandleEvent(ev, hole);
@@ -1868,6 +2007,14 @@ function mpHandleEvent(ev, hole) {
         soundWater();
         mpShowBanner('SPLASH! +1');
         achvOnSplash();
+      }
+      break;
+    case 'blackHole':
+      if (typeof ev.x === 'number') spawnSplash(ev.x, ev.y);
+      if (mine) {
+        soundWater();
+        mpShowBanner('EVENT HORIZON! +1');
+        // Do not achvOnSplash — water skin is for water hazards only.
       }
       break;
     case 'clash':
@@ -1989,7 +2136,14 @@ document.getElementById('btn-menu-end').addEventListener('click', () => {
     gameMenuEl.classList.add('hidden');
     hud.classList.add('hidden');
     Game.state = 'START';
+    // Keep customHole if we still have pendingCustomLvl so share UI remains.
+    if (!Game.pendingCustomLvl) Game.customHole = null;
+    else {
+      const d = decodeHole(Game.pendingCustomLvl);
+      Game.customHole = d.ok ? d.hole : null;
+    }
     showScreen('screen-start');
+    refreshCustomLevelPanel();
   }
 });
 document.getElementById('btn-rename').addEventListener('click', () => {
@@ -2004,21 +2158,120 @@ if (courseSelectEl) {
   courseSelectEl.addEventListener('change', (e) => {
     const courseIndex = Number(e.target.value);
     mpCourseIndex = courseIndex;
+    Game.customHole = null;
+    Game.pendingCustomLvl = null;
     if (mpSocket && mpSocket.readyState === WebSocket.OPEN) {
       mpSocket.send(JSON.stringify({ type: 'selectCourse', courseIndex }));
+    }
+  });
+}
+const btnClearCustom = document.getElementById('btn-clear-custom');
+if (btnClearCustom) {
+  btnClearCustom.addEventListener('click', () => {
+    soundClick();
+    Game.customHole = null;
+    Game.pendingCustomLvl = null;
+    if (mpSocket && mpSocket.readyState === WebSocket.OPEN) {
+      mpSocket.send(JSON.stringify({ type: 'clearCustomHole' }));
     }
   });
 }
 document.getElementById('btn-start-round').addEventListener('click', () => {
   unlockAudio();
   soundClick();
+  if (Game.pendingCustomLvl || Game.customHole) {
+    try {
+      const lvl = Game.pendingCustomLvl || encodeHole(Game.customHole);
+      mpSocket.send(JSON.stringify({ type: 'setCustomHole', lvl }));
+      mpSocket.send(JSON.stringify({ type: 'startRound' }));
+      return;
+    } catch (e) {
+      mpSetRelayStatus('Custom hole invalid: ' + (e.message || e));
+    }
+  }
   mpSocket.send(JSON.stringify({ type: 'startRound', courseIndex: mpCourseIndex }));
 });
 document.getElementById('btn-play-again').addEventListener('click', () => {
   unlockAudio();
   soundClick();
+  if (Game.customHole || Game.pendingCustomLvl) {
+    try {
+      const lvl = Game.pendingCustomLvl || encodeHole(Game.customHole);
+      mpSocket.send(JSON.stringify({ type: 'setCustomHole', lvl }));
+      mpSocket.send(JSON.stringify({ type: 'startRound' }));
+      return;
+    } catch (e) { /* fall through */ }
+  }
   mpSocket.send(JSON.stringify({ type: 'startRound', courseIndex: mpCourseIndex }));
 });
+
+// ---- Custom level URL (?lvl= independent of ?room=) ----
+function refreshCustomLevelPanel() {
+  const panel = document.getElementById('custom-level-panel');
+  const label = document.getElementById('custom-level-label');
+  const errEl = document.getElementById('custom-level-error');
+  if (!panel) return;
+  const lvl = Game.pendingCustomLvl || MP_PARAMS.get('lvl');
+  if (!lvl) {
+    panel.classList.add('hidden');
+    return;
+  }
+  const d = decodeHole(lvl);
+  panel.classList.remove('hidden');
+  if (!d.ok) {
+    if (label) label.textContent = 'Custom level link invalid';
+    if (errEl) {
+      errEl.textContent = 'Could not load level: ' + d.error;
+      errEl.classList.remove('hidden');
+    }
+    return;
+  }
+  if (errEl) errEl.classList.add('hidden');
+  Game.pendingCustomLvl = lvl;
+  // Do not force customHole until user chooses Play (keeps menu course select working).
+  if (label) label.textContent = `Custom level: ${d.hole.name} (par ${d.hole.par})`;
+}
+
+/**
+ * Share-link Play / Create room: on production, create a multiplayer room with the
+ * custom hole attached (same path as "create room and start alone" today). Friends
+ * join via room code. file:// only falls back to offline solo for local dev.
+ */
+function playCustomInRoom() {
+  const lvl = Game.pendingCustomLvl || MP_PARAMS.get('lvl');
+  if (!lvl) return;
+  const d = decodeHole(lvl);
+  if (!d.ok) return;
+  Game.pendingCustomLvl = lvl;
+  Game.customHole = d.hole;
+  unlockAudio();
+  soundClick();
+  if (!MULTIPLAYER) {
+    // Local file:// dev only — no relay.
+    startGame();
+    return;
+  }
+  showScreen('screen-lobby');
+  mpSendCreateRoom(); // host welcome sends setCustomHole(pendingCustomLvl)
+}
+
+const btnPlayCustom = document.getElementById('btn-play-custom');
+if (btnPlayCustom) btnPlayCustom.addEventListener('click', playCustomInRoom);
+const btnEditLevel = document.getElementById('btn-edit-level');
+if (btnEditLevel) {
+  btnEditLevel.addEventListener('click', () => {
+    const lvl = Game.pendingCustomLvl || MP_PARAMS.get('lvl');
+    if (!lvl) {
+      location.href = 'editor.html';
+      return;
+    }
+    location.href = 'editor.html?lvl=' + encodeURIComponent(lvl);
+  });
+}
+const btnCreateWithLevel = document.getElementById('btn-create-with-level');
+if (btnCreateWithLevel) {
+  btnCreateWithLevel.addEventListener('click', playCustomInRoom);
+}
 
 // ---- Init ----
 setupCanvasDPR();
@@ -2032,11 +2285,46 @@ if (soloCourse) {
     Game.courseIndex = Number(soloCourse.value) || 0;
   });
 }
-Game.ball.x = currentHoles()[0].tee.x;
-Game.ball.y = currentHoles()[0].tee.y;
+
+// Parse level param independently of room (do not require room for lvl).
+{
+  const lvl = (MP_PARAMS.get('lvl') || '').trim();
+  if (lvl) {
+    Game.pendingCustomLvl = lvl;
+    const d = decodeHole(lvl);
+    if (d.ok) {
+      // Prefill ball preview only — customHole set on Play.
+      Game.ball.x = d.hole.tee.x;
+      Game.ball.y = d.hole.tee.y;
+    }
+  }
+}
+refreshCustomLevelPanel();
+
+if (!Game.pendingCustomLvl) {
+  Game.ball.x = COURSES[0].holes[0].tee.x;
+  Game.ball.y = COURSES[0].holes[0].tee.y;
+} else {
+  try {
+    const d = decodeHole(Game.pendingCustomLvl);
+    if (d.ok) {
+      Game.ball.x = d.hole.tee.x;
+      Game.ball.y = d.hole.tee.y;
+    }
+  } catch (e) { /* ignore */ }
+}
+
 if (MULTIPLAYER) {
-  showScreen('screen-lobby');
-  mpConnect();
+  // Level-only share: show start with custom actions (not forced lobby auto-play).
+  // Room param still opens lobby join flow.
+  const hasRoom = !!(MP_PARAMS.get('room') || '').trim();
+  if (Game.pendingCustomLvl && !hasRoom) {
+    showScreen('screen-start');
+    mpConnect(); // connect in background for Create room
+  } else {
+    showScreen('screen-lobby');
+    mpConnect();
+  }
 } else {
   showScreen('screen-start');
 }
