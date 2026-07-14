@@ -18,6 +18,8 @@
     return { x1: g.x1, y1: g.y1, x2: g.x2, y2: g.y2 };
   };
 
+  const GRAVITY_G = S.GRAVITY_G || 100;
+
   const BOOST_COLOR_A = '#8b2fd1';
   const BOOST_COLOR_B = '#2fd1c8';
   /**
@@ -69,6 +71,176 @@
     ctx.fillStyle = 'rgba(255,255,255,0.035)';
     for (let x = 0, i = 0; x < LOGICAL_W; x += stripeW, i++) {
       if (i % 2 === 0) ctx.fillRect(x, 0, stripeW, LOGICAL_H);
+    }
+  }
+
+  // ---- Space backdrop (holes with gravity bodies) ----
+  // Decorative debris drifts in from the screen edges and falls along the hole's real
+  // 1/r² field (same GRAVITY_G * mass / r² as the ball, scaled down so it pans, not
+  // plummets). Visual only — sim state lives on hole._space and never touches physics.
+  const SPACE = {
+    stars: 110,
+    dust: 26,
+    comets: 3,
+    planetoids: 2,
+    gravityScale: 0.3,
+    maxSpeed: 320,
+    maxDt: 0.1, // clamp per-frame step so tab-back doesn't teleport debris
+  };
+
+  function spaceRand(min, max) {
+    return min + Math.random() * (max - min);
+  }
+
+  function spawnSpaceDebris(p, hole, kind) {
+    // Enter from a random screen edge, aimed loosely at a gravity body (or map center).
+    const side = Math.floor(Math.random() * 4);
+    if (side === 0) { p.x = -12; p.y = spaceRand(0, LOGICAL_H); }
+    else if (side === 1) { p.x = LOGICAL_W + 12; p.y = spaceRand(0, LOGICAL_H); }
+    else if (side === 2) { p.x = spaceRand(0, LOGICAL_W); p.y = -12; }
+    else { p.x = spaceRand(0, LOGICAL_W); p.y = LOGICAL_H + 12; }
+    const bodies = hole.gravityBodies || [];
+    const target = bodies.length
+      ? bodies[Math.floor(Math.random() * bodies.length)]
+      : { x: LOGICAL_W / 2, y: LOGICAL_H / 2 };
+    const ang = Math.atan2(target.y + spaceRand(-90, 90) - p.y, target.x + spaceRand(-90, 90) - p.x);
+    const speed = kind === 'comet' ? spaceRand(24, 46) : kind === 'planetoid' ? spaceRand(5, 11) : spaceRand(9, 22);
+    p.kind = kind;
+    p.vx = Math.cos(ang) * speed;
+    p.vy = Math.sin(ang) * speed;
+    p.r = kind === 'comet' ? spaceRand(1.6, 2.4) : kind === 'planetoid' ? spaceRand(3, 5.5) : spaceRand(0.6, 1.4);
+    if (kind === 'planetoid') {
+      const icy = Math.random() < 0.5;
+      p.c1 = icy ? '#aebdd0' : '#b3a68f';
+      p.c2 = icy ? '#4e5b70' : '#5d5648';
+    }
+    return p;
+  }
+
+  function stepSpace(space, hole, dt) {
+    const bodies = hole.gravityBodies || [];
+    for (const p of space.debris) {
+      let ax = 0;
+      let ay = 0;
+      let eaten = false;
+      for (const b of bodies) {
+        const dx = b.x - p.x;
+        const dy = b.y - p.y;
+        const r = Math.hypot(dx, dy);
+        if (r < b.radius + p.r + 1) {
+          eaten = true;
+          break;
+        }
+        const a = (GRAVITY_G * b.mass * SPACE.gravityScale) / (r * r);
+        ax += (dx / r) * a;
+        ay += (dy / r) * a;
+      }
+      if (eaten) {
+        spawnSpaceDebris(p, hole, p.kind);
+        continue;
+      }
+      p.vx += ax * dt;
+      p.vy += ay * dt;
+      const sp = Math.hypot(p.vx, p.vy);
+      if (sp > SPACE.maxSpeed) {
+        p.vx *= SPACE.maxSpeed / sp;
+        p.vy *= SPACE.maxSpeed / sp;
+      }
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      const m = 60;
+      if (p.x < -m || p.x > LOGICAL_W + m || p.y < -m || p.y > LOGICAL_H + m) {
+        spawnSpaceDebris(p, hole, p.kind);
+      }
+    }
+  }
+
+  function initSpace(hole) {
+    const stars = [];
+    for (let i = 0; i < SPACE.stars; i++) {
+      stars.push({
+        x: Math.random() * LOGICAL_W,
+        y: Math.random() * LOGICAL_H,
+        r: spaceRand(0.4, 1.3),
+        base: spaceRand(0.25, 0.7),
+        amp: spaceRand(0.08, 0.3),
+        w: spaceRand(0.6, 2.2),
+        ph: spaceRand(0, Math.PI * 2),
+      });
+    }
+    const debris = [];
+    for (let i = 0; i < SPACE.dust; i++) debris.push(spawnSpaceDebris({}, hole, 'dust'));
+    for (let i = 0; i < SPACE.comets; i++) debris.push(spawnSpaceDebris({}, hole, 'comet'));
+    for (let i = 0; i < SPACE.planetoids; i++) debris.push(spawnSpaceDebris({}, hole, 'planetoid'));
+    const space = { stars, debris, lastT: null };
+    // Pre-roll ~10s so the first frame is a lived-in field, not everyone hugging the edges.
+    for (let i = 0; i < 240; i++) stepSpace(space, hole, 1 / 24);
+    return space;
+  }
+
+  function drawSpace(ctx, hole, timeSec) {
+    const t = timeSec != null ? timeSec : nowSec();
+    if (!hole._space) hole._space = initSpace(hole);
+    const space = hole._space;
+    const dt = space.lastT == null ? 0 : Math.min(Math.max(t - space.lastT, 0), SPACE.maxDt);
+    space.lastT = t;
+    if (dt > 0) stepSpace(space, hole, dt);
+
+    ctx.fillStyle = '#04060c';
+    ctx.fillRect(0, 0, LOGICAL_W, LOGICAL_H);
+    let neb = ctx.createRadialGradient(LOGICAL_W * 0.72, LOGICAL_H * 0.25, 20, LOGICAL_W * 0.72, LOGICAL_H * 0.25, 340);
+    neb.addColorStop(0, 'rgba(96,72,160,0.10)');
+    neb.addColorStop(1, 'rgba(96,72,160,0)');
+    ctx.fillStyle = neb;
+    ctx.fillRect(0, 0, LOGICAL_W, LOGICAL_H);
+    neb = ctx.createRadialGradient(LOGICAL_W * 0.2, LOGICAL_H * 0.8, 20, LOGICAL_W * 0.2, LOGICAL_H * 0.8, 300);
+    neb.addColorStop(0, 'rgba(40,110,150,0.08)');
+    neb.addColorStop(1, 'rgba(40,110,150,0)');
+    ctx.fillStyle = neb;
+    ctx.fillRect(0, 0, LOGICAL_W, LOGICAL_H);
+
+    for (const s of space.stars) {
+      const a = Math.max(0, Math.min(1, s.base + Math.sin(t * s.w + s.ph) * s.amp));
+      ctx.fillStyle = 'rgba(255,255,255,' + a.toFixed(3) + ')';
+      ctx.beginPath();
+      ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    for (const p of space.debris) {
+      if (p.kind === 'dust') {
+        ctx.fillStyle = 'rgba(200,210,230,0.5)';
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+        ctx.fill();
+      } else if (p.kind === 'comet') {
+        const sp = Math.hypot(p.vx, p.vy) || 1;
+        const tail = Math.min(46, 10 + sp * 0.18);
+        const tx = p.x - (p.vx / sp) * tail;
+        const ty = p.y - (p.vy / sp) * tail;
+        const grad = ctx.createLinearGradient(p.x, p.y, tx, ty);
+        grad.addColorStop(0, 'rgba(180,220,255,0.85)');
+        grad.addColorStop(1, 'rgba(180,220,255,0)');
+        ctx.strokeStyle = grad;
+        ctx.lineWidth = p.r * 1.6;
+        ctx.lineCap = 'round';
+        ctx.beginPath();
+        ctx.moveTo(p.x, p.y);
+        ctx.lineTo(tx, ty);
+        ctx.stroke();
+        ctx.fillStyle = '#eaf6ff';
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+        ctx.fill();
+      } else {
+        const g = ctx.createRadialGradient(p.x - p.r * 0.35, p.y - p.r * 0.35, p.r * 0.2, p.x, p.y, p.r);
+        g.addColorStop(0, p.c1);
+        g.addColorStop(1, p.c2);
+        ctx.fillStyle = g;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+        ctx.fill();
+      }
     }
   }
 
@@ -524,7 +696,9 @@
     const t = nowSec(opts);
     const flagPhase = opts.flagPhase != null ? opts.flagPhase : 0;
 
-    drawGrass(ctx);
+    // Gravity holes play in space: black canvas + starfield instead of fairway grass.
+    if ((hole.gravityBodies || []).length) drawSpace(ctx, hole, t);
+    else drawGrass(ctx);
     for (const z of hole.sand || []) drawSandZone(ctx, z);
     for (const z of hole.water || []) drawWaterZone(ctx, z, t);
     for (const z of hole.sticky || []) drawStickyZone(ctx, z, t);
@@ -550,6 +724,7 @@
     BH_LENS,
     roundRectPath,
     drawGrass,
+    drawSpace,
     drawSandZone,
     drawWaterZone,
     drawStickyZone,
