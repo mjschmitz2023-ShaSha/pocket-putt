@@ -52,13 +52,15 @@ const RAMP_VZ_MIN = 260;
 const RAMP_VZ_MAX = 520;
 const RAMP_UPHILL_ACCEL = 900;
 const FRICTION_AIR = 0.1;
-// Sticky goo: drags a ball to a dead stop on entry; the escape putt leaves at reduced power.
-// Keep friction high enough to stop, but not so high that a 1-substep host/client skew
-// (or soft pose correction) turns into a multi-metre fork. Escape uses a latch (see
-// stuckStickyIndex) so the ball can roll out at grass friction after a putt.
-const FRICTION_STICKY = 14;
-const STICKY_STOP_SPEED = 40;
-const STICKY_LAUNCH_FACTOR = 0.55;
+// Sticky goo, two drag strengths:
+// - Trapping (unlatched entry): 2x sand friction. Incoming balls get chewed hard and
+//   stop fast — goo is the most punishing surface on the course.
+// - Escape (latched after a putt from inside): lighter drag so a full-power escape can
+//   reach 950/7 ≈ 136px, which clears every authored patch — dragged out, never free.
+const FRICTION_STICKY = FRICTION_SAND * 2;
+const FRICTION_STICKY_ESCAPE = 7;
+const STICKY_STOP_SPEED = 40;   // full-stop snap inside goo (exact zero keeps host/client in lockstep)
+const STICKY_LAUNCH_FACTOR = 1; // goo drag itself is the punishment; no launch nerf on top
 const BOUND = { left: 20, top: 20, right: 780, bottom: 480 };
 
 // ---- Small geometry / data helpers ----
@@ -589,7 +591,7 @@ const CANYON_HOLES = [
   },
 ];
 
-// Goo numbers: FRICTION_STICKY bleeds ~22 px/s of speed per px, so patches deeper than
+// Goo numbers: trapping drag bleeds ~16 px/s of speed per px, so patches deeper than
 // ~45 px always trap a crossing ball; a ~20 px strip is a speed filter only max-power putts
 // punch through. Escape putts cap at MAX_LAUNCH_SPEED * 0.45 ≈ 427 (~370 px of reach).
 const STICKY_HOLES = [
@@ -883,7 +885,7 @@ function stepBallPhysics(ball, hole, dt) {
     } else {
       const stickyIdx = stickyIndexAt(ball, hole);
       if (stickyIdx < 0) {
-        // Off the goo entirely: re-arm so the next patch entry traps again.
+        // Off the goo entirely: re-arm so the next patch entry registers again.
         ball.stuckStickyIndex = -1;
         for (const z of hole.sand) {
           if (circleTouchesZone(ball.x, ball.y, BALL_RADIUS, z)) {
@@ -892,12 +894,14 @@ function stepBallPhysics(ball, hole, dt) {
             break;
           }
         }
-      } else if (ball.stuckStickyIndex !== stickyIdx) {
-        // Entering goo (or a different patch) without a latch — sticky drag.
+      } else if (ball.stuckStickyIndex === stickyIdx) {
+        // Latched escape putt: still dragged (never grass), but light enough to get out.
+        friction = FRICTION_STICKY_ESCAPE;
+      } else {
+        // Unlatched entry: full 2x-sand trapping drag.
         friction = FRICTION_STICKY;
         trappingIndex = stickyIdx;
       }
-      // stuckStickyIndex === stickyIdx: escape latch — grass friction until exit.
     }
     if (inSand && !inSandLastStep) events.enteredSand = true;
     inSandLastStep = inSand;
@@ -926,8 +930,10 @@ function stepBallPhysics(ball, hole, dt) {
       // Exact zero — no float crawl that would diverge host/client under sticky drag.
       ball.vx = 0;
       ball.vy = 0;
-      ball.stuckStickyIndex = trappingIndex;
-      events.stuck = true;
+      if (ball.stuckStickyIndex !== trappingIndex) {
+        ball.stuckStickyIndex = trappingIndex;
+        events.stuck = true;
+      }
     }
     ball.x += ball.vx * subDt;
     ball.y += ball.vy * subDt;
@@ -1110,7 +1116,7 @@ return {
   WALL_RESTITUTION, BUMPER_RESTITUTION, PENDULUM_RESTITUTION, GATE_RESTITUTION,
   MAX_DRAG_DIST, MIN_DRAG_DIST, POWER_MULTIPLIER, MAX_LAUNCH_SPEED, BOOST_MAX_SPEED, BOUND,
   RAMP_MIN_SPEED, RAMP_GRAVITY, RAMP_VZ_SCALE, RAMP_VZ_MIN, RAMP_VZ_MAX,
-  FRICTION_STICKY, STICKY_STOP_SPEED, STICKY_LAUNCH_FACTOR,
+  FRICTION_STICKY, FRICTION_STICKY_ESCAPE, STICKY_STOP_SPEED, STICKY_LAUNCH_FACTOR,
   wall, sandRect, waterRect, boostRect, rampRect, stickyRect, pendulum, getPendulumSegment, slidingGate,
   getSlidingGateSegment, ringBumpers, pointInZone, circleTouchesZone, zoneBounds, cupHasGravity,
   BOUNDARY_WALLS, HOLES, COURSES,
