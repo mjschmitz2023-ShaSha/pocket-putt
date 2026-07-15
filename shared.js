@@ -1234,7 +1234,9 @@ const ORBIT_HOLES = [
   {
     name: 'Well Between', par: 3,
     tee: { x: 80, y: 100 }, cup: { x: 700, y: 400, radius: 11 },
-    walls: [], sand: [], water: [waterRect(360, 200, 440, 300, { x: 200, y: 250 })],
+    // Water top edge at 204 (not 200): leaves an ace corridor over the hazard from the
+    // leftmost multiplayer tee slots (verified for every slot at lobby sizes 1..5).
+    walls: [], sand: [], water: [waterRect(360, 204, 440, 300, { x: 200, y: 250 })],
     boost: [],
     pendulums: [], gates: [], windmills: [], ramps: [], sticky: [],
     gravityBodies: [planet(520, 180, 34, 20000, { fieldRadius: 180 })],
