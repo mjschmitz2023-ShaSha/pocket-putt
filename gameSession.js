@@ -190,6 +190,7 @@ class GameSession {
       p.ball = Shared.createBallState(Shared.teePositionFor(slot, roster.length, hole));
       p.strokes = 0;
       p.holedOut = false;
+      p.floating = null; // never carry a hazard float across holes
       p.speedTracker = Shared.createSpeedAvgTracker();
     });
     this.holeStartedAtMs = Date.now();
@@ -399,9 +400,32 @@ class GameSession {
 
     // Physics subticks must match client mpStepOneTick (same dt schedule → sticky latch agrees).
     // Ball-ball interleaved each subtick so fast rams still connect.
+    // Hazard floats first: penalized balls bob and drift with the (deterministic)
+    // waves instead of stepping physics; at the end of the float they take their
+    // slot-indexed spot in the drop zone.
+    for (const p of this.players.values()) {
+      if (!p.connected || p.holedOut || !p.ball || !p.floating) continue;
+      const fl = p.floating;
+      fl.ticks -= 1;
+      Shared.stepWaterFloat(p.ball, fl, fl.zone, this.simTick * TICK_DT, TICK_DT);
+      if (fl.ticks <= 0) {
+        const roster = [...this.players.values()];
+        const idx = Shared.waterDropIndexFor(roster.indexOf(p), p.dunks || 1);
+        const drop = Shared.waterDropPointFor(fl.zone, idx, hole);
+        p.ball.x = drop.x;
+        p.ball.y = drop.y;
+        p.ball.vx = 0;
+        p.ball.vy = 0;
+        Shared.markWetFromWater(p.ball);
+        p.floating = null;
+        // Hard event so every client snaps to the authoritative drop spot.
+        tickEvents.push({ id: p.id, kind: 'water', x: drop.x, y: drop.y });
+      }
+    }
+
     for (let s = 0; s < PHYSICS_SUBTICKS; s++) {
       for (const p of this.players.values()) {
-        if (!p.connected || p.holedOut || !p.ball) continue;
+        if (!p.connected || p.holedOut || !p.ball || p.floating) continue;
         const events = Shared.stepBallPhysics(p.ball, hole, TICK_DT / PHYSICS_SUBTICKS);
         if (!p.speedTracker) p.speedTracker = Shared.createSpeedAvgTracker();
         Shared.noteSpeedSample(
@@ -427,25 +451,21 @@ class GameSession {
           });
         }
         if (events.water) {
+          // Penalty now; the reset comes after a 1.5s float (see the float pass above).
           p.strokes++;
+          p.dunks = (p.dunks || 0) + 1;
           tickEvents.push({ id: p.id, kind: 'water', x: p.ball.x, y: p.ball.y });
-          // Slot-indexed spot in the radial drop zone — a full lobby drowning in the
-          // same pond never stacks on one point. Clients compute the same slot; the
-          // hard water correction is the authoritative safety net either way.
-          const dropRoster = [...this.players.values()];
-          const drop = Shared.waterDropPointFor(
-            events.water,
-            Math.max(0, dropRoster.indexOf(p)),
-            this.currentHoles()[this.currentHoleIndex]
-          );
-          p.ball.x = drop.x;
-          p.ball.y = drop.y;
+          p.floating = {
+            zone: events.water,
+            ticks: Shared.WATER_FLOAT_TICKS,
+            vx: p.ball.vx * Shared.WATER_FLOAT_CARRY,
+            vy: p.ball.vy * Shared.WATER_FLOAT_CARRY,
+          };
           p.ball.vx = 0;
           p.ball.vy = 0;
           p.ball.z = 0;
           p.ball.vz = 0;
           p.ball.stuckStickyIndex = -1;
-          Shared.markWetFromWater(p.ball);
         }
         if (events.blackHole) {
           p.strokes++;
@@ -470,7 +490,7 @@ class GameSession {
       }
 
       const activeNow = [...this.players.values()]
-        .filter((p) => p.connected && p.ball && !p.holedOut)
+        .filter((p) => p.connected && p.ball && !p.holedOut && !p.floating)
         .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
       for (let i = 0; i < activeNow.length; i++) {
         for (let j = i + 1; j < activeNow.length; j++) {
@@ -722,6 +742,7 @@ class GameSession {
     } else if (msg.type === 'respawn') {
       // Escape hatch when a ball never settles (e.g. Orbit gravity loops). No stroke penalty.
       if (this.state !== 'PLAYING' || !player.ball || player.holedOut) return;
+      player.floating = null;
       const hole = this.currentHoles()[this.currentHoleIndex];
       const roster = [...this.players.values()];
       const slot = Math.max(0, roster.indexOf(player));
@@ -742,7 +763,7 @@ class GameSession {
         this.buildCorrection([], { reason: 'resync', includeObstacles: true, hard: true })
       );
     } else if (msg.type === 'putt') {
-      if (this.state !== 'PLAYING' || !player.ball || player.holedOut) return;
+      if (this.state !== 'PLAYING' || !player.ball || player.holedOut || player.floating) return;
       const hole = this.currentHoles()[this.currentHoleIndex];
       if (!player.speedTracker) player.speedTracker = Shared.createSpeedAvgTracker();
       // Clean rest, or quasi-rest (avg |v| near 0 for ~5s) e.g. bumper chatter in gravity.

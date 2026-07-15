@@ -11,6 +11,7 @@ const {
   createBallState, stepBallPhysics, advanceHoleObstacles, setHoleObstaclesAtTick, resetHoleObstacles,
   computeLaunchVelocity, clampDragVector, stickyLaunchFactor, stickyIndexAt, latchStickyAfterPutt,
   markWetFromWater, noteWetPutt, ballMayRestForAim, zoneBounds, waterDropPointFor,
+  waterDropIndexFor, waterWaveFrontAt, stepWaterFloat, WATER_FLOAT_TICKS, WATER_FLOAT_CARRY,
   createSpeedAvgTracker, resetSpeedAvgTracker, noteSpeedSample, isQuasiRest, mayPuttBall,
   teePositionFor,
   decodeHole, encodeHole, normalizeHole, blankHole,
@@ -360,26 +361,9 @@ function updateWaterFloat(dt) {
   const f = Game.waterFloat;
   if (!f) return;
   f.timer -= dt;
-  // Drift with the pond's lead wave (draw.js keeps wave state on the zone itself);
-  // entry momentum decays away so the ball settles into the current.
-  const w = f.zone._waves;
-  const driftSpeed = 14;
-  let dx = 0;
-  let dy = 0;
-  if (w && w.fronts && w.fronts.length) {
-    if (w.vertical) dy = w.fronts[0].dir * driftSpeed;
-    else dx = w.fronts[0].dir * driftSpeed;
-  }
-  Game.ball.x += (dx + f.vx) * dt;
-  Game.ball.y += (dy + f.vy) * dt;
-  const decay = Math.exp(-3 * dt);
-  f.vx *= decay;
-  f.vy *= decay;
-  // Stay afloat inside the waterline (bank pad + ball radius).
-  const b = zoneBounds(f.zone);
-  const pad = 5 + BALL_RADIUS;
-  Game.ball.x = Math.min(Math.max(Game.ball.x, b.x1 + pad), b.x2 - pad);
-  Game.ball.y = Math.min(Math.max(Game.ball.y, b.y1 + pad), b.y2 - pad);
+  // Drift with the pond's lead wave — shared closed-form front on the same clock the
+  // renderer draws with, so the ball visibly rides the wave players see.
+  stepWaterFloat(Game.ball, f, f.zone, performance.now() / 1000, dt);
 
   if (f.timer <= 0) {
     Game.waterFloat = null;
@@ -1814,10 +1798,35 @@ function mpStepOneTick() {
   setHoleObstaclesAtTick(hole, mpSimTick);
 
   const active = [...Game.players.values()].filter((p) => !p.holedOut);
+
+  // Hazard floats mirror the server pass: drift with the deterministic waves,
+  // then take the same slot-indexed drop spot. Hard corrections reconcile drift.
+  for (const p of active) {
+    if (!p.floatTicks || p.floatTicks <= 0) continue;
+    p.floatTicks -= 1;
+    stepWaterFloat(p, p.floatCarry, p.floatZone, mpSimTick * TICK_DT, TICK_DT);
+    p.rx = p.x;
+    p.ry = p.y;
+    if (p.floatTicks <= 0) {
+      const slot = Math.max(0, [...Game.players.keys()].indexOf(p.id));
+      const drop = waterDropPointFor(p.floatZone, waterDropIndexFor(slot, p.dunks || 1), hole);
+      p.x = drop.x;
+      p.y = drop.y;
+      p.vx = 0;
+      p.vy = 0;
+      markWetFromWater(p);
+      p.errX = 0;
+      p.errY = 0;
+      p.rx = p.x;
+      p.ry = p.y;
+      spawnSplash(drop.x, drop.y);
+    }
+  }
+
   // Same PHYSICS_SUBTICKS schedule as the host so sticky stop/latch thresholds match.
   for (let s = 0; s < MP_PHYSICS_SUBTICKS; s++) {
     for (const p of active) {
-      if (p.holedOut) continue;
+      if (p.holedOut || (p.floatTicks && p.floatTicks > 0)) continue;
       const events = stepBallPhysics(p, hole, TICK_DT / MP_PHYSICS_SUBTICKS);
       const mine = p.id === mpPlayerId;
       if (events.bounced && mine) {
@@ -1830,24 +1839,19 @@ function mpStepOneTick() {
         if (mine) soundBoost();
       }
       if (events.water) {
-        // Same slot-indexed drop-zone spot the server picks (roster order matches);
-        // the authoritative hard correction reconciles any residual difference.
-        const slot = Math.max(0, [...Game.players.keys()].indexOf(p.id));
-        const drop = waterDropPointFor(events.water, slot, hole);
-        p.x = drop.x;
-        p.y = drop.y;
+        // Penalty + splash now; the ball floats 1.5s (float pass above) before the
+        // server-matched drop-zone reset.
+        p.strokes += 1;
+        p.dunks = (p.dunks || 0) + 1;
+        p.floatTicks = WATER_FLOAT_TICKS;
+        p.floatZone = events.water;
+        p.floatCarry = { vx: p.vx * WATER_FLOAT_CARRY, vy: p.vy * WATER_FLOAT_CARRY };
         p.vx = 0;
         p.vy = 0;
         p.z = 0;
         p.vz = 0;
         p.stuckStickyIndex = -1;
-        markWetFromWater(p);
-        p.strokes += 1;
-        p.errX = 0;
-        p.errY = 0;
-        p.rx = p.x;
-        p.ry = p.y;
-        spawnSplash(drop.x, drop.y);
+        spawnSplash(p.x, p.y);
         if (mine) {
           soundWater();
           mpShowBanner('SPLASH! +1  ·  WET');

@@ -1828,6 +1828,69 @@ function waterDropPointFor(zone, index, hole) {
   return { x: dp.x, y: dp.y }; // pathological zone: fall back to the original point
 }
 
+// ---- Water waves + hazard float (deterministic, shared by server, clients, renderer) ----
+// Waves are a closed-form triangle sweep along the pond's long axis, seeded by zone
+// geometry: same (zone, k, tSec) → same front everywhere, no state to sync. The float
+// (penalized ball bobbing 1.5s before its drop) drifts with front 0, so the authoritative
+// drift on the server matches the waves every client draws.
+const WATER_WAVE = { speed: 17, followers: 3, slowdown: 0.85, margin: 4 };
+const WATER_FLOAT_TICKS = 45;      // 1.5s at TICK_HZ 30
+const WATER_FLOAT_DRIFT = 14;      // px/s along the lead wave's travel
+const WATER_FLOAT_CARRY = 0.22;    // entry momentum carried into the float (decays)
+
+function zoneWaveSeed(zone) {
+  const b = zoneBounds(zone);
+  return (((b.x1 * 73856093) ^ (b.y1 * 19349663) ^ (b.x2 * 83492791) ^ (b.y2 * 15485863)) >>> 0);
+}
+
+/** Front k of a pond's wave set at time tSec: { pos, dir, vertical }. */
+function waterWaveFrontAt(zone, k, tSec) {
+  const b = zoneBounds(zone);
+  const vertical = (b.y2 - b.y1) > (b.x2 - b.x1);
+  const lo = (vertical ? b.y1 : b.x1) + WATER_WAVE.margin;
+  const hi = (vertical ? b.y2 : b.x2) - WATER_WAVE.margin;
+  const span = Math.max(1, hi - lo);
+  const seed = zoneWaveSeed(zone);
+  const jitter = 0.9 + ((seed % 1000) / 1000) * 0.2;
+  const speed = WATER_WAVE.speed * jitter * Math.pow(WATER_WAVE.slowdown, k);
+  const phase0 = (((seed >>> 10) % 1000) / 1000 + k * 0.16) * span;
+  const dir0 = ((seed >>> 20) & 1) ? 1 : -1;
+  let u = (phase0 + dir0 * speed * tSec) % (2 * span);
+  if (u < 0) u += 2 * span;
+  return u < span
+    ? { pos: lo + u, dir: 1, vertical }
+    : { pos: hi - (u - span), dir: -1, vertical };
+}
+
+/**
+ * One float step: drift `ball` with the lead wave + decaying entry momentum, clamped
+ * inside the waterline. `float` = { vx, vy } entry carry (mutated). Deterministic given
+ * the same tSec/dt schedule — server and predicting clients stay in lockstep.
+ */
+function stepWaterFloat(ball, float, zone, tSec, dt) {
+  const f = waterWaveFrontAt(zone, 0, tSec);
+  const dx = f.vertical ? 0 : f.dir * WATER_FLOAT_DRIFT;
+  const dy = f.vertical ? f.dir * WATER_FLOAT_DRIFT : 0;
+  ball.x += (dx + float.vx) * dt;
+  ball.y += (dy + float.vy) * dt;
+  const decay = Math.exp(-3 * dt);
+  float.vx *= decay;
+  float.vy *= decay;
+  const b = zoneBounds(zone);
+  const pad = 5 + BALL_RADIUS;
+  if (b.x2 - b.x1 > pad * 2) ball.x = Math.min(Math.max(ball.x, b.x1 + pad), b.x2 - pad);
+  else ball.x = (b.x1 + b.x2) / 2;
+  if (b.y2 - b.y1 > pad * 2) ball.y = Math.min(Math.max(ball.y, b.y1 + pad), b.y2 - pad);
+  else ball.y = (b.y1 + b.y2) / 2;
+}
+
+/** Drop index for a drowning: roster slot keeps players separated, the per-player
+ *  dunk counter rotates rings so repeat dunks vary. Slots 0..4 plus ring offsets
+ *  {0,5,10} can never collide across different slots. */
+function waterDropIndexFor(slot, dunkCount) {
+  return Math.max(0, slot) + ((Math.max(1, dunkCount) - 1) % 3) * 5;
+}
+
 // Launch-power multiplier for a ball sitting in sticky goo — every launch site (server putt
 // handler, solo launch, client prediction) applies this identically so the authoritative and
 // predicted escape shots match. Deliberately keyed off position, not `stuckTo`, so even a
@@ -2808,7 +2871,9 @@ return {
   createBallState, stepBallPhysics, advanceHoleObstacles, setHoleObstaclesAtTick, resetHoleObstacles,
   computeLaunchVelocity, clampDragVector, stickyLaunchFactor, stickyIndexAt, latchStickyAfterPutt,
   markWetFromWater, noteWetPutt,
-  resolveBallBallCollision, teePositionFor, waterDropPointFor,
+  resolveBallBallCollision, teePositionFor, waterDropPointFor, waterDropIndexFor,
+  WATER_WAVE, WATER_FLOAT_TICKS, WATER_FLOAT_DRIFT, WATER_FLOAT_CARRY,
+  waterWaveFrontAt, stepWaterFloat,
   LEVEL_CODEC_VERSION, LEVEL_MAX_B64_LEN, LEVEL_MAX_KIND_COUNT, LEVEL_CAPS, LEVEL_MAX_NAME_LEN,
   CODEC_I16_MAX, CODEC_I16_MIN, CODEC_QCOORD_STEP, CODEC_QCOORD_MAX, CODEC_QCOORD_MIN,
   CODEC_QF10_STEP, CODEC_QF10_MAX, CODEC_QF10_MIN, CODEC_QF100_STEP, CODEC_QF100_MAX, CODEC_QF100_MIN,

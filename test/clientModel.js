@@ -375,23 +375,45 @@ class ClientModel {
     this.simTick += 1;
     Shared.setHoleObstaclesAtTick(hole, this.simTick);
     const active = [...this.players.values()].filter((p) => !p.holedOut);
+
+    // Hazard float mirror — same pass, drift, and drop indexing as gameSession.
+    for (const p of active) {
+      if (!p.floatTicks || p.floatTicks <= 0) continue;
+      p.floatTicks -= 1;
+      Shared.stepWaterFloat(p, p.floatCarry, p.floatZone, this.simTick * TICK_DT, TICK_DT);
+      p.rx = p.x;
+      p.ry = p.y;
+      if (p.floatTicks <= 0) {
+        const slot = Math.max(0, [...this.players.keys()].indexOf(p.id));
+        const drop = Shared.waterDropPointFor(p.floatZone, Shared.waterDropIndexFor(slot, p.dunks || 1), hole);
+        p.x = drop.x;
+        p.y = drop.y;
+        p.vx = 0;
+        p.vy = 0;
+        Shared.markWetFromWater(p);
+        p.errX = 0;
+        p.errY = 0;
+        p.rx = p.x;
+        p.ry = p.y;
+      }
+    }
+
     for (let s = 0; s < PHYSICS_SUBTICKS; s++) {
       for (const p of active) {
-        if (p.holedOut) continue;
+        if (p.holedOut || (p.floatTicks && p.floatTicks > 0)) continue;
         const events = Shared.stepBallPhysics(p, hole, TICK_DT / PHYSICS_SUBTICKS);
         if (events.water) {
-          // Slot-indexed drop-zone spot — must mirror gameSession's roster-order pick.
-          const slot = Math.max(0, [...this.players.keys()].indexOf(p.id));
-          const drop = Shared.waterDropPointFor(events.water, slot, hole);
-          p.x = drop.x;
-          p.y = drop.y;
+          // Float start — mirrors gameSession: penalty now, drop after the float.
+          p.strokes += 1;
+          p.dunks = (p.dunks || 0) + 1;
+          p.floatTicks = Shared.WATER_FLOAT_TICKS;
+          p.floatZone = events.water;
+          p.floatCarry = { vx: p.vx * Shared.WATER_FLOAT_CARRY, vy: p.vy * Shared.WATER_FLOAT_CARRY };
           p.vx = 0;
           p.vy = 0;
           p.z = 0;
           p.vz = 0;
           p.stuckStickyIndex = -1;
-          Shared.markWetFromWater(p);
-          p.strokes += 1;
           p.errX = 0;
           p.errY = 0;
           p.rx = p.x;

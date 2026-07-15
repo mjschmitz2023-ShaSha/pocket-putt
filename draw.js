@@ -451,50 +451,27 @@
     ctx.restore();
   }
 
-  const WATER_WAVES = {
-    speed: 17,        // px/s, lead front; followers are each a step slower
-    followers: 3,
-    slowdown: 0.85,   // per-follower speed multiplier
-    bow: 4,           // px the line bows in its direction of travel
-  };
-
-  // One lead wave line + followers sweeping the pond's long axis, reflecting off the
-  // banks (the inset waterline is the boundary). Four strokes per pond, no heightfield.
+  // Waves render from Shared.waterWaveFrontAt — closed-form and deterministic, so the
+  // server's hazard-float drift and every client's rendered waves are the same waves.
+  // Wisps (foam peeling off the wave paths) are client-local decoration only.
   function drawWaterWaves(ctx, z, b, t) {
-    if (!z._waves) {
-      const vertical = (b.y2 - b.y1) > (b.x2 - b.x1);
-      const lo = vertical ? b.y1 : b.x1;
-      const span = (vertical ? b.y2 - b.y1 : b.x2 - b.x1);
-      // Randomize phase + jitter speeds per pond so same-sized neighbors never sync —
-      // synchronized lines in adjacent zones read as one line crossing the terrain between.
-      const fronts = [];
-      const phase = Math.random() * 0.6;
-      const jitter = 0.9 + Math.random() * 0.2;
-      for (let k = 0; k <= WATER_WAVES.followers; k++) {
-        fronts.push({
-          pos: lo + span * ((phase + 0.16 * k) % 0.92 + 0.04),
-          dir: Math.random() < 0.5 ? 1 : -1,
-          speed: WATER_WAVES.speed * jitter * Math.pow(WATER_WAVES.slowdown, k),
-        });
-      }
-      z._waves = { vertical, fronts, wisps: [], nextWispAt: t + 0.4, lastT: null };
-    }
+    if (!S.waterWaveFrontAt) return;
+    if (!z._waves) z._waves = { wisps: [], nextWispAt: t + 0.4, lastT: null };
     const w = z._waves;
     const dt = w.lastT == null ? 0 : Math.min(0.1, Math.max(0, t - w.lastT));
     w.lastT = t;
-    const lo = (w.vertical ? b.y1 : b.x1) + 3;
-    const hi = (w.vertical ? b.y2 : b.x2) - 3;
     ctx.lineCap = 'round';
 
-    // Wake: small foam wisps that peel off a wave's path and get gently left behind,
-    // spreading and fading as the line moves on. Drawn under the lines.
+    const followers = (S.WATER_WAVE && S.WATER_WAVE.followers) || 3;
+    const lead = S.waterWaveFrontAt(z, 0, t);
+
+    // Wake wisps: spawn on the lead front, get gently left astern, spread and fade.
     if (t >= w.nextWispAt && dt > 0) {
       w.nextWispAt = t + 0.35 + Math.random() * 0.6;
-      const f = w.fronts[Math.floor(Math.random() * w.fronts.length)];
       w.wisps.push({
         across: 0.15 + Math.random() * 0.7,
-        pos: f.pos - f.dir * 2,
-        dir: f.dir,
+        pos: lead.pos - lead.dir * 2,
+        dir: lead.dir,
         len: 7 + Math.random() * 8,
         age: 0,
       });
@@ -505,14 +482,14 @@
       const s = w.wisps[i];
       s.age += dt;
       if (s.age >= WISP_LIFE) { w.wisps.splice(i, 1); continue; }
-      s.pos -= s.dir * 3 * dt; // drift softly astern of the wave that shed it
+      s.pos -= s.dir * 3 * dt;
       const life = s.age / WISP_LIFE;
       const alpha = 0.16 * (1 - life);
       const half = (s.len * (1 + 0.45 * life)) / 2;
       ctx.strokeStyle = 'rgba(255,255,255,' + alpha.toFixed(3) + ')';
       ctx.lineWidth = 1.2;
       ctx.beginPath();
-      if (w.vertical) {
+      if (lead.vertical) {
         const cx = b.x1 + 4 + s.across * (b.x2 - b.x1 - 8);
         ctx.moveTo(cx - half, s.pos);
         ctx.quadraticCurveTo(cx, s.pos + s.dir * 2, cx + half, s.pos);
@@ -523,16 +500,15 @@
       }
       ctx.stroke();
     }
-    for (let k = w.fronts.length - 1; k >= 0; k--) {
-      const f = w.fronts[k];
-      f.pos += f.dir * f.speed * dt;
-      if (f.pos > hi) { f.pos = hi; f.dir = -1; }
-      if (f.pos < lo) { f.pos = lo; f.dir = 1; }
+
+    // Lead line + followers (followers drawn first so the lead sits on top).
+    for (let k = followers; k >= 0; k--) {
+      const f = S.waterWaveFrontAt(z, k, t);
       ctx.strokeStyle = 'rgba(255,255,255,' + (k === 0 ? 0.22 : 0.16 - 0.035 * k).toFixed(3) + ')';
       ctx.lineWidth = k === 0 ? 2 : 1.4;
-      const bow = f.dir * WATER_WAVES.bow;
+      const bow = f.dir * 4;
       ctx.beginPath();
-      if (w.vertical) {
+      if (f.vertical) {
         ctx.moveTo(b.x1 + 4, f.pos);
         ctx.quadraticCurveTo((b.x1 + b.x2) / 2, f.pos + bow, b.x2 - 4, f.pos);
       } else {
