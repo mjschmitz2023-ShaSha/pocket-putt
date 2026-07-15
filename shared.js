@@ -1806,20 +1806,28 @@ function clampDragVector(v) {
 
 // ---- Custom level codec (URL ?lvl= base64url, independent of ?room=) ----
 // v2: windmill phase0 (radians) packed after rotationSpeed. v1 decodes with phase0=0.
-const LEVEL_CODEC_VERSION = 2;
+// v3: gravity body radius/mass/fieldRadius/drawRadius as f32 (v1/v2 used i16 qCoord/qF10:
+//     mass clamped at 3276.7; radius quantum 0.1 so sub-0.05 radii became 0 then
+//     normalizeGravityBody's `|| 10` reset them to 10).
+const LEVEL_CODEC_VERSION = 3;
 const LEVEL_MAX_B64_LEN = 4096;
 const LEVEL_MAX_NAME_LEN = 40;
+// Array lengths are packed as u8 in the share codec — hard ceiling per kind is 255.
+// The real design budget is LEVEL_MAX_B64_LEN (total share string); we do not impose
+// lower per-kind art limits (old LEVEL_CAPS walls:40, sand:20, … were arbitrary).
+const LEVEL_MAX_KIND_COUNT = 255;
+/** @deprecated Use LEVEL_MAX_KIND_COUNT; kept so callers reading LEVEL_CAPS.* still get 255. */
 const LEVEL_CAPS = {
-  walls: 40,
-  sand: 20,
-  water: 20,
-  boost: 20,
-  ramps: 20,
-  sticky: 20,
-  pendulums: 6,
-  gates: 6,
-  windmills: 6,
-  gravityBodies: 8,
+  walls: LEVEL_MAX_KIND_COUNT,
+  sand: LEVEL_MAX_KIND_COUNT,
+  water: LEVEL_MAX_KIND_COUNT,
+  boost: LEVEL_MAX_KIND_COUNT,
+  ramps: LEVEL_MAX_KIND_COUNT,
+  sticky: LEVEL_MAX_KIND_COUNT,
+  pendulums: LEVEL_MAX_KIND_COUNT,
+  gates: LEVEL_MAX_KIND_COUNT,
+  windmills: LEVEL_MAX_KIND_COUNT,
+  gravityBodies: LEVEL_MAX_KIND_COUNT,
 };
 
 function blankHole(overrides) {
@@ -1861,6 +1869,145 @@ function qF10(v) {
   return Math.max(-32768, Math.min(32767, n));
 }
 function uqF10(n) { return n / 10; }
+
+// ---- Share-link quantizer limits (i16 fields still used outside gravity v3 f32) ----
+// Editor should refuse values outside these so users never author something that
+// silently clamps on encode. Gravity radius/mass/field/draw use f32 in v3+ (no max here).
+const CODEC_I16_MAX = 32767;
+const CODEC_I16_MIN = -32768;
+const CODEC_QCOORD_STEP = 0.1;
+const CODEC_QCOORD_MAX = CODEC_I16_MAX / 10; // 3276.7
+const CODEC_QCOORD_MIN = CODEC_I16_MIN / 10; // -3276.8
+const CODEC_QF10_STEP = 0.1;
+const CODEC_QF10_MAX = CODEC_I16_MAX / 10; // 3276.7
+const CODEC_QF10_MIN = 0; // boost power / ramp minSpeed — non-negative
+const CODEC_QF100_STEP = 0.01;
+const CODEC_QF100_MAX = CODEC_I16_MAX / 100; // 327.67
+const CODEC_QF100_MIN = CODEC_I16_MIN / 100; // -327.68
+
+function codecClamp(v, lo, hi) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return lo;
+  return Math.max(lo, Math.min(hi, n));
+}
+function codecQuantize(v, step) {
+  if (!(step > 0)) return v;
+  const q = Math.round(v / step) * step;
+  // Avoid ugly float noise (e.g. 1.0000000002)
+  const decimals = step >= 1 ? 0 : Math.max(0, Math.round(-Math.log10(step)));
+  return Number(q.toFixed(decimals));
+}
+/** Positions / lengths / moon orbit radius — qCoord (0.1). */
+function clampCodecQCoord(v, opts) {
+  opts = opts || {};
+  const lo = opts.min != null ? opts.min : CODEC_QCOORD_MIN;
+  const hi = opts.max != null ? opts.max : CODEC_QCOORD_MAX;
+  let n = codecClamp(v, lo, hi);
+  if (opts.quantize !== false) n = codecQuantize(n, CODEC_QCOORD_STEP);
+  return n;
+}
+/** Boost power / ramp minSpeed — qF10 (0.1), ≥0. */
+function clampCodecQF10(v, opts) {
+  opts = opts || {};
+  const lo = opts.min != null ? opts.min : CODEC_QF10_MIN;
+  const hi = opts.max != null ? opts.max : CODEC_QF10_MAX;
+  let n = codecClamp(v, lo, hi);
+  if (opts.quantize !== false) n = codecQuantize(n, CODEC_QF10_STEP);
+  return n;
+}
+/** Angles / periods / phase0 / rotationSpeed — qF100 (0.01). */
+function clampCodecQF100(v, opts) {
+  opts = opts || {};
+  const lo = opts.min != null ? opts.min : CODEC_QF100_MIN;
+  const hi = opts.max != null ? opts.max : CODEC_QF100_MAX;
+  let n = codecClamp(v, lo, hi);
+  if (opts.quantize !== false) n = codecQuantize(n, CODEC_QF100_STEP);
+  return n;
+}
+/**
+ * Clamp a single editor property to share-link-legal range for its selection kind.
+ * Gravity radius/mass/field/draw are codec-v3 f32 (only positivity enforced).
+ */
+function clampEditorProp(selKind, key, value) {
+  const k = key;
+  // Gravity body free floats (v3)
+  if (selKind === 'gravityBodies') {
+    if (k === 'radius' || k === 'fieldRadius' || k === 'drawRadius') {
+      return Math.max(0.001, Number(value) || 0.001);
+    }
+    if (k === 'mass') {
+      return Math.max(0.01, Number(value) || 0.01);
+    }
+    if (k === 'orbitPeriodTicks') {
+      return Math.max(1, Math.min(CODEC_I16_MAX, Math.round(Number(value) || 1)));
+    }
+    if (k === 'orbitRadius') {
+      return clampCodecQCoord(value, { min: 0 });
+    }
+    if (k === 'orbitPhase0') {
+      return clampCodecQF100(value);
+    }
+    if (k === 'ocx' || k === 'ocy' || k === 'x' || k === 'y') {
+      return clampCodecQCoord(value);
+    }
+  }
+  if (k === 'blades') {
+    return Math.max(2, Math.min(255, Math.round(Number(value) || 4)));
+  }
+  if (k === 'power' || k === 'minSpeed') {
+    return clampCodecQF10(value);
+  }
+  // Spatial qCoord
+  if (
+    k === 'x' || k === 'y' || k === 'x1' || k === 'y1' || k === 'x2' || k === 'y2' ||
+    k === 'cx' || k === 'cy' || k === 'dropX' || k === 'dropY' ||
+    k === 'length' || k === 'armLength'
+  ) {
+    const min = (k === 'length' || k === 'armLength') ? 0 : CODEC_QCOORD_MIN;
+    return clampCodecQCoord(value, { min });
+  }
+  if (k === 'radius' && selKind === 'cup') {
+    return clampCodecQCoord(value, { min: 0.1 });
+  }
+  // Gate travel is spatial; pendulum amplitude is angular
+  if (k === 'amplitude') {
+    if (selKind === 'gates') return clampCodecQCoord(value, { min: 0 });
+    return clampCodecQF100(value);
+  }
+  if (
+    k === 'angle' || k === 'angleCenter' || k === 'period' ||
+    k === 'phase0' || k === 'rotationSpeed'
+  ) {
+    const min = (k === 'period') ? 0.01 : CODEC_QF100_MIN;
+    return clampCodecQF100(value, { min });
+  }
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
+/** Mutate object in place so every numeric field is share-link legal. */
+function clampObjectForCodec(selKind, obj) {
+  if (!obj || typeof obj !== 'object') return obj;
+  const keys = Object.keys(obj);
+  for (const k of keys) {
+    if (k === 'dropPoint' && obj.dropPoint) {
+      obj.dropPoint.x = clampEditorProp(selKind, 'dropX', obj.dropPoint.x);
+      obj.dropPoint.y = clampEditorProp(selKind, 'dropY', obj.dropPoint.y);
+      continue;
+    }
+    if (k === 'orbitCenter' && obj.orbitCenter) {
+      obj.orbitCenter.x = clampEditorProp(selKind, 'ocx', obj.orbitCenter.x);
+      obj.orbitCenter.y = clampEditorProp(selKind, 'ocy', obj.orbitCenter.y);
+      continue;
+    }
+    if (typeof obj[k] === 'number') {
+      // bumper bool skip; kind string skip — already numbers only
+      if (k === 'bumper' || k === 'shape' || k === 'kind' || k === 'axis') continue;
+      obj[k] = clampEditorProp(selKind, k, obj[k]);
+    }
+  }
+  return obj;
+}
 
 function bytesFromBase64Url(str) {
   if (typeof str !== 'string' || !str) return null;
@@ -1906,6 +2053,15 @@ ByteWriter.prototype.i16 = function (v) {
   this.buf[this.i++] = x & 0xff;
   this.buf[this.i++] = (x >> 8) & 0xff;
 };
+/** IEEE-754 little-endian float32. Used by codec v3+ for gravity scalars. */
+ByteWriter.prototype.f32 = function (v) {
+  this.ensure(4);
+  const n = Number(v);
+  const f = Number.isFinite(n) ? n : 0;
+  const dv = new DataView(this.buf.buffer, this.buf.byteOffset + this.i, 4);
+  dv.setFloat32(0, f, true);
+  this.i += 4;
+};
 ByteWriter.prototype.bytes = function () {
   return this.buf.subarray(0, this.i);
 };
@@ -1927,21 +2083,36 @@ ByteReader.prototype.i16 = function () {
   if (v & 0x8000) v = v - 0x10000;
   return v;
 };
+ByteReader.prototype.f32 = function () {
+  if (this.i + 4 > this.buf.length) throw new Error('eof');
+  const dv = new DataView(this.buf.buffer, this.buf.byteOffset + this.i, 4);
+  const v = dv.getFloat32(0, true);
+  this.i += 4;
+  return Number.isFinite(v) ? v : 0;
+};
 
 function normalizeGravityBody(b) {
   if (!b || typeof b !== 'object') return null;
   const kind = b.kind;
   if (kind !== 'planet' && kind !== 'blackHole' && kind !== 'moon') return null;
-  const radius = Number(b.radius) || 10;
-  const mass = Number(b.mass) || 1;
+  // Do not use `|| default` for radius/mass: codec v1/v2 could quantize tiny radii to 0,
+  // and `0 || 10` silently rewrote them to 10 on every normalize/load.
+  let radius = Number(b.radius);
+  if (!Number.isFinite(radius) || radius <= 0) radius = 10;
+  let mass = Number(b.mass);
+  if (!Number.isFinite(mass) || mass <= 0) mass = 1;
   const body = {
     kind,
     x: Number(b.x) || 0,
     y: Number(b.y) || 0,
     radius,
     mass,
-    fieldRadius: b.fieldRadius != null ? Number(b.fieldRadius) : radius * 6,
-    drawRadius: b.drawRadius != null ? Number(b.drawRadius) : (kind === 'blackHole' ? Math.min(radius, 5) : radius),
+    fieldRadius: b.fieldRadius != null && Number.isFinite(Number(b.fieldRadius))
+      ? Number(b.fieldRadius)
+      : radius * 6,
+    drawRadius: b.drawRadius != null && Number.isFinite(Number(b.drawRadius))
+      ? Number(b.drawRadius)
+      : (kind === 'blackHole' ? Math.min(radius, 5) : radius),
   };
   if (kind === 'moon') {
     const oc = b.orbitCenter || { x: body.x, y: body.y };
@@ -2074,9 +2245,16 @@ function validateHole(raw) {
   }
   if (hole.par < 1 || hole.par > 10) return { ok: false, error: 'bad_par' };
   const counts = holeObjectCounts(hole);
-  for (const key of Object.keys(LEVEL_CAPS)) {
-    if (counts[key] > LEVEL_CAPS[key]) {
-      return { ok: false, error: 'over_cap', field: key, count: counts[key], max: LEVEL_CAPS[key] };
+  for (const key of Object.keys(counts)) {
+    if (counts[key] > LEVEL_MAX_KIND_COUNT) {
+      // Codec packs each array length as u8 — more than 255 of one kind cannot be encoded.
+      return {
+        ok: false,
+        error: 'over_cap',
+        field: key,
+        count: counts[key],
+        max: LEVEL_MAX_KIND_COUNT,
+      };
     }
   }
   const margin = 40;
@@ -2189,8 +2367,9 @@ function packHoleBytes(hole) {
       const kindCode = b.kind === 'blackHole' ? 1 : b.kind === 'moon' ? 2 : 0;
       w.u8(kindCode);
       w.i16(qCoord(b.x)); w.i16(qCoord(b.y));
-      w.i16(qCoord(b.radius)); w.i16(qF10(b.mass));
-      w.i16(qCoord(b.fieldRadius)); w.i16(qCoord(b.drawRadius));
+      // v3+: full float range for gravity scalars (tiny BH horizons + Orbit-scale mass).
+      w.f32(b.radius); w.f32(b.mass);
+      w.f32(b.fieldRadius); w.f32(b.drawRadius);
       if (kindCode === 2) {
         w.i16(qCoord(b.orbitCenter.x)); w.i16(qCoord(b.orbitCenter.y));
         w.i16(qCoord(b.orbitRadius));
@@ -2216,8 +2395,8 @@ function packHoleBytes(hole) {
 function unpackHoleBytes(bytes) {
   const r = new ByteReader(bytes);
   const ver = r.u8();
-  // Accept current and prior (v1) layouts; unknown versions reject.
-  if (ver !== LEVEL_CODEC_VERSION && ver !== 1) {
+  // Accept current and prior layouts; unknown versions reject.
+  if (ver !== LEVEL_CODEC_VERSION && ver !== 1 && ver !== 2) {
     const err = new Error('bad_version');
     err.code = 'bad_version';
     err.version = ver;
@@ -2320,8 +2499,19 @@ function unpackHoleBytes(bytes) {
     for (let i = 0; i < n; i++) {
       const kindCode = r.u8();
       const x = uqCoord(r.i16()), y = uqCoord(r.i16());
-      const radius = uqCoord(r.i16()), mass = uqF10(r.i16());
-      const fieldRadius = uqCoord(r.i16()), drawRadius = uqCoord(r.i16());
+      let radius, mass, fieldRadius, drawRadius;
+      if (ver >= 3) {
+        radius = r.f32();
+        mass = r.f32();
+        fieldRadius = r.f32();
+        drawRadius = r.f32();
+      } else {
+        // v1/v2: 0.1 px radius, mass×10 in i16 (mass max 3276.7).
+        radius = uqCoord(r.i16());
+        mass = uqF10(r.i16());
+        fieldRadius = uqCoord(r.i16());
+        drawRadius = uqCoord(r.i16());
+      }
       if (kindCode === 2) {
         const ocx = uqCoord(r.i16()), ocy = uqCoord(r.i16());
         const orbitRadius = uqCoord(r.i16());
@@ -2568,7 +2758,10 @@ return {
   computeLaunchVelocity, clampDragVector, stickyLaunchFactor, stickyIndexAt, latchStickyAfterPutt,
   markWetFromWater, noteWetPutt,
   resolveBallBallCollision, teePositionFor,
-  LEVEL_CODEC_VERSION, LEVEL_MAX_B64_LEN, LEVEL_CAPS, LEVEL_MAX_NAME_LEN,
+  LEVEL_CODEC_VERSION, LEVEL_MAX_B64_LEN, LEVEL_MAX_KIND_COUNT, LEVEL_CAPS, LEVEL_MAX_NAME_LEN,
+  CODEC_I16_MAX, CODEC_I16_MIN, CODEC_QCOORD_STEP, CODEC_QCOORD_MAX, CODEC_QCOORD_MIN,
+  CODEC_QF10_STEP, CODEC_QF10_MAX, CODEC_QF10_MIN, CODEC_QF100_STEP, CODEC_QF100_MAX, CODEC_QF100_MIN,
+  clampCodecQCoord, clampCodecQF10, clampCodecQF100, clampEditorProp, clampObjectForCodec,
   blankHole, normalizeHole, validateHole, encodeHole, decodeHole,
   packHoleBytes, unpackHoleBytes, simulateTrajectory, createTrajectorySim, stepTrajectorySim,
   TRAJECTORY_SAFETY_MAX_TICKS, deepCloneHole, holeObjectCounts,

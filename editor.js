@@ -17,6 +17,11 @@
     speedAvg, QUASI_REST_WINDOW_S,
     getWindmillBlades, getPendulumSegment, getSlidingGateSegment,
     COURSES, zoneBounds, TICK_DT,
+    CODEC_QCOORD_STEP, CODEC_QCOORD_MIN, CODEC_QCOORD_MAX,
+    CODEC_QF10_STEP, CODEC_QF10_MIN, CODEC_QF10_MAX,
+    CODEC_QF100_STEP, CODEC_QF100_MIN, CODEC_QF100_MAX,
+    CODEC_I16_MAX,
+    clampEditorProp, clampObjectForCodec,
   } = S;
 
   const SNAP = 5;
@@ -328,55 +333,80 @@
       return;
     }
     const fields = [];
-    function num(key, label, step) {
-      fields.push(`<label>${label}<input data-k="${key}" type="number" step="${step || 1}" value="${obj[key] != null ? obj[key] : ''}"></label>`);
+    // min/max/step match share-link quantizers (see Shared.CODEC_* / clampEditorProp).
+    function num(key, label, step, min, max) {
+      const v = obj[key] != null ? obj[key] : '';
+      let attrs = `data-k="${key}" type="number" step="${step != null ? step : 1}" value="${v}"`;
+      if (min != null && Number.isFinite(min)) attrs += ` min="${min}"`;
+      if (max != null && Number.isFinite(max)) attrs += ` max="${max}"`;
+      fields.push(`<label>${label}<input ${attrs}></label>`);
     }
+    const qc = CODEC_QCOORD_STEP, qclo = CODEC_QCOORD_MIN, qchi = CODEC_QCOORD_MAX;
+    const q10 = CODEC_QF10_STEP, q10lo = CODEC_QF10_MIN, q10hi = CODEC_QF10_MAX;
+    const q100 = CODEC_QF100_STEP, q100lo = CODEC_QF100_MIN, q100hi = CODEC_QF100_MAX;
     if (selection.kind === 'tee' || selection.kind === 'cup') {
-      num('x', 'X', 1); num('y', 'Y', 1);
-      if (selection.kind === 'cup') num('radius', 'Radius', 0.5);
+      num('x', 'X', qc, qclo, qchi); num('y', 'Y', qc, qclo, qchi);
+      if (selection.kind === 'cup') num('radius', 'Radius', qc, 0.1, qchi);
     } else if (selection.kind === 'walls') {
-      num('x1', 'X1'); num('y1', 'Y1'); num('x2', 'X2'); num('y2', 'Y2');
+      num('x1', 'X1', qc, qclo, qchi); num('y1', 'Y1', qc, qclo, qchi);
+      num('x2', 'X2', qc, qclo, qchi); num('y2', 'Y2', qc, qclo, qchi);
       fields.push(`<label><input data-k="bumper" type="checkbox" ${obj.bumper ? 'checked' : ''}> Bumper</label>`);
     } else if (selection.kind === 'sand' || selection.kind === 'sticky') {
-      num('x1', 'X1'); num('y1', 'Y1'); num('x2', 'X2'); num('y2', 'Y2');
+      num('x1', 'X1', qc, qclo, qchi); num('y1', 'Y1', qc, qclo, qchi);
+      num('x2', 'X2', qc, qclo, qchi); num('y2', 'Y2', qc, qclo, qchi);
     } else if (selection.kind === 'water') {
-      num('x1', 'X1'); num('y1', 'Y1'); num('x2', 'X2'); num('y2', 'Y2');
-      fields.push(`<label>Drop X<input data-k="dropX" type="number" step="1" value="${obj.dropPoint ? obj.dropPoint.x : ''}"></label>`);
-      fields.push(`<label>Drop Y<input data-k="dropY" type="number" step="1" value="${obj.dropPoint ? obj.dropPoint.y : ''}"></label>`);
+      num('x1', 'X1', qc, qclo, qchi); num('y1', 'Y1', qc, qclo, qchi);
+      num('x2', 'X2', qc, qclo, qchi); num('y2', 'Y2', qc, qclo, qchi);
+      const dx = obj.dropPoint ? obj.dropPoint.x : '';
+      const dy = obj.dropPoint ? obj.dropPoint.y : '';
+      fields.push(`<label>Drop X<input data-k="dropX" type="number" step="${qc}" min="${qclo}" max="${qchi}" value="${dx}"></label>`);
+      fields.push(`<label>Drop Y<input data-k="dropY" type="number" step="${qc}" min="${qclo}" max="${qchi}" value="${dy}"></label>`);
     } else if (selection.kind === 'boost') {
-      num('x1', 'X1'); num('y1', 'Y1'); num('x2', 'X2'); num('y2', 'Y2');
-      num('angle', 'Angle (rad)', 0.05); num('power', 'Power', 10);
+      num('x1', 'X1', qc, qclo, qchi); num('y1', 'Y1', qc, qclo, qchi);
+      num('x2', 'X2', qc, qclo, qchi); num('y2', 'Y2', qc, qclo, qchi);
+      num('angle', 'Angle (rad)', q100, q100lo, q100hi);
+      num('power', 'Power', q10, q10lo, q10hi);
     } else if (selection.kind === 'ramps') {
-      num('x1', 'X1'); num('y1', 'Y1'); num('x2', 'X2'); num('y2', 'Y2');
-      num('angle', 'Angle (rad)', 0.05); num('minSpeed', 'Min speed', 10);
+      num('x1', 'X1', qc, qclo, qchi); num('y1', 'Y1', qc, qclo, qchi);
+      num('x2', 'X2', qc, qclo, qchi); num('y2', 'Y2', qc, qclo, qchi);
+      num('angle', 'Angle (rad)', q100, q100lo, q100hi);
+      num('minSpeed', 'Min speed', q10, q10lo, q10hi);
     } else if (selection.kind === 'pendulums') {
-      num('cx', 'CX'); num('cy', 'CY'); num('length', 'Length');
-      num('angleCenter', 'Angle center', 0.05); num('amplitude', 'Amplitude', 0.05);
-      num('period', 'Period', 0.05);
-      // Design-time offset in seconds; live phase = phase0 + elapsed (shared clock).
-      num('phase0', 'Phase offset (s)', 0.05);
+      num('cx', 'CX', qc, qclo, qchi); num('cy', 'CY', qc, qclo, qchi);
+      num('length', 'Length', qc, 0, qchi);
+      num('angleCenter', 'Angle center', q100, q100lo, q100hi);
+      num('amplitude', 'Amplitude', q100, q100lo, q100hi);
+      num('period', 'Period', q100, 0.01, q100hi);
+      num('phase0', 'Phase offset (s)', q100, q100lo, q100hi);
     } else if (selection.kind === 'gates') {
-      num('x1', 'X1'); num('y1', 'Y1'); num('x2', 'X2'); num('y2', 'Y2');
+      num('x1', 'X1', qc, qclo, qchi); num('y1', 'Y1', qc, qclo, qchi);
+      num('x2', 'X2', qc, qclo, qchi); num('y2', 'Y2', qc, qclo, qchi);
       fields.push(`<label>Axis<select data-k="axis"><option value="x" ${obj.axis === 'x' ? 'selected' : ''}>x</option><option value="y" ${obj.axis === 'y' ? 'selected' : ''}>y</option></select></label>`);
-      num('amplitude', 'Amplitude'); num('period', 'Period', 0.05);
-      num('phase0', 'Phase offset (s)', 0.05);
+      num('amplitude', 'Amplitude', qc, 0, qchi);
+      num('period', 'Period', q100, 0.01, q100hi);
+      num('phase0', 'Phase offset (s)', q100, q100lo, q100hi);
     } else if (selection.kind === 'windmills') {
-      num('cx', 'CX'); num('cy', 'CY'); num('armLength', 'Arm'); num('blades', 'Blades');
-      num('rotationSpeed', 'Rot speed', 0.05);
-      // Design-time angular offset (radians); angle = phase0 + rotationSpeed * t.
-      num('phase0', 'Phase offset (rad)', 0.05);
+      num('cx', 'CX', qc, qclo, qchi); num('cy', 'CY', qc, qclo, qchi);
+      num('armLength', 'Arm', qc, 0, qchi);
+      num('blades', 'Blades', 1, 2, 255);
+      num('rotationSpeed', 'Rot speed', q100, q100lo, q100hi);
+      num('phase0', 'Phase offset (rad)', q100, q100lo, q100hi);
     } else if (selection.kind === 'gravityBodies') {
       fields.push(`<p class="muted">${obj.kind}</p>`);
       if (obj.kind === 'moon') {
-        fields.push(`<label>Orbit CX<input data-k="ocx" type="number" value="${obj.orbitCenter.x}"></label>`);
-        fields.push(`<label>Orbit CY<input data-k="ocy" type="number" value="${obj.orbitCenter.y}"></label>`);
-        num('orbitRadius', 'Orbit R'); num('orbitPeriodTicks', 'Period ticks');
-        num('orbitPhase0', 'Phase offset (rad)', 0.05);
+        fields.push(`<label>Orbit CX<input data-k="ocx" type="number" step="${qc}" min="${qclo}" max="${qchi}" value="${obj.orbitCenter.x}"></label>`);
+        fields.push(`<label>Orbit CY<input data-k="ocy" type="number" step="${qc}" min="${qclo}" max="${qchi}" value="${obj.orbitCenter.y}"></label>`);
+        num('orbitRadius', 'Orbit R', qc, 0, qchi);
+        num('orbitPeriodTicks', 'Period ticks', 1, 1, CODEC_I16_MAX);
+        num('orbitPhase0', 'Phase offset (rad)', q100, q100lo, q100hi);
       } else {
-        num('x', 'X'); num('y', 'Y');
+        num('x', 'X', qc, qclo, qchi); num('y', 'Y', qc, qclo, qchi);
       }
-      num('radius', 'Radius'); num('mass', 'Mass', 0.5);
-      num('fieldRadius', 'Field R'); num('drawRadius', 'Draw R');
+      // radius/mass/field/draw: codec v3 f32 — no share-link max, only positivity
+      num('radius', 'Radius', 0.001, 0.001, null);
+      num('mass', 'Mass', 0.5, 0.01, null);
+      num('fieldRadius', 'Field R', 0.1, 0.001, null);
+      num('drawRadius', 'Draw R', 0.001, 0.001, null);
     }
     propFields.innerHTML = fields.join('');
     propFields.querySelectorAll('input,select').forEach((el) => {
@@ -422,17 +452,24 @@
     }
     if (k === 'dropX' || k === 'dropY') {
       if (!obj.dropPoint) obj.dropPoint = { x: 0, y: 0 };
-      obj.dropPoint[k === 'dropX' ? 'x' : 'y'] = Number(el.value);
+      const clamped = clampEditorProp(selection.kind, k, el.value);
+      obj.dropPoint[k === 'dropX' ? 'x' : 'y'] = clamped;
+      if (el.type === 'number' && Number(el.value) !== clamped) el.value = String(clamped);
       return;
     }
     if (k === 'ocx' || k === 'ocy') {
-      obj.orbitCenter[k === 'ocx' ? 'x' : 'y'] = Number(el.value);
+      const clamped = clampEditorProp(selection.kind, k, el.value);
+      obj.orbitCenter[k === 'ocx' ? 'x' : 'y'] = clamped;
+      if (el.type === 'number' && Number(el.value) !== clamped) el.value = String(clamped);
       applyLivePoseFromPhase0(obj, 'gravityBodies');
       return;
     }
-    const n = Number(el.value);
-    if (!Number.isFinite(n) && el.tagName !== 'SELECT') return;
+    const raw = Number(el.value);
+    if (!Number.isFinite(raw) && el.tagName !== 'SELECT') return;
+    const n = clampEditorProp(selection.kind, k, raw);
     obj[k] = n;
+    // Reflect clamp back into the field so the UI never shows a non-shareable value.
+    if (el.type === 'number' && Number(el.value) !== n) el.value = String(n);
     if (selection.kind === 'walls') {
       hole.walls[selection.index] = wall(obj.x1, obj.y1, obj.x2, obj.y2, { bumper: !!obj.bumper });
     }
@@ -655,6 +692,8 @@
         setMoonPoseAtTick: S.setMoonPoseAtTick,
         tick: Math.floor(hole._orbitTick || 0),
       });
+      // Keep drag results within share-link quantizer limits (power, orbit R, etc.).
+      if (typeof clampObjectForCodec === 'function') clampObjectForCodec(selection.kind, obj);
       if (tag && tag.rebuildWall && selection.kind === 'walls') {
         hole.walls[selection.index] = wall(obj.x1, obj.y1, obj.x2, obj.y2, { bumper: !!st.bumper });
       }
@@ -1155,8 +1194,13 @@
   function enterTest() {
     const v = validateHole(hole);
     if (!v.ok && v.error === 'over_cap') {
-      setStatus('Over cap — fix counts before test: ' + (v.field || ''), true);
+      setStatus(
+        'Too many ' + (v.field || 'objects') + ' (max ' + (v.max || 255) + ' per kind in share format)',
+        true
+      );
       // still allow test of local draft for design
+    } else if (!v.ok && v.error === 'oversize') {
+      setStatus('Share link too large (' + (v.size || '?') + ' > ' + (v.max || 4096) + ' chars) — remove objects', true);
     }
     draftSnapshot = deepCloneHole(hole);
     hole = deepCloneHole(hole);
