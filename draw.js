@@ -486,6 +486,21 @@
     ctx.save();
     ctx.translate(cx, cy);
     ctx.rotate(ang);
+    // Cast shadow, sheared by height: hugs the base at the low end, pushed past the
+    // lip and sideways at the high end so the launch edge reads as raised off the green.
+    const drop = Math.min(10, Math.max(6, hh * 0.28));
+    const shadowQuad = (grow, alpha) => {
+      ctx.fillStyle = 'rgba(0,0,0,' + alpha + ')';
+      ctx.beginPath();
+      ctx.moveTo(-hw + 1, -hh + 1.5 - grow * 0.4);
+      ctx.lineTo(hw + drop + grow, -hh + drop * 0.55 - grow);
+      ctx.lineTo(hw + drop + grow, hh + drop + grow);
+      ctx.lineTo(-hw + 1, hh + 1.5 + grow * 0.4);
+      ctx.closePath();
+      ctx.fill();
+    };
+    shadowQuad(2.5, 0.12); // soft penumbra
+    shadowQuad(0, 0.28);   // core shadow
     // Local +x = launch direction after rotation.
     const grad = ctx.createLinearGradient(-hw, 0, hw, 0);
     grad.addColorStop(0, '#8a6a3f');
