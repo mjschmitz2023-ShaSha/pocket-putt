@@ -741,12 +741,20 @@ function drawWorld() {
     flagPhase: Game.flagPhase,
   });
 
+  // Black-hole tracers: each ball entering a black hole's pull claims its own color.
+  // Drawn BEFORE equipped cosmetic trails so it extends off the tail end of them.
   if (MULTIPLAYER) {
+    for (const b of Game.players.values()) {
+      Draw.updateTracerTrail(b, b.rx, b.ry, hole, 30);
+      Draw.drawTracerTrail(ctx, b);
+    }
     for (const b of Game.players.values()) {
       if (b.trail && b.trailPts) drawTrailPts(b.trailPts, b.trail);
     }
     for (const [id, b] of Game.players) drawMultiplayerBall(b, id === mpPlayerId);
   } else {
+    Draw.updateTracerTrail(Game.ball, Game.ball.x, Game.ball.y, hole, 30);
+    Draw.drawTracerTrail(ctx, Game.ball);
     drawTrail();
     drawBall();
   }

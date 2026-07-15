@@ -7,6 +7,7 @@
   const LOGICAL_W = S.LOGICAL_W || 800;
   const LOGICAL_H = S.LOGICAL_H || 500;
   const BOUNDARY_WALLS = S.BOUNDARY_WALLS || [];
+  const BOUND = S.BOUND || { left: 20, top: 20, right: 780, bottom: 480 };
   const zoneBounds = S.zoneBounds || function (z) {
     return { x1: z.x1, y1: z.y1, x2: z.x2, y2: z.y2 };
   };
@@ -92,6 +93,102 @@
     return min + Math.random() * (max - min);
   }
 
+  // ---- Black-hole tracer trails ----
+  // 1000 unique random RGB colors; trails cycle through the palette per segment and
+  // per frame for a constantly-shifting rainbow as things spiral in. Visual only.
+  const TRACER_COLORS = (() => {
+    const seen = new Set();
+    const out = [];
+    while (out.length < 1000) {
+      const r = (Math.random() * 256) | 0;
+      const g = (Math.random() * 256) | 0;
+      const b = (Math.random() * 256) | 0;
+      const key = (r << 16) | (g << 8) | b;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push([r, g, b]);
+    }
+    return out;
+  })();
+
+  /** Pull radius inside which an object counts as "interacting" with a black hole. */
+  function blackHolePullRadius(body) {
+    return body.fieldRadius != null ? body.fieldRadius : BH_LENS.rOutLogical;
+  }
+
+  function nearBlackHole(x, y, hole) {
+    for (const b of hole.gravityBodies || []) {
+      if (b.kind !== 'blackHole') continue;
+      if (Math.hypot(x - b.x, y - b.y) <= blackHolePullRadius(b)) return true;
+    }
+    return false;
+  }
+
+  /** 0 at the pull edge → 1 at the black-hole center (max over all BHs; 0 if none). */
+  function blackHoleProximity(x, y, hole) {
+    let best = 0;
+    for (const b of hole.gravityBodies || []) {
+      if (b.kind !== 'blackHole') continue;
+      const p = 1 - Math.hypot(x - b.x, y - b.y) / blackHolePullRadius(b);
+      if (p > best) best = p;
+    }
+    return Math.max(0, Math.min(1, best));
+  }
+
+  // One color per interaction: a global cursor starts at a random seed in [1,1000]
+  // and each NEW object entering a black hole's pull claims the current color and
+  // advances the cursor (wrapping past 1000 and looping forever — back through the
+  // seed and around again).
+  let tracerCursor = Math.floor(Math.random() * 1000); // random seed 1..1000 (0-based)
+  function claimTracerColor() {
+    const c = TRACER_COLORS[tracerCursor];
+    tracerCursor = (tracerCursor + 1) % 1000;
+    return c;
+  }
+
+  /** Draw an object's tracer trail (oldest → newest) in its single claimed color. */
+  function drawTracerTrail(ctx, obj) {
+    const pts = obj && obj._bhTrail;
+    const c = obj && obj._bhColor;
+    if (!pts || pts.length < 2 || !c) return;
+    ctx.save();
+    ctx.lineCap = 'round';
+    const n = pts.length;
+    for (let i = 1; i < n; i++) {
+      const frac = i / (n - 1); // 0 = tail, 1 = head
+      // Proximity scale (captured per point): gradual fade-in at the pull edge,
+      // ramping hard near the horizon — reads as acceleration, keeps far trails quiet.
+      const prox = pts[i].prox != null ? pts[i].prox : 0.5;
+      const proxScale = 0.12 + 0.88 * Math.pow(prox, 1.6);
+      ctx.strokeStyle = 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + ((0.15 + 0.85 * frac) * proxScale).toFixed(3) + ')';
+      ctx.lineWidth = (1 + 2.2 * frac) * (0.7 + 0.5 * prox);
+      ctx.beginPath();
+      ctx.moveTo(pts[i - 1].x, pts[i - 1].y);
+      ctx.lineTo(pts[i].x, pts[i].y);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  /**
+   * Append (or decay) a tracer trail on `obj` based on black-hole proximity.
+   * A fresh interaction (no active trail) claims the next palette color.
+   */
+  function updateTracerTrail(obj, x, y, hole, maxLen) {
+    if (nearBlackHole(x, y, hole)) {
+      if (!obj._bhTrail) obj._bhTrail = [];
+      if (obj._bhTrail.length === 0) obj._bhColor = claimTracerColor();
+      const last = obj._bhTrail[obj._bhTrail.length - 1];
+      if (!last || Math.hypot(x - last.x, y - last.y) > 1.2) {
+        obj._bhTrail.push({ x, y, prox: blackHoleProximity(x, y, hole) });
+        if (obj._bhTrail.length > maxLen) obj._bhTrail.shift();
+      }
+    } else if (obj._bhTrail && obj._bhTrail.length) {
+      obj._bhTrail.splice(0, 2); // fade out once clear of the pull
+      if (obj._bhTrail.length === 0) obj._bhColor = null; // next entry = new color
+    }
+  }
+
   function spawnSpaceDebris(p, hole, kind) {
     // Enter from a random screen edge, aimed loosely at a gravity body (or map center).
     const side = Math.floor(Math.random() * 4);
@@ -106,6 +203,7 @@
     const ang = Math.atan2(target.y + spaceRand(-90, 90) - p.y, target.x + spaceRand(-90, 90) - p.x);
     const speed = kind === 'comet' ? spaceRand(24, 46) : kind === 'planetoid' ? spaceRand(5, 11) : spaceRand(9, 22);
     p.kind = kind;
+    p._bhTrail = [];
     p.vx = Math.cos(ang) * speed;
     p.vy = Math.sin(ang) * speed;
     p.r = kind === 'comet' ? spaceRand(1.6, 2.4) : kind === 'planetoid' ? spaceRand(3, 5.5) : spaceRand(0.6, 1.4);
@@ -148,6 +246,7 @@
       }
       p.x += p.vx * dt;
       p.y += p.vy * dt;
+      updateTracerTrail(p, p.x, p.y, hole, 26);
       const m = 60;
       if (p.x < -m || p.x > LOGICAL_W + m || p.y < -m || p.y > LOGICAL_H + m) {
         spawnSpaceDebris(p, hole, p.kind);
@@ -207,6 +306,10 @@
       ctx.fill();
     }
 
+    // Tracers for debris being pulled into a black hole (under the debris dots) —
+    // each interaction wears its own claimed palette color.
+    for (const p of space.debris) drawTracerTrail(ctx, p);
+
     for (const p of space.debris) {
       if (p.kind === 'dust') {
         ctx.fillStyle = 'rgba(200,210,230,0.5)';
@@ -244,13 +347,22 @@
     }
   }
 
-  function drawSandZone(ctx, z) {
-    ctx.fillStyle = '#dcc27a';
+  function drawSandZone(ctx, z, space) {
+    const b = zoneBounds(z);
+    if (space) {
+      // Moon dust: gray→white sweep with crater-gray speckling.
+      const grad = ctx.createLinearGradient(b.x1, b.y1, b.x2, b.y2);
+      grad.addColorStop(0, '#aeb4bd');
+      grad.addColorStop(0.55, '#d8dce2');
+      grad.addColorStop(1, '#f2f4f7');
+      ctx.fillStyle = grad;
+    } else {
+      ctx.fillStyle = '#dcc27a';
+    }
     drawZonePath(ctx, z);
     ctx.fill();
     if (!z._speckles) {
       z._speckles = [];
-      const b = zoneBounds(z);
       for (let i = 0; i < 40; i++) {
         z._speckles.push({
           x: b.x1 + Math.random() * (b.x2 - b.x1),
@@ -259,11 +371,22 @@
         });
       }
     }
-    ctx.fillStyle = 'rgba(150,120,60,0.28)';
+    ctx.fillStyle = space ? 'rgba(96,102,112,0.4)' : 'rgba(150,120,60,0.28)';
     for (const d of z._speckles) {
       ctx.beginPath();
       ctx.arc(d.x, d.y, d.r, 0, Math.PI * 2);
       ctx.fill();
+    }
+    if (space) {
+      // A few catching-the-light rim highlights on the larger "craters".
+      ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+      ctx.lineWidth = 1;
+      for (const d of z._speckles) {
+        if (d.r < 1.8) continue;
+        ctx.beginPath();
+        ctx.arc(d.x, d.y, d.r, Math.PI * 0.75, Math.PI * 1.45);
+        ctx.stroke();
+      }
     }
   }
 
@@ -397,7 +520,91 @@
     ctx.restore();
   }
 
-  function drawWallSegment(ctx, wall) {
+  // Space-hole wall skin: one satellite spanning the segment — central bus with two
+  // smooth solar-panel wings — instead of wooden planks. Purely visual; collision
+  // stays WALL_DRAW_WIDTH.
+  function drawSatelliteSegment(ctx, wall) {
+    const dx = wall.x2 - wall.x1;
+    const dy = wall.y2 - wall.y1;
+    const len = Math.hypot(dx, dy);
+    if (len < 1) return;
+    ctx.save();
+    ctx.translate((wall.x1 + wall.x2) / 2, (wall.y1 + wall.y2) / 2);
+    ctx.rotate(Math.atan2(dy, dx));
+    const half = len / 2;
+    const hw = WALL_DRAW_WIDTH / 2; // panel half-height
+    const busHalf = Math.min(14, half * 0.28); // central body half-length
+
+    // Boom arms connecting bus to wings
+    ctx.strokeStyle = '#7d8694';
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(-half, 0);
+    ctx.lineTo(half, 0);
+    ctx.stroke();
+
+    // Two smooth panel wings: continuous gradient sheets with sparse cell seams
+    const wing = (x0, x1) => {
+      if (x1 - x0 < 6) return;
+      const panel = ctx.createLinearGradient(0, -hw, 0, hw);
+      panel.addColorStop(0, '#3a3e45');
+      panel.addColorStop(0.45, '#17191d');
+      panel.addColorStop(1, '#060708');
+      ctx.fillStyle = panel;
+      roundRectPath(ctx, x0, -hw, x1 - x0, WALL_DRAW_WIDTH, 3);
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(255,255,255,0.75)';
+      ctx.lineWidth = 1;
+      roundRectPath(ctx, x0 + 0.5, -hw + 0.5, x1 - x0 - 1, WALL_DRAW_WIDTH - 1, 3);
+      ctx.stroke();
+      // sparse seams so the sheet reads as an array without getting busy
+      ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+      const seams = Math.max(1, Math.round((x1 - x0) / 26));
+      for (let s = 1; s < seams + 1; s++) {
+        const x = x0 + ((x1 - x0) * s) / (seams + 1);
+        ctx.beginPath();
+        ctx.moveTo(x, -hw + 1.5);
+        ctx.lineTo(x, hw - 1.5);
+        ctx.stroke();
+      }
+      // long center seam down the wing
+      ctx.beginPath();
+      ctx.moveTo(x0 + 2, 0);
+      ctx.lineTo(x1 - 2, 0);
+      ctx.stroke();
+    };
+    wing(-half, -busHalf - 3);
+    wing(busHalf + 3, half);
+
+    // Central bus: dark-gray body with white trim and a small dish
+    const bus = ctx.createLinearGradient(0, -hw - 2, 0, hw + 2);
+    bus.addColorStop(0, '#6b7078');
+    bus.addColorStop(0.5, '#42464d');
+    bus.addColorStop(1, '#26292e');
+    ctx.fillStyle = bus;
+    roundRectPath(ctx, -busHalf, -hw - 1, busHalf * 2, WALL_DRAW_WIDTH + 2, 3);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.7)';
+    ctx.lineWidth = 1;
+    roundRectPath(ctx, -busHalf + 0.5, -hw - 0.5, busHalf * 2 - 1, WALL_DRAW_WIDTH + 1, 3);
+    ctx.stroke();
+    // dish + nav light
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath();
+    ctx.arc(0, 0, 3, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#26292e';
+    ctx.beginPath();
+    ctx.arc(0, 0, 1.2, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function drawWallSegment(ctx, wall, space) {
+    if (space && !wall.bumper) {
+      drawSatelliteSegment(ctx, wall);
+      return;
+    }
     ctx.lineCap = 'round';
     if (wall.bumper) {
       ctx.strokeStyle = '#e6483f';
@@ -430,8 +637,31 @@
     }
   }
 
-  function drawBoundary(ctx) {
-    for (const w of BOUNDARY_WALLS) drawWallSegment(ctx, w);
+  // Visual border skin — deliberately separate from the physics boundary system.
+  // Physics owns WHERE the wall face is (Shared.SPACE_BOUND / boundaryWallsFor);
+  // these constants only control how the border LOOKS and can be tuned freely.
+  const BORDER_SKIN = { fill: '#6b4a2b', detail: '#5a3d22', detailWidth: 3 };
+
+  function drawBoundary(ctx, space) {
+    if (!space) {
+      // Classic course frame, untouched.
+      for (const w of BOUNDARY_WALLS) drawWallSegment(ctx, w);
+      return;
+    }
+    // Space holes: solid band from the canvas edge to the physics bounce face.
+    // The face position comes from Shared (single source of truth for physics);
+    // everything else here is presentation.
+    const SB = S.SPACE_BOUND || { left: 5, top: 5, right: LOGICAL_W - 5, bottom: LOGICAL_H - 5 };
+    const face = WALL_DRAW_WIDTH / 2;
+    ctx.fillStyle = BORDER_SKIN.fill;
+    ctx.fillRect(0, 0, LOGICAL_W, SB.top + face); // top band
+    ctx.fillRect(0, SB.bottom - face, LOGICAL_W, LOGICAL_H - (SB.bottom - face)); // bottom
+    ctx.fillRect(0, 0, SB.left + face, LOGICAL_H); // left
+    ctx.fillRect(SB.right - face, 0, LOGICAL_W - (SB.right - face), LOGICAL_H); // right
+    // Detail line along the wall centerline, matching the classic frame's grain.
+    ctx.strokeStyle = BORDER_SKIN.detail;
+    ctx.lineWidth = BORDER_SKIN.detailWidth;
+    ctx.strokeRect(SB.left, SB.top, SB.right - SB.left, SB.bottom - SB.top);
   }
 
   function drawWindmill(ctx, wm) {
@@ -511,9 +741,52 @@
     ctx.setLineDash([]);
   }
 
-  function drawGravityBody(ctx, body) {
-    // Black holes are warped + overlaid later (need fairway pixels first).
-    if (body.kind === 'blackHole') return;
+  /**
+   * Accretion disk painted BEFORE the lens pass so the warp bends it like the
+   * starfield — hot doppler-offset glow with slowly orbiting filament arcs.
+   * The crisp shadow + photon ring go on top afterwards (drawBlackHoleOverlay).
+   */
+  function drawBlackHoleAccretion(ctx, body, timeSec) {
+    const t = timeSec != null ? timeSec : nowSec();
+    const rs = BH_LENS.rsLogical;
+    const diskR = rs * 4.8;
+    // Ambient glow, center offset a touch so one side runs hotter (doppler beaming).
+    const ox = body.x - rs * 0.45;
+    const oy = body.y + rs * 0.25;
+    const glow = ctx.createRadialGradient(ox, oy, rs * 0.7, ox, oy, diskR);
+    glow.addColorStop(0, 'rgba(255,214,140,0.95)');
+    glow.addColorStop(0.3, 'rgba(255,140,40,0.6)');
+    glow.addColorStop(0.65, 'rgba(200,70,15,0.25)');
+    glow.addColorStop(1, 'rgba(120,30,0,0)');
+    ctx.fillStyle = glow;
+    ctx.beginPath();
+    ctx.arc(body.x, body.y, diskR, 0, Math.PI * 2);
+    ctx.fill();
+    // Orbiting filaments: uneven arcs of superheated matter, inner ones faster.
+    const FILS = [
+      { r: rs * 1.8, w: 1.9, span: 2.4, speed: 0.9, a: 'rgba(255,240,215,0.85)' },
+      { r: rs * 2.6, w: 1.5, span: 1.7, speed: 0.55, a: 'rgba(255,190,120,0.6)' },
+      { r: rs * 3.5, w: 1.2, span: 2.9, speed: 0.33, a: 'rgba(255,140,70,0.4)' },
+    ];
+    ctx.lineCap = 'round';
+    for (let i = 0; i < FILS.length; i++) {
+      const f = FILS[i];
+      const a0 = t * f.speed + i * 2.1;
+      ctx.strokeStyle = f.a;
+      ctx.lineWidth = f.w;
+      ctx.beginPath();
+      ctx.arc(body.x, body.y, f.r, a0, a0 + f.span);
+      ctx.stroke();
+    }
+  }
+
+  function drawGravityBody(ctx, body, timeSec) {
+    // Black holes: paint the accretion disk now (so the lens warps it); the
+    // shadow + photon ring are overlaid after the warp.
+    if (body.kind === 'blackHole') {
+      drawBlackHoleAccretion(ctx, body, timeSec);
+      return;
+    }
     const r = body.radius;
     const bodyGrad = ctx.createRadialGradient(body.x - r * 0.3, body.y - r * 0.3, r * 0.2, body.x, body.y, r);
     if (body.kind === 'moon') {
@@ -648,14 +921,31 @@
   }
 
   function drawBlackHoleOverlay(ctx, body) {
-    const diskR = BH_LENS.diskDraw;
+    const rs = BH_LENS.rsLogical;
+    // Event-horizon shadow: dead black, swallowing the warped glow behind it.
     ctx.fillStyle = '#000000';
     ctx.beginPath();
-    ctx.arc(body.x, body.y, diskR, 0, Math.PI * 2);
+    ctx.arc(body.x, body.y, rs * 1.18, 0, Math.PI * 2);
     ctx.fill();
+    // Photon ring hugging the shadow — white-hot, with a faint warm bloom.
+    ctx.save();
+    ctx.shadowColor = 'rgba(255,190,110,0.9)';
+    ctx.shadowBlur = 6;
+    ctx.strokeStyle = 'rgba(255,244,224,0.95)';
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    ctx.arc(body.x, body.y, rs * 1.32, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+    // Faint secondary lensed image of the ring.
+    ctx.strokeStyle = 'rgba(255,200,150,0.3)';
+    ctx.lineWidth = 0.8;
+    ctx.beginPath();
+    ctx.arc(body.x, body.y, rs * 1.8, 0, Math.PI * 2);
+    ctx.stroke();
   }
 
-  function drawHoleAndFlag(ctx, hole, flagPhase) {
+  function drawHoleAndFlag(ctx, hole, flagPhase, space) {
     const phase = flagPhase != null ? flagPhase : 0;
     const { x, y } = hole.cup;
     const grad = ctx.createRadialGradient(x, y, 2, x, y, hole.cup.radius + 6);
@@ -669,6 +959,20 @@
     ctx.beginPath();
     ctx.arc(x, y, hole.cup.radius, 0, Math.PI * 2);
     ctx.fill();
+    if (space) {
+      // A dark cup vanishes on a black sky — ring the outside edge so it always reads.
+      // Soft white drop shadow under the ring keeps it from getting lost in the debris field.
+      ctx.save();
+      ctx.shadowColor = 'rgba(255,255,255,0.75)';
+      ctx.shadowBlur = 5;
+      ctx.shadowOffsetY = 2;
+      ctx.strokeStyle = 'rgba(255,255,255,0.9)';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.arc(x, y, hole.cup.radius + 1, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
+    }
 
     const stickTop = y - 46;
     ctx.strokeStyle = '#eee';
@@ -696,22 +1000,24 @@
     const t = nowSec(opts);
     const flagPhase = opts.flagPhase != null ? opts.flagPhase : 0;
 
-    // Gravity holes play in space: black canvas + starfield instead of fairway grass.
-    if ((hole.gravityBodies || []).length) drawSpace(ctx, hole, t);
+    // Gravity holes play in space: black canvas + starfield instead of fairway grass,
+    // moon-dust sand, satellite walls, and outlined cup so everything reads on black.
+    const space = (hole.gravityBodies || []).length > 0;
+    if (space) drawSpace(ctx, hole, t);
     else drawGrass(ctx);
-    for (const z of hole.sand || []) drawSandZone(ctx, z);
+    for (const z of hole.sand || []) drawSandZone(ctx, z, space);
     for (const z of hole.water || []) drawWaterZone(ctx, z, t);
     for (const z of hole.sticky || []) drawStickyZone(ctx, z, t);
     for (const z of hole.boost || []) drawBoostZone(ctx, z, t);
     for (const z of hole.ramps || []) drawRampZone(ctx, z);
     // Planets/moons first (solid bodies sit under lens warp if a BH is nearby).
-    for (const b of hole.gravityBodies || []) drawGravityBody(ctx, b);
-    drawBoundary(ctx);
-    for (const w of hole.walls || []) drawWallSegment(ctx, w);
+    for (const b of hole.gravityBodies || []) drawGravityBody(ctx, b, t);
+    drawBoundary(ctx, space);
+    for (const w of hole.walls || []) drawWallSegment(ctx, w, space);
     for (const wm of hole.windmills || []) drawWindmill(ctx, wm);
     for (const p of hole.pendulums || []) drawPendulum(ctx, p);
     for (const g of hole.gates || []) drawSlidingGate(ctx, g);
-    drawHoleAndFlag(ctx, hole, flagPhase);
+    drawHoleAndFlag(ctx, hole, flagPhase, space);
 
     // Black holes: warp fairway/walls, then disk. Balls stay unwarped on top.
     const blackHoles = (hole.gravityBodies || []).filter((b) => b.kind === 'blackHole');
@@ -737,6 +1043,9 @@
     drawSlidingGate,
     drawGravityBody,
     drawBlackHoleOverlay,
+    drawTracerTrail,
+    updateTracerTrail,
+    nearBlackHole,
     warpBlackHoleLens,
     drawHoleAndFlag,
     drawHoleStatic,

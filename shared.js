@@ -540,6 +540,20 @@ const BOUNDARY_WALLS = [
   wall(BOUND.left, BOUND.bottom, BOUND.left, BOUND.top),
 ];
 
+// Space holes trade the grass apron for playfield: the frame hugs the canvas edge, so
+// the boundary centerline moves out to 5px and the bounce face sits 10px from the edge
+// (vs 25px on grass). Draw and physics both key off gravityBodies via boundaryWallsFor.
+const SPACE_BOUND = { left: 5, top: 5, right: LOGICAL_W - 5, bottom: LOGICAL_H - 5 };
+const SPACE_BOUNDARY_WALLS = [
+  wall(SPACE_BOUND.left, SPACE_BOUND.top, SPACE_BOUND.right, SPACE_BOUND.top),
+  wall(SPACE_BOUND.right, SPACE_BOUND.top, SPACE_BOUND.right, SPACE_BOUND.bottom),
+  wall(SPACE_BOUND.right, SPACE_BOUND.bottom, SPACE_BOUND.left, SPACE_BOUND.bottom),
+  wall(SPACE_BOUND.left, SPACE_BOUND.bottom, SPACE_BOUND.left, SPACE_BOUND.top),
+];
+function boundaryWallsFor(hole) {
+  return (hole.gravityBodies || []).length ? SPACE_BOUNDARY_WALLS : BOUNDARY_WALLS;
+}
+
 // ---- Hole data ----
 // Every hole carries the same set of arrays (walls, sand, water, boost, pendulums, gates,
 // windmills) even when empty, so the physics/render loops never need to guard for undefined.
@@ -1481,7 +1495,7 @@ function latchStickyAfterPutt(ball, hole) {
 // CRITICAL for multiplayer: host and client must call this with the SAME dt schedule per
 // sim tick. Sticky stop thresholds are speed-based and fork hard if one side microsteps more.
 function stepBallPhysics(ball, hole, dt) {
-  let walls = BOUNDARY_WALLS.concat(hole.walls);
+  let walls = boundaryWallsFor(hole).concat(hole.walls);
   for (const wm of hole.windmills) walls = walls.concat(getWindmillBlades(wm));
   if (hole.pendulums.length) walls = walls.concat(hole.pendulums.map(getPendulumSegment));
   if (hole.gates.length) walls = walls.concat(hole.gates.map(getSlidingGateSegment));
@@ -1582,7 +1596,7 @@ function stepBallPhysics(ball, hole, dt) {
 
     // Airborne balls fly over interior walls and moving obstacles; only the perimeter
     // fence is "tall" enough to knock them back in.
-    const wallList = ball.z > 0 ? BOUNDARY_WALLS : walls;
+    const wallList = ball.z > 0 ? boundaryWallsFor(hole) : walls;
     for (const w of wallList) {
       if (resolveWallCollision(ball, w)) events.bounced = true;
     }
@@ -2754,7 +2768,7 @@ return {
   createSpeedAvgTracker, resetSpeedAvgTracker, noteSpeedSample, speedAvg, isQuasiRest, mayPuttBall,
   ballInSand, effectiveGravityMag, gravityAccelAt, REST_GRAVITY_EPS, SAND_GRAVITY_HOLD,
   setMoonPoseAtTick, applyGravityAcceleration, resolvePlanetCollision, blackHoleCaptures,
-  BOUNDARY_WALLS, HOLES, ORBIT_HOLES, COURSES,
+  BOUNDARY_WALLS, SPACE_BOUND, SPACE_BOUNDARY_WALLS, boundaryWallsFor, HOLES, ORBIT_HOLES, COURSES,
   resolveWallCollision, getWindmillBlades,
   createBallState, stepBallPhysics, advanceHoleObstacles, setHoleObstaclesAtTick, resetHoleObstacles,
   computeLaunchVelocity, clampDragVector, stickyLaunchFactor, stickyIndexAt, latchStickyAfterPutt,
