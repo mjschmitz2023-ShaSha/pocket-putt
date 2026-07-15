@@ -429,8 +429,17 @@ class GameSession {
         if (events.water) {
           p.strokes++;
           tickEvents.push({ id: p.id, kind: 'water', x: p.ball.x, y: p.ball.y });
-          p.ball.x = events.water.dropPoint.x;
-          p.ball.y = events.water.dropPoint.y;
+          // Slot-indexed spot in the radial drop zone — a full lobby drowning in the
+          // same pond never stacks on one point. Clients compute the same slot; the
+          // hard water correction is the authoritative safety net either way.
+          const dropRoster = [...this.players.values()];
+          const drop = Shared.waterDropPointFor(
+            events.water,
+            Math.max(0, dropRoster.indexOf(p)),
+            this.currentHoles()[this.currentHoleIndex]
+          );
+          p.ball.x = drop.x;
+          p.ball.y = drop.y;
           p.ball.vx = 0;
           p.ball.vy = 0;
           p.ball.z = 0;

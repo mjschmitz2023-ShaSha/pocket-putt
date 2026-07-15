@@ -390,25 +390,162 @@
     }
   }
 
+  function drawZonePathExpanded(ctx, z, pad) {
+    if (z.shape === 'circle') {
+      ctx.beginPath();
+      ctx.arc(z.cx, z.cy, z.r + pad, 0, Math.PI * 2);
+    } else {
+      roundRectPath(ctx, z.x1 - pad, z.y1 - pad, z.x2 - z.x1 + pad * 2, z.y2 - z.y1 + pad * 2, 8 + pad);
+    }
+  }
+
   function drawWaterZone(ctx, z, timeSec) {
-    ctx.fillStyle = '#3b82c4';
-    drawZonePath(ctx, z);
-    ctx.fill();
-    ctx.strokeStyle = 'rgba(255,255,255,0.25)';
-    ctx.lineWidth = 2;
+    // Visuals live ENTIRELY inside the hazard rect — physics (circleTouchesZone on
+    // the zone) is the single source of truth for where water begins, and the drawn
+    // feature never covers playable green. The dirt bank is the zone's outer band;
+    // the waterline is inset within it (a ball at the muddy shore is in the hazard,
+    // same as a real penalty area).
     const b = zoneBounds(z);
     const t = timeSec != null ? timeSec : nowSec();
-    for (let i = 0; i < 3; i++) {
-      const yOff = b.y1 + ((b.y2 - b.y1) * (i + 1)) / 4 + Math.sin(t * 1.5 + i) * 4;
+    const pad = Math.min(5, (Math.min(b.x2 - b.x1, b.y2 - b.y1) / 6) | 0);
+    const ib = { x1: b.x1 + pad, y1: b.y1 + pad, x2: b.x2 - pad, y2: b.y2 - pad };
+
+    // Raised dirt bank: outer band of the hazard, rim highlight right on the physics edge.
+    const bank = ctx.createLinearGradient(b.x1, b.y1, b.x2, b.y2);
+    bank.addColorStop(0, '#96714a');
+    bank.addColorStop(1, '#6b4d2e');
+    ctx.fillStyle = bank;
+    drawZonePath(ctx, z);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+    ctx.lineWidth = 1.5;
+    drawZonePathExpanded(ctx, z, -0.75);
+    ctx.stroke();
+
+    // Water body inset within the bank: deeper toward the far corner.
+    const body = ctx.createLinearGradient(ib.x1, ib.y1, ib.x2, ib.y2);
+    body.addColorStop(0, '#4a94d4');
+    body.addColorStop(1, '#2a5f9e');
+    ctx.fillStyle = body;
+    drawZonePathExpanded(ctx, z, -pad);
+    ctx.fill();
+
+    ctx.save();
+    drawZonePathExpanded(ctx, z, -pad);
+    ctx.clip();
+    // Contact shadow under the bank lip, strongest along the top edge (light from above).
+    ctx.strokeStyle = 'rgba(8,18,48,0.4)';
+    ctx.lineWidth = 9;
+    drawZonePathExpanded(ctx, z, -pad);
+    ctx.stroke();
+    const lip = ctx.createLinearGradient(0, ib.y1, 0, ib.y1 + 12);
+    lip.addColorStop(0, 'rgba(5,15,40,0.35)');
+    lip.addColorStop(1, 'rgba(5,15,40,0)');
+    ctx.fillStyle = lip;
+    ctx.fillRect(ib.x1, ib.y1, ib.x2 - ib.x1, 12);
+
+    // Waves: one lead front line + 3 followers, each slightly slower, all bouncing
+    // off the banks (the waterline is the physics boundary). Four strokes per pond
+    // instead of a rendered heightfield — huge draw-call reduction, same motion story.
+    drawWaterWaves(ctx, z, ib, t);
+    ctx.restore();
+  }
+
+  const WATER_WAVES = {
+    speed: 17,        // px/s, lead front; followers are each a step slower
+    followers: 3,
+    slowdown: 0.85,   // per-follower speed multiplier
+    bow: 4,           // px the line bows in its direction of travel
+  };
+
+  // One lead wave line + followers sweeping the pond's long axis, reflecting off the
+  // banks (the inset waterline is the boundary). Four strokes per pond, no heightfield.
+  function drawWaterWaves(ctx, z, b, t) {
+    if (!z._waves) {
+      const vertical = (b.y2 - b.y1) > (b.x2 - b.x1);
+      const lo = vertical ? b.y1 : b.x1;
+      const span = (vertical ? b.y2 - b.y1 : b.x2 - b.x1);
+      // Randomize phase + jitter speeds per pond so same-sized neighbors never sync —
+      // synchronized lines in adjacent zones read as one line crossing the terrain between.
+      const fronts = [];
+      const phase = Math.random() * 0.6;
+      const jitter = 0.9 + Math.random() * 0.2;
+      for (let k = 0; k <= WATER_WAVES.followers; k++) {
+        fronts.push({
+          pos: lo + span * ((phase + 0.16 * k) % 0.92 + 0.04),
+          dir: Math.random() < 0.5 ? 1 : -1,
+          speed: WATER_WAVES.speed * jitter * Math.pow(WATER_WAVES.slowdown, k),
+        });
+      }
+      z._waves = { vertical, fronts, wisps: [], nextWispAt: t + 0.4, lastT: null };
+    }
+    const w = z._waves;
+    const dt = w.lastT == null ? 0 : Math.min(0.1, Math.max(0, t - w.lastT));
+    w.lastT = t;
+    const lo = (w.vertical ? b.y1 : b.x1) + 3;
+    const hi = (w.vertical ? b.y2 : b.x2) - 3;
+    ctx.lineCap = 'round';
+
+    // Wake: small foam wisps that peel off a wave's path and get gently left behind,
+    // spreading and fading as the line moves on. Drawn under the lines.
+    if (t >= w.nextWispAt && dt > 0) {
+      w.nextWispAt = t + 0.35 + Math.random() * 0.6;
+      const f = w.fronts[Math.floor(Math.random() * w.fronts.length)];
+      w.wisps.push({
+        across: 0.15 + Math.random() * 0.7,
+        pos: f.pos - f.dir * 2,
+        dir: f.dir,
+        len: 7 + Math.random() * 8,
+        age: 0,
+      });
+      if (w.wisps.length > 12) w.wisps.shift();
+    }
+    const WISP_LIFE = 1.3;
+    for (let i = w.wisps.length - 1; i >= 0; i--) {
+      const s = w.wisps[i];
+      s.age += dt;
+      if (s.age >= WISP_LIFE) { w.wisps.splice(i, 1); continue; }
+      s.pos -= s.dir * 3 * dt; // drift softly astern of the wave that shed it
+      const life = s.age / WISP_LIFE;
+      const alpha = 0.16 * (1 - life);
+      const half = (s.len * (1 + 0.45 * life)) / 2;
+      ctx.strokeStyle = 'rgba(255,255,255,' + alpha.toFixed(3) + ')';
+      ctx.lineWidth = 1.2;
       ctx.beginPath();
-      ctx.moveTo(b.x1 + 6, yOff);
-      ctx.lineTo(b.x2 - 6, yOff);
+      if (w.vertical) {
+        const cx = b.x1 + 4 + s.across * (b.x2 - b.x1 - 8);
+        ctx.moveTo(cx - half, s.pos);
+        ctx.quadraticCurveTo(cx, s.pos + s.dir * 2, cx + half, s.pos);
+      } else {
+        const cy = b.y1 + 4 + s.across * (b.y2 - b.y1 - 8);
+        ctx.moveTo(s.pos, cy - half);
+        ctx.quadraticCurveTo(s.pos + s.dir * 2, cy, s.pos, cy + half);
+      }
+      ctx.stroke();
+    }
+    for (let k = w.fronts.length - 1; k >= 0; k--) {
+      const f = w.fronts[k];
+      f.pos += f.dir * f.speed * dt;
+      if (f.pos > hi) { f.pos = hi; f.dir = -1; }
+      if (f.pos < lo) { f.pos = lo; f.dir = 1; }
+      ctx.strokeStyle = 'rgba(255,255,255,' + (k === 0 ? 0.22 : 0.16 - 0.035 * k).toFixed(3) + ')';
+      ctx.lineWidth = k === 0 ? 2 : 1.4;
+      const bow = f.dir * WATER_WAVES.bow;
+      ctx.beginPath();
+      if (w.vertical) {
+        ctx.moveTo(b.x1 + 4, f.pos);
+        ctx.quadraticCurveTo((b.x1 + b.x2) / 2, f.pos + bow, b.x2 - 4, f.pos);
+      } else {
+        ctx.moveTo(f.pos, b.y1 + 4);
+        ctx.quadraticCurveTo(f.pos + bow, (b.y1 + b.y2) / 2, f.pos, b.y2 - 4);
+      }
       ctx.stroke();
     }
   }
 
   function drawStickyZone(ctx, z, timeSec) {
-    ctx.fillStyle = '#d99a1f';
+    // Deeper amber than sand's pale tan so goo and bunkers never read as the same surface.
+    ctx.fillStyle = '#c9861c';
     drawZonePath(ctx, z);
     ctx.fill();
     if (!z._speckles) {
@@ -431,13 +568,28 @@
     }
     const b = zoneBounds(z);
     const t = timeSec != null ? timeSec : nowSec();
-    const sheenY = b.y1 + ((t * 12) % Math.max(1, b.y2 - b.y1));
-    ctx.strokeStyle = 'rgba(255,230,160,0.35)';
-    ctx.lineWidth = 3;
-    ctx.beginPath();
-    ctx.moveTo(b.x1 + 6, sheenY);
-    ctx.lineTo(b.x2 - 6, sheenY);
-    ctx.stroke();
+    // Glossy wet-goo highlights that slowly pulse in place — no panning line, so goo
+    // can never be mistaken for water's traveling waves.
+    if (!z._gloss) {
+      z._gloss = [];
+      const n = Math.max(2, Math.min(4, Math.floor(((b.x2 - b.x1) * (b.y2 - b.y1)) / 6000)));
+      for (let i = 0; i < n; i++) {
+        z._gloss.push({
+          x: b.x1 + (0.2 + Math.random() * 0.6) * (b.x2 - b.x1),
+          y: b.y1 + (0.2 + Math.random() * 0.6) * (b.y2 - b.y1),
+          rx: 6 + Math.random() * 8,
+          ry: 3 + Math.random() * 3,
+          ph: Math.random() * Math.PI * 2,
+        });
+      }
+    }
+    for (const g of z._gloss) {
+      const pulse = 0.16 + 0.08 * Math.sin(t * 1.1 + g.ph);
+      ctx.fillStyle = 'rgba(255,225,150,' + pulse.toFixed(3) + ')';
+      ctx.beginPath();
+      ctx.ellipse(g.x, g.y, g.rx, g.ry, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
   }
 
   function drawBoostZone(ctx, z, timeSec) {
@@ -652,31 +804,12 @@
     }
   }
 
-  // Visual border skin — deliberately separate from the physics boundary system.
-  // Physics owns WHERE the wall face is (Shared.SPACE_BOUND / boundaryWallsFor);
-  // these constants only control how the border LOOKS and can be tuned freely.
-  const BORDER_SKIN = { fill: '#6b4a2b', detail: '#5a3d22', detailWidth: 3 };
-
-  function drawBoundary(ctx, space) {
-    if (!space) {
-      // Classic course frame, untouched.
-      for (const w of BOUNDARY_WALLS) drawWallSegment(ctx, w);
-      return;
-    }
-    // Space holes: solid band from the canvas edge to the physics bounce face.
-    // The face position comes from Shared (single source of truth for physics);
-    // everything else here is presentation.
-    const SB = S.SPACE_BOUND || { left: 5, top: 5, right: LOGICAL_W - 5, bottom: LOGICAL_H - 5 };
-    const face = WALL_DRAW_WIDTH / 2;
-    ctx.fillStyle = BORDER_SKIN.fill;
-    ctx.fillRect(0, 0, LOGICAL_W, SB.top + face); // top band
-    ctx.fillRect(0, SB.bottom - face, LOGICAL_W, LOGICAL_H - (SB.bottom - face)); // bottom
-    ctx.fillRect(0, 0, SB.left + face, LOGICAL_H); // left
-    ctx.fillRect(SB.right - face, 0, LOGICAL_W - (SB.right - face), LOGICAL_H); // right
-    // Detail line along the wall centerline, matching the classic frame's grain.
-    ctx.strokeStyle = BORDER_SKIN.detail;
-    ctx.lineWidth = BORDER_SKIN.detailWidth;
-    ctx.strokeRect(SB.left, SB.top, SB.right - SB.left, SB.bottom - SB.top);
+  // Visual border skin — separate from the physics boundary system. Physics owns
+  // WHERE the walls are (Shared.BOUNDARY_WALLS, flush with the canvas edge on all
+  // courses); this only decides how the frame looks. The 10px wooden stroke centered
+  // on the 5px line spans exactly 0..10 — visual band ≡ physics band, no apron.
+  function drawBoundary(ctx) {
+    for (const w of BOUNDARY_WALLS) drawWallSegment(ctx, w);
   }
 
   function drawWindmill(ctx, wm) {
@@ -1027,7 +1160,7 @@
     for (const z of hole.ramps || []) drawRampZone(ctx, z);
     // Planets/moons first (solid bodies sit under lens warp if a BH is nearby).
     for (const b of hole.gravityBodies || []) drawGravityBody(ctx, b, t);
-    drawBoundary(ctx, space);
+    drawBoundary(ctx);
     for (const w of hole.walls || []) drawWallSegment(ctx, w, space);
     for (const wm of hole.windmills || []) drawWindmill(ctx, wm);
     for (const p of hole.pendulums || []) drawPendulum(ctx, p);

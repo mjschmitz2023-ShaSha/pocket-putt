@@ -380,8 +380,11 @@ class ClientModel {
         if (p.holedOut) continue;
         const events = Shared.stepBallPhysics(p, hole, TICK_DT / PHYSICS_SUBTICKS);
         if (events.water) {
-          p.x = events.water.dropPoint.x;
-          p.y = events.water.dropPoint.y;
+          // Slot-indexed drop-zone spot — must mirror gameSession's roster-order pick.
+          const slot = Math.max(0, [...this.players.keys()].indexOf(p.id));
+          const drop = Shared.waterDropPointFor(events.water, slot, hole);
+          p.x = drop.x;
+          p.y = drop.y;
           p.vx = 0;
           p.vy = 0;
           p.z = 0;

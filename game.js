@@ -10,7 +10,7 @@ const {
   COURSES,
   createBallState, stepBallPhysics, advanceHoleObstacles, setHoleObstaclesAtTick, resetHoleObstacles,
   computeLaunchVelocity, clampDragVector, stickyLaunchFactor, stickyIndexAt, latchStickyAfterPutt,
-  markWetFromWater, noteWetPutt, ballMayRestForAim,
+  markWetFromWater, noteWetPutt, ballMayRestForAim, zoneBounds, waterDropPointFor,
   createSpeedAvgTracker, resetSpeedAvgTracker, noteSpeedSample, isQuasiRest, mayPuttBall,
   teePositionFor,
   decodeHole, encodeHole, normalizeHole, blankHole,
@@ -333,23 +333,70 @@ function maybePlayBounceSound() {
   }
 }
 function handleWaterHazard(zone) {
+  // Penalty + banner land the instant the ball crosses the waterline; the reset to the
+  // drop point waits ~1.5s while the ball bobs afloat and drifts with the pond's waves.
   Game.strokes++;
   Game.totalStrokes++;
-  Game.ball.x = zone.dropPoint.x;
-  Game.ball.y = zone.dropPoint.y;
-  Game.ball.vx = 0;
-  Game.ball.vy = 0;
-  markWetFromWater(Game.ball);
-  Game.trail = [];
-  spawnSplash(zone.dropPoint.x, zone.dropPoint.y);
+  spawnSplash(Game.ball.x, Game.ball.y);
   soundWater();
   achvOnSplash();
   updateHUD();
+  Game.waterFloat = {
+    zone,
+    timer: 1.5,
+    vx: Game.ball.vx * 0.22, // a little entry momentum carries into the float
+    vy: Game.ball.vy * 0.22,
+  };
+  Game.ball.vx = 0;
+  Game.ball.vy = 0;
+  Game.trail = [];
   Game.hazardTimer = 0.9;
-  Game.state = 'HAZARD_RESET';
+  Game.state = 'WATER_FLOAT';
   showScreen('screen-hazard');
   const hazardMsg = document.getElementById('hazard-text');
   if (hazardMsg) hazardMsg.textContent = 'Splash! +1  ·  WET — goo is slick this putt';
+}
+function updateWaterFloat(dt) {
+  const f = Game.waterFloat;
+  if (!f) return;
+  f.timer -= dt;
+  // Drift with the pond's lead wave (draw.js keeps wave state on the zone itself);
+  // entry momentum decays away so the ball settles into the current.
+  const w = f.zone._waves;
+  const driftSpeed = 14;
+  let dx = 0;
+  let dy = 0;
+  if (w && w.fronts && w.fronts.length) {
+    if (w.vertical) dy = w.fronts[0].dir * driftSpeed;
+    else dx = w.fronts[0].dir * driftSpeed;
+  }
+  Game.ball.x += (dx + f.vx) * dt;
+  Game.ball.y += (dy + f.vy) * dt;
+  const decay = Math.exp(-3 * dt);
+  f.vx *= decay;
+  f.vy *= decay;
+  // Stay afloat inside the waterline (bank pad + ball radius).
+  const b = zoneBounds(f.zone);
+  const pad = 5 + BALL_RADIUS;
+  Game.ball.x = Math.min(Math.max(Game.ball.x, b.x1 + pad), b.x2 - pad);
+  Game.ball.y = Math.min(Math.max(Game.ball.y, b.y1 + pad), b.y2 - pad);
+
+  if (f.timer <= 0) {
+    Game.waterFloat = null;
+    // Solo variation: land on the original point or any spot in the first drop ring.
+    const hole = currentHoles()[Game.currentHoleIndex];
+    const drop = waterDropPointFor(f.zone, Math.floor(Math.random() * 6), hole);
+    Game.ball.x = drop.x;
+    Game.ball.y = drop.y;
+    Game.ball.vx = 0;
+    Game.ball.vy = 0;
+    markWetFromWater(Game.ball);
+    Game.trail = [];
+    spawnSplash(drop.x, drop.y);
+    hideAllScreens();
+    Game.state = 'AIMING';
+    resetUnsettledTimer();
+  }
 }
 function handleBlackHoleHazard() {
   Game.strokes++;
@@ -1053,6 +1100,12 @@ function update(dt) {
       Game.state = 'AIMING';
       resetUnsettledTimer();
     }
+  }
+  if (Game.state === 'WATER_FLOAT') {
+    // Banner hides on its own clock; the float keeps going until its 1.5s is up.
+    Game.hazardTimer -= dt;
+    if (Game.hazardTimer <= 0) hideAllScreens();
+    updateWaterFloat(dt);
   }
   updateRespawnOffer(dt);
   for (const pt of Game.trail) pt.age += dt;
@@ -1777,8 +1830,12 @@ function mpStepOneTick() {
         if (mine) soundBoost();
       }
       if (events.water) {
-        p.x = events.water.dropPoint.x;
-        p.y = events.water.dropPoint.y;
+        // Same slot-indexed drop-zone spot the server picks (roster order matches);
+        // the authoritative hard correction reconciles any residual difference.
+        const slot = Math.max(0, [...Game.players.keys()].indexOf(p.id));
+        const drop = waterDropPointFor(events.water, slot, hole);
+        p.x = drop.x;
+        p.y = drop.y;
         p.vx = 0;
         p.vy = 0;
         p.z = 0;
@@ -1790,7 +1847,7 @@ function mpStepOneTick() {
         p.errY = 0;
         p.rx = p.x;
         p.ry = p.y;
-        spawnSplash(events.water.dropPoint.x, events.water.dropPoint.y);
+        spawnSplash(drop.x, drop.y);
         if (mine) {
           soundWater();
           mpShowBanner('SPLASH! +1  ·  WET');

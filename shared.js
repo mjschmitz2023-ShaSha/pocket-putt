@@ -533,25 +533,20 @@ function zoneBounds(z) {
     : { x1: z.x1, y1: z.y1, x2: z.x2, y2: z.y2 };
 }
 
-const BOUNDARY_WALLS = [
-  wall(BOUND.left, BOUND.top, BOUND.right, BOUND.top),
-  wall(BOUND.right, BOUND.top, BOUND.right, BOUND.bottom),
-  wall(BOUND.right, BOUND.bottom, BOUND.left, BOUND.bottom),
-  wall(BOUND.left, BOUND.bottom, BOUND.left, BOUND.top),
-];
-
-// Space holes trade the grass apron for playfield: the frame hugs the canvas edge, so
-// the boundary centerline moves out to 5px and the bounce face sits 10px from the edge
-// (vs 25px on grass). Draw and physics both key off gravityBodies via boundaryWallsFor.
+// The frame hugs the canvas edge on EVERY course — no dead apron between the border
+// and the canvas. Centerline at 5px, so the bounce face sits 10px from the edge and
+// visual band (10px wall stroke) spans exactly 0..10. BOUND (above) remains only as
+// the conservative clamp box for tee placement/aim helpers.
 const SPACE_BOUND = { left: 5, top: 5, right: LOGICAL_W - 5, bottom: LOGICAL_H - 5 };
-const SPACE_BOUNDARY_WALLS = [
+const BOUNDARY_WALLS = [
   wall(SPACE_BOUND.left, SPACE_BOUND.top, SPACE_BOUND.right, SPACE_BOUND.top),
   wall(SPACE_BOUND.right, SPACE_BOUND.top, SPACE_BOUND.right, SPACE_BOUND.bottom),
   wall(SPACE_BOUND.right, SPACE_BOUND.bottom, SPACE_BOUND.left, SPACE_BOUND.bottom),
   wall(SPACE_BOUND.left, SPACE_BOUND.bottom, SPACE_BOUND.left, SPACE_BOUND.top),
 ];
+const SPACE_BOUNDARY_WALLS = BOUNDARY_WALLS; // kept for compat; one geometry everywhere now
 function boundaryWallsFor(hole) {
-  return (hole.gravityBodies || []).length ? SPACE_BOUNDARY_WALLS : BOUNDARY_WALLS;
+  return BOUNDARY_WALLS;
 }
 
 // ---- Hole data ----
@@ -1793,6 +1788,46 @@ function teePositionFor(index, count, hole) {
   };
 }
 
+/**
+ * Water drop ZONE: the authored dropPoint plus a deterministic radial fan of extra
+ * spots arranged ring by ring "behind" it (away from the water), so a full lobby
+ * never stacks penalized balls on one point. Index 0 = the original drop point;
+ * ring 1 fans 5 spots at one ball-spacing, ring 2 fans 8 further out, and so on.
+ * Deterministic for a given (zone, index) — host and clients agree by slot.
+ */
+function waterDropPointFor(zone, index, hole) {
+  const dp = zone.dropPoint || { x: BOUND.left + 40, y: BOUND.top + 40 };
+  if (!index || index <= 0) return { x: dp.x, y: dp.y };
+  const b = zoneBounds(zone);
+  // "Behind" = from the water's center out through the drop point.
+  let ax = dp.x - (b.x1 + b.x2) / 2;
+  let ay = dp.y - (b.y1 + b.y2) / 2;
+  const al = Math.hypot(ax, ay);
+  if (al < 1) { ax = -1; ay = 0; } else { ax /= al; ay /= al; }
+  const baseAng = Math.atan2(ay, ax);
+  const spacing = BALL_RADIUS * 2 + 6;
+  let i = index - 1;
+  let ring = 1;
+  let slots = 5;
+  while (i >= slots) { i -= slots; ring++; slots += 3; }
+  const spread = Math.PI * 0.9; // fan across the away-from-water half
+  const ang = baseAng + (i - (slots - 1) / 2) * (spread / Math.max(1, slots - 1));
+  const margin = BALL_RADIUS * 2;
+  for (let r = ring * spacing; r <= ring * spacing + spacing * 3; r += spacing) {
+    const x = Math.min(Math.max(dp.x + Math.cos(ang) * r, BOUND.left + margin), BOUND.right - margin);
+    const y = Math.min(Math.max(dp.y + Math.sin(ang) * r, BOUND.top + margin), BOUND.bottom - margin);
+    // Never drop back into water (this zone or any other on the hole).
+    let wet = circleTouchesZone(x, y, BALL_RADIUS + 1, zone);
+    if (!wet && hole && hole.water) {
+      for (const wz of hole.water) {
+        if (circleTouchesZone(x, y, BALL_RADIUS + 1, wz)) { wet = true; break; }
+      }
+    }
+    if (!wet) return { x, y };
+  }
+  return { x: dp.x, y: dp.y }; // pathological zone: fall back to the original point
+}
+
 // Launch-power multiplier for a ball sitting in sticky goo — every launch site (server putt
 // handler, solo launch, client prediction) applies this identically so the authoritative and
 // predicted escape shots match. Deliberately keyed off position, not `stuckTo`, so even a
@@ -2773,7 +2808,7 @@ return {
   createBallState, stepBallPhysics, advanceHoleObstacles, setHoleObstaclesAtTick, resetHoleObstacles,
   computeLaunchVelocity, clampDragVector, stickyLaunchFactor, stickyIndexAt, latchStickyAfterPutt,
   markWetFromWater, noteWetPutt,
-  resolveBallBallCollision, teePositionFor,
+  resolveBallBallCollision, teePositionFor, waterDropPointFor,
   LEVEL_CODEC_VERSION, LEVEL_MAX_B64_LEN, LEVEL_MAX_KIND_COUNT, LEVEL_CAPS, LEVEL_MAX_NAME_LEN,
   CODEC_I16_MAX, CODEC_I16_MIN, CODEC_QCOORD_STEP, CODEC_QCOORD_MAX, CODEC_QCOORD_MIN,
   CODEC_QF10_STEP, CODEC_QF10_MAX, CODEC_QF10_MIN, CODEC_QF100_STEP, CODEC_QF100_MAX, CODEC_QF100_MIN,
