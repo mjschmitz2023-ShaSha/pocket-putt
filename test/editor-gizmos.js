@@ -237,5 +237,46 @@ test('applyHandleDrag: pendulum length + amplitude', () => {
   assert.ok(approx(p.amplitude, Math.PI / 2, 1e-9));
 });
 
+// Width handle through midpoint (along wall) flips face; still resizes; no new gizmo.
+test('portal width drag through position flips face and keeps wSign', () => {
+  const Shared = require('../shared.js');
+  globalThis.Shared = Shared;
+
+  const hole = Shared.normalizeHole(Shared.blankHole({
+    walls: [Shared.wall(200, 100, 200, 400), Shared.wall(600, 100, 600, 400)],
+    portalPairs: [{
+      width: 40,
+      a: { host: 'wall', index: 0, t: 0.5, face: 1, wSign: 1 },
+      b: { host: 'wall', index: 1, t: 0.5, face: -1, wSign: 1 },
+    }],
+  }));
+  const pair = hole.portalPairs[0];
+  // Gesture start: width handle on +ty side of vertical wall (up), face +1
+  const start = JSON.parse(JSON.stringify(pair));
+
+  // Drag to +y from center (200,250) → along > 0, same side as wSign 1 → face stays +1
+  // Vertical wall: tx=0,ty=1; along = (py-250)*1
+  G.applyHandleDrag('portalPairs', pair, start, { id: 'w_a' }, 200, 250 + 30, { hole });
+  assert.strictEqual(pair.a.face, 1, 'same side of midpoint keeps face');
+  assert.strictEqual(pair.a.wSign, 1);
+  assert.ok(pair.width >= 60 - 0.1, 'width grows with drag');
+
+  // Restore pair from start (editor does this each frame) then drag through midpoint to -y
+  Object.assign(pair, JSON.parse(JSON.stringify(start)));
+  G.applyHandleDrag('portalPairs', pair, start, { id: 'w_a' }, 200, 250 - 30, { hole });
+  assert.strictEqual(pair.a.face, -1, 'crossing midpoint flips face');
+  assert.strictEqual(pair.a.wSign, -1, 'width handle sits on other side of position gizmo');
+  assert.ok(pair.width >= 60 - 0.1, 'still controlling width after flip');
+
+  // getHandles places width gizmo on wSign side of midpoint only (2 handles per end: t + w)
+  const hs = G.getHandles({ kind: 'portalPairs', index: 0 }, hole, {});
+  const ta = hs.filter((h) => h.id === 't_a');
+  const wa = hs.filter((h) => h.id === 'w_a');
+  assert.strictEqual(ta.length, 1);
+  assert.strictEqual(wa.length, 1);
+  // wSign -1 on vertical wall → width handle below midpoint
+  assert.ok(wa[0].y < ta[0].y, 'width handle on −t side of position');
+});
+
 console.log(passed + ' tests passed');
 if (process.exitCode) process.exit(process.exitCode);

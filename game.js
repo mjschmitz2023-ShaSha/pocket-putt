@@ -205,7 +205,13 @@ function getCanvasPos(clientX, clientY) {
 
 // ---- Audio (Web Audio API oscillators only, no sound files) ----
 let audioCtx = null;
-const SFX_FILES = { putt: 'putt.wav', bounce: 'echoey_putt.wav', holeIn: 'putt_go_in.wav' };
+const SFX_FILES = {
+  putt: 'putt.wav',
+  bounce: 'echoey_putt.wav',
+  holeIn: 'putt_go_in.wav',
+  portalEnter: 'sounds/portal/portal_enter.wav',
+  portalExit: 'sounds/portal/portal_exit.wav',
+};
 const sfxBuffers = {}; // name -> decoded AudioBuffer (primary playback path)
 const sfxPools = {};   // name -> pool of <audio> elements (fallback when fetch is blocked, e.g. Chrome over file://)
 let sfxPoolsBlessed = false;
@@ -418,6 +424,10 @@ function updateBallPhysics(dt) {
   for (const z of events.boosts) {
     spawnBoostSpark(Game.ball.x, Game.ball.y, Game.ball.angleDir);
     soundBoost();
+  }
+  if (events.portals && events.portals.length) {
+    playSfx('portalEnter', 0.85);
+    playSfx('portalExit', 0.85);
   }
   if (events.water) { handleWaterHazard(events.water); return; }
   if (events.blackHole) { handleBlackHoleHazard(); return; }
@@ -1845,6 +1855,10 @@ function mpStepOneTick() {
       for (const z of events.boosts) {
         spawnBoostSpark(p.x, p.y, p.angleDir);
         if (mine) soundBoost();
+      }
+      if (mine && events.portals && events.portals.length) {
+        playSfx('portalEnter', 0.85);
+        playSfx('portalExit', 0.85);
       }
       if (events.water) {
         // Penalty + splash now; the ball floats 1.5s (float pass above) before the

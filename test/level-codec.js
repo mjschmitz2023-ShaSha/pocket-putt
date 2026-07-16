@@ -38,6 +38,7 @@ function assertPhysicsClose(a, b, label) {
   assert.strictEqual(a.gates.length, b.gates.length, `${label} gates`);
   assert.strictEqual(a.windmills.length, b.windmills.length, `${label} mills`);
   assert.strictEqual(a.gravityBodies.length, b.gravityBodies.length, `${label} bodies`);
+  assert.strictEqual((a.portalPairs || []).length, (b.portalPairs || []).length, `${label} portalPairs`);
   for (let i = 0; i < a.walls.length; i++) {
     assert.ok(approx(a.walls[i].x1, b.walls[i].x1), `${label} wall ${i}`);
     assert.strictEqual(!!a.walls[i].bumper, !!b.walls[i].bumper, `${label} bumper ${i}`);
@@ -256,8 +257,8 @@ test('deepCloneHole isolates arrays', () => {
   assert.strictEqual(h.walls.length, 1);
 });
 
-test('LEVEL_CODEC_VERSION is 3', () => {
-  assert.strictEqual(LEVEL_CODEC_VERSION, 3);
+test('LEVEL_CODEC_VERSION is 4', () => {
+  assert.strictEqual(LEVEL_CODEC_VERSION, 4);
 });
 
 // v3 gravity scalars: Orbit-scale mass + sub-1px BH horizon must survive share links.

@@ -18,6 +18,11 @@
   const getSlidingGateSegment = S.getSlidingGateSegment || function (g) {
     return { x1: g.x1, y1: g.y1, x2: g.x2, y2: g.y2 };
   };
+  const resolvePortalAperture = S.resolvePortalAperture || null;
+  const portalPairColors = S.portalPairColors || function (n) {
+    if (n <= 1) return [{ a: '#f97316', b: '#38bdf8' }];
+    return [{ a: '#f97316', b: '#ef4444' }, { a: '#38bdf8', b: '#a855f7' }];
+  };
 
   const GRAVITY_G = S.GRAVITY_G || 100;
 
@@ -1069,6 +1074,63 @@
     ctx.stroke();
   }
 
+  /**
+   * Top-down portal: colored line segment on the host aperture + faint glow along face normal
+   * (out of the wall into the room — not in-plane bloom only).
+   */
+  function drawPortals(ctx, hole) {
+    const pairs = hole.portalPairs || [];
+    if (!pairs.length || !resolvePortalAperture) return;
+    const colors = portalPairColors(pairs.length);
+    for (let pi = 0; pi < pairs.length; pi++) {
+      const pair = pairs[pi];
+      const col = colors[pi] || colors[colors.length - 1];
+      for (const side of ['a', 'b']) {
+        const ap = resolvePortalAperture(hole, pair[side], pair.width);
+        if (!ap) continue;
+        const color = col[side];
+        const ax = ap.cx - ap.tx * (pair.width * 0.5);
+        const ay = ap.cy - ap.ty * (pair.width * 0.5);
+        const bx = ap.cx + ap.tx * (pair.width * 0.5);
+        const by = ap.cy + ap.ty * (pair.width * 0.5);
+        // Glow along face normal (into the room).
+        const glowLen = 18;
+        const gx = ap.nx * glowLen;
+        const gy = ap.ny * glowLen;
+        const grad = ctx.createLinearGradient(ap.cx, ap.cy, ap.cx + gx, ap.cy + gy);
+        grad.addColorStop(0, color + '99');
+        grad.addColorStop(0.35, color + '44');
+        grad.addColorStop(1, color + '00');
+        ctx.save();
+        ctx.beginPath();
+        // Quad from aperture line out along normal.
+        ctx.moveTo(ax, ay);
+        ctx.lineTo(bx, by);
+        ctx.lineTo(bx + gx, by + gy);
+        ctx.lineTo(ax + gx, ay + gy);
+        ctx.closePath();
+        ctx.fillStyle = grad;
+        ctx.fill();
+        // Solid aperture stroke on the wall face.
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 5;
+        ctx.lineCap = 'round';
+        ctx.beginPath();
+        ctx.moveTo(ax, ay);
+        ctx.lineTo(bx, by);
+        ctx.stroke();
+        // Inner bright core
+        ctx.strokeStyle = '#ffffffcc';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(ax, ay);
+        ctx.lineTo(bx, by);
+        ctx.stroke();
+        ctx.restore();
+      }
+    }
+  }
+
   function drawHoleAndFlag(ctx, hole, flagPhase, space) {
     const phase = flagPhase != null ? flagPhase : 0;
     const { x, y } = hole.cup;
@@ -1141,6 +1203,7 @@
     for (const wm of hole.windmills || []) drawWindmill(ctx, wm);
     for (const p of hole.pendulums || []) drawPendulum(ctx, p);
     for (const g of hole.gates || []) drawSlidingGate(ctx, g);
+    drawPortals(ctx, hole);
     drawHoleAndFlag(ctx, hole, flagPhase, space);
 
     // Black holes: warp fairway/walls, then disk. Balls stay unwarped on top.
@@ -1172,6 +1235,7 @@
     nearBlackHole,
     warpBlackHoleLens,
     drawHoleAndFlag,
+    drawPortals,
     drawHoleStatic,
   };
 

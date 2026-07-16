@@ -61,6 +61,8 @@ const STATIC_FILES = [
   'putt.wav',
   'echoey_putt.wav',
   'putt_go_in.wav',
+  'sounds/portal/portal_enter.wav',
+  'sounds/portal/portal_exit.wav',
 ];
 
 /** @type {Map<string, { code: string, session: GameSession, createdAt: number }>} */
@@ -119,13 +121,23 @@ function destroyRoom(code) {
 function serveStatic(req, res) {
   let reqPath = (req.url || '/').split('?')[0];
   if (reqPath === '/') reqPath = '/index.html';
-  const name = path.basename(reqPath);
-  if (!STATIC_FILES.includes(name)) {
+  // Allowlisted relative paths (may include subdirs like sounds/portal/...).
+  const rel = path.normalize(reqPath).replace(/^(\.\.(\/|\\|$))+/, '').replace(/^[/\\]+/, '');
+  const name = STATIC_FILES.includes(rel)
+    ? rel
+    : (STATIC_FILES.includes(path.basename(rel)) ? path.basename(rel) : null);
+  if (!name) {
     res.writeHead(404, { 'Content-Type': 'text/plain' });
     res.end('Not found\n');
     return;
   }
   const filePath = path.join(ROOT, name);
+  // Path-traversal guard: resolved file must stay under ROOT.
+  if (!filePath.startsWith(ROOT + path.sep) && filePath !== ROOT) {
+    res.writeHead(404, { 'Content-Type': 'text/plain' });
+    res.end('Not found\n');
+    return;
+  }
   fs.readFile(filePath, (err, data) => {
     if (err) {
       res.writeHead(500, { 'Content-Type': 'text/plain' });

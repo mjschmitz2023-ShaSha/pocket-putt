@@ -451,6 +451,311 @@ function getSlidingGateSegment(g) {
     svx: g.axis === 'x' ? speed : 0, svy: g.axis === 'y' ? speed : 0,
   };
 }
+
+// ---- Portals (Valve-style pairs; max 2) ----
+// Data: hole.portalPairs[{ width, a:{host,index,t,face}, b:{...} }]
+// host: 'wall' | 'gate' | 'pendulum'. face ±1 picks enterable side. width shared by pair.
+const PORTAL_MAX_PAIRS = 2;
+const PORTAL_MIN_WIDTH = 2 * BALL_RADIUS + 4; // ball diameter + margin
+const PORTAL_DEFAULT_WIDTH = 48;
+/** Relative velocity into the face (along inward normal) must exceed this. */
+const PORTAL_ENTER_DOT_EPS = 8;
+/** Place ball this far past exit face along outward normal (clear thick wall). */
+const PORTAL_EXIT_CLEAR = BALL_RADIUS + WALL_HALF_WIDTH + 1.5;
+const PORTAL_HOST_CODES = { wall: 0, gate: 1, pendulum: 2 };
+const PORTAL_HOST_NAMES = ['wall', 'gate', 'pendulum'];
+
+/** Runtime colors: not stored. 1 pair orange↔blue; 2 pairs coop orange↔red + blue↔purple. */
+function portalPairColors(pairCount) {
+  if (pairCount <= 1) {
+    return [{ a: '#f97316', b: '#38bdf8' }]; // orange, blue
+  }
+  return [
+    { a: '#f97316', b: '#ef4444' }, // orange, red
+    { a: '#38bdf8', b: '#a855f7' }, // blue, purple
+  ];
+}
+
+function portalHostArray(hole, host) {
+  if (host === 'wall') return hole.walls || [];
+  if (host === 'gate') return hole.gates || [];
+  if (host === 'pendulum') return hole.pendulums || [];
+  return null;
+}
+
+/** Live segment for a portal host (walls static; gates/pendulums move). */
+function resolvePortalHostSegment(hole, host, index) {
+  const arr = portalHostArray(hole, host);
+  if (!arr || index < 0 || index >= arr.length) return null;
+  if (host === 'wall') {
+    const w = arr[index];
+    return {
+      x1: w.x1, y1: w.y1, x2: w.x2, y2: w.y2,
+      restitution: w.restitution != null ? w.restitution : (w.bumper ? BUMPER_RESTITUTION : WALL_RESTITUTION),
+      bumper: !!w.bumper,
+      svx: 0, svy: 0,
+    };
+  }
+  if (host === 'gate') return getSlidingGateSegment(arr[index]);
+  if (host === 'pendulum') return getPendulumSegment(arr[index]);
+  return null;
+}
+
+/**
+ * Resolved aperture frame for one portal end.
+ * n points from the wall into the enterable room (outward face normal).
+ * Surface velocity is at the aperture center (includes pendulum omega).
+ */
+function resolvePortalAperture(hole, end, width) {
+  if (!end || !hole) return null;
+  const host = end.host;
+  const index = end.index | 0;
+  const seg = resolvePortalHostSegment(hole, host, index);
+  if (!seg) return null;
+  const dx = seg.x2 - seg.x1, dy = seg.y2 - seg.y1;
+  const len = Math.hypot(dx, dy);
+  if (!(len > 1e-6)) return null;
+  const tx = dx / len, ty = dy / len;
+  // Left normal when walking (x1→x2); face multiplies for designer side.
+  const n0x = -ty, n0y = tx;
+  const face = end.face === -1 ? -1 : 1;
+  const nx = n0x * face, ny = n0y * face;
+  let t = Number(end.t);
+  if (!Number.isFinite(t)) t = 0.5;
+  t = Math.max(0, Math.min(1, t));
+  const w = Math.max(PORTAL_MIN_WIDTH, Number(width) || PORTAL_DEFAULT_WIDTH);
+  const halfT = Math.min(0.5, (w * 0.5) / len);
+  // Keep aperture fully on the segment.
+  t = Math.max(halfT, Math.min(1 - halfT, t));
+  const cx = seg.x1 + t * dx, cy = seg.y1 + t * dy;
+  let svx = seg.svx || 0, svy = seg.svy || 0;
+  if (seg.pivot && seg.omega) {
+    svx = -seg.omega * (cy - seg.pivot.y);
+    svy = seg.omega * (cx - seg.pivot.x);
+  }
+  return {
+    host, index, t, face, width: w,
+    cx, cy, nx, ny, tx, ty, len,
+    t0: t - halfT, t1: t + halfT,
+    halfT, svx, svy,
+    x1: seg.x1, y1: seg.y1, x2: seg.x2, y2: seg.y2,
+    restitution: seg.restitution,
+    pivot: seg.pivot || null,
+    omega: seg.omega || 0,
+  };
+}
+
+/** Open t-intervals [t0,t1] on a host segment from all portal ends. */
+function portalOpenIntervalsOnHost(hole, host, index) {
+  const pairs = hole.portalPairs || [];
+  const out = [];
+  for (let pi = 0; pi < pairs.length; pi++) {
+    const pair = pairs[pi];
+    if (!pair) continue;
+    for (const side of ['a', 'b']) {
+      const end = pair[side];
+      if (!end || end.host !== host || (end.index | 0) !== index) continue;
+      const ap = resolvePortalAperture(hole, end, pair.width);
+      if (ap) out.push({ t0: ap.t0, t1: ap.t1 });
+    }
+  }
+  out.sort((u, v) => u.t0 - v.t0);
+  // Merge overlaps
+  const merged = [];
+  for (const iv of out) {
+    if (!merged.length || iv.t0 > merged[merged.length - 1].t1 + 1e-9) {
+      merged.push({ t0: iv.t0, t1: iv.t1 });
+    } else {
+      merged[merged.length - 1].t1 = Math.max(merged[merged.length - 1].t1, iv.t1);
+    }
+  }
+  return merged;
+}
+
+/** Solid t-ranges on [0,1] after subtracting open portal intervals. */
+function solidTRangesFromOpens(opens) {
+  const solids = [];
+  let cursor = 0;
+  for (const iv of opens) {
+    const a = Math.max(0, Math.min(1, iv.t0));
+    const b = Math.max(0, Math.min(1, iv.t1));
+    if (a > cursor + 1e-9) solids.push({ t0: cursor, t1: a });
+    cursor = Math.max(cursor, b);
+  }
+  if (cursor < 1 - 1e-9) solids.push({ t0: cursor, t1: 1 });
+  return solids;
+}
+
+function subsegmentFromT(seg, t0, t1) {
+  const dx = seg.x2 - seg.x1, dy = seg.y2 - seg.y1;
+  const out = {
+    x1: seg.x1 + t0 * dx,
+    y1: seg.y1 + t0 * dy,
+    x2: seg.x1 + t1 * dx,
+    y2: seg.y1 + t1 * dy,
+    restitution: seg.restitution != null ? seg.restitution : WALL_RESTITUTION,
+  };
+  if (seg.bumper) out.bumper = true;
+  if (seg.svx != null) out.svx = seg.svx;
+  if (seg.svy != null) out.svy = seg.svy;
+  if (seg.pivot) {
+    out.pivot = seg.pivot;
+    out.omega = seg.omega || 0;
+  }
+  return out;
+}
+
+/** Carve portal apertures out of a host segment → 0..N solid pieces. */
+function carvePortalOpenings(hole, host, index, seg) {
+  if (!seg) return [];
+  const opens = portalOpenIntervalsOnHost(hole, host, index);
+  if (!opens.length) return [seg];
+  const solids = solidTRangesFromOpens(opens);
+  const pieces = [];
+  for (const r of solids) {
+    if (r.t1 - r.t0 < 1e-6) continue;
+    pieces.push(subsegmentFromT(seg, r.t0, r.t1));
+  }
+  return pieces;
+}
+
+/**
+ * Map velocity through a portal pair (Valve local-frame).
+ * n = outward face normal (into room). vn_in = dot(v_rel, n_entry) is negative when entering.
+ * Exit: v_rel_out = (-vn) * n_exit + vt * t_exit, then add exit surface velocity.
+ */
+function mapVelocityThroughPortals(vx, vy, entryAp, exitAp) {
+  const rvx = vx - entryAp.svx;
+  const rvy = vy - entryAp.svy;
+  const vn = rvx * entryAp.nx + rvy * entryAp.ny;
+  const vt = rvx * entryAp.tx + rvy * entryAp.ty;
+  const outRelX = (-vn) * exitAp.nx + vt * exitAp.tx;
+  const outRelY = (-vn) * exitAp.ny + vt * exitAp.ty;
+  return {
+    vx: outRelX + exitAp.svx,
+    vy: outRelY + exitAp.svy,
+  };
+}
+
+/**
+ * Project ball center onto segment parametric t and signed distance along outward normal n.
+ * Returns null if segment degenerate.
+ */
+function projectOntoAperture(ball, ap) {
+  const dx = ap.x2 - ap.x1, dy = ap.y2 - ap.y1;
+  const lenSq = dx * dx + dy * dy;
+  if (!(lenSq > 1e-12)) return null;
+  const t = ((ball.x - ap.x1) * dx + (ball.y - ap.y1) * dy) / lenSq;
+  const px = ap.x1 + t * dx, py = ap.y1 + t * dy;
+  // signed distance from centerline along face normal
+  const side = (ball.x - px) * ap.nx + (ball.y - py) * ap.ny;
+  return { t, side, px, py };
+}
+
+/**
+ * Try teleport through any portal pair. Mutates ball; returns event or null.
+ * Requires grounded, not sticky-latched, center in aperture, inward relative velocity.
+ * Exit position preserves along-aperture offset (not always aperture center).
+ */
+function tryPortalTeleport(ball, hole) {
+  if ((ball.z || 0) > 0.001) return null;
+  if (typeof ball.stuckStickyIndex === 'number' && ball.stuckStickyIndex >= 0) return null;
+  const pairs = hole.portalPairs || [];
+  for (let pi = 0; pi < pairs.length; pi++) {
+    const pair = pairs[pi];
+    if (!pair || !pair.a || !pair.b) continue;
+    const sides = [
+      { from: 'a', to: 'b', end: pair.a, other: pair.b },
+      { from: 'b', to: 'a', end: pair.b, other: pair.a },
+    ];
+    for (const s of sides) {
+      const entryAp = resolvePortalAperture(hole, s.end, pair.width);
+      const exitAp = resolvePortalAperture(hole, s.other, pair.width);
+      if (!entryAp || !exitAp) continue;
+      const proj = projectOntoAperture(ball, entryAp);
+      if (!proj) continue;
+      // Center must lie in open aperture along the wall.
+      if (proj.t < entryAp.t0 || proj.t > entryAp.t1) continue;
+      // Must approach from enterable face (side > 0) or be crossing the slab from that side.
+      // Back face (side << 0) never teleports — wall stays solid there.
+      if (proj.side > WALL_HALF_WIDTH + 2) continue;
+      if (proj.side < -1) continue;
+      const rvx = ball.vx - entryAp.svx;
+      const rvy = ball.vy - entryAp.svy;
+      // Inward = into portal = opposite outward normal → -dot(v_rel, n) > eps
+      const into = -(rvx * entryAp.nx + rvy * entryAp.ny);
+      if (into <= PORTAL_ENTER_DOT_EPS) continue;
+      // Along-aperture offset from entry center (local tangent); clamp to half-width.
+      let along = (ball.x - entryAp.cx) * entryAp.tx + (ball.y - entryAp.cy) * entryAp.ty;
+      const half = pair.width * 0.5;
+      if (along > half) along = half;
+      if (along < -half) along = -half;
+      // Map local-t offset onto exit aperture (same basis convention as velocity map).
+      const mapped = mapVelocityThroughPortals(ball.vx, ball.vy, entryAp, exitAp);
+      ball.x = exitAp.cx + exitAp.tx * along + exitAp.nx * PORTAL_EXIT_CLEAR;
+      ball.y = exitAp.cy + exitAp.ty * along + exitAp.ny * PORTAL_EXIT_CLEAR;
+      ball.vx = mapped.vx;
+      ball.vy = mapped.vy;
+      return { type: 'portal', pairIndex: pi, from: s.from, to: s.to };
+    }
+  }
+  return null;
+}
+
+/**
+ * Attach one-sided portal opens to a host segment for collision.
+ * Opens are only passable from the enterable face; the back remains solid.
+ */
+function attachPortalOpens(hole, host, index, seg) {
+  if (!seg) return seg;
+  const pairs = hole.portalPairs || [];
+  if (!pairs.length) return seg;
+  const opens = [];
+  for (let pi = 0; pi < pairs.length; pi++) {
+    const pair = pairs[pi];
+    if (!pair) continue;
+    for (const side of ['a', 'b']) {
+      const end = pair[side];
+      if (!end || end.host !== host || (end.index | 0) !== index) continue;
+      const ap = resolvePortalAperture(hole, end, pair.width);
+      if (!ap) continue;
+      opens.push({ t0: ap.t0, t1: ap.t1, nx: ap.nx, ny: ap.ny });
+    }
+  }
+  if (opens.length) seg.portalOpens = opens;
+  return seg;
+}
+
+/**
+ * Build collision wall list. Portal apertures are NOT fully carved out — the wall stays
+ * solid on the back face. resolveWallCollision skips only the enterable face of opens.
+ */
+function collisionWallsForHole(hole, ballZ) {
+  if (ballZ > 0) return boundaryWallsFor(hole);
+  let walls = boundaryWallsFor(hole).slice();
+  for (let i = 0; i < (hole.walls || []).length; i++) {
+    const w = hole.walls[i];
+    const seg = {
+      x1: w.x1, y1: w.y1, x2: w.x2, y2: w.y2,
+      restitution: w.restitution != null ? w.restitution : (w.bumper ? BUMPER_RESTITUTION : WALL_RESTITUTION),
+      bumper: !!w.bumper,
+    };
+    walls.push(attachPortalOpens(hole, 'wall', i, seg));
+  }
+  for (const wm of hole.windmills || []) {
+    walls = walls.concat(getWindmillBlades(wm));
+  }
+  for (let i = 0; i < (hole.pendulums || []).length; i++) {
+    const seg = getPendulumSegment(hole.pendulums[i]);
+    walls.push(attachPortalOpens(hole, 'pendulum', i, seg));
+  }
+  for (let i = 0; i < (hole.gates || []).length; i++) {
+    const seg = getSlidingGateSegment(hole.gates[i]);
+    walls.push(attachPortalOpens(hole, 'gate', i, seg));
+  }
+  return walls;
+}
+
 function ringBumpers(cx, cy, r, n, gapIndex) {
   const walls = [];
   for (let i = 0; i < n; i++) {
@@ -1376,13 +1681,14 @@ const COURSES = [
   { id: 'orbit', name: 'Orbit', holes: ORBIT_HOLES },
 ];
 
-// Classic's hole literals predate ramps/sticky/gravity — fill arrays in one pass so the
+// Classic's hole literals predate ramps/sticky/gravity/portals — fill arrays in one pass so the
 // "every hole carries every array" invariant keeps holding without editing every literal.
 for (const c of COURSES) {
   for (const h of c.holes) {
     h.ramps = h.ramps || [];
     h.sticky = h.sticky || [];
     h.gravityBodies = h.gravityBodies || [];
+    h.portalPairs = h.portalPairs || [];
   }
 }
 
@@ -1403,6 +1709,20 @@ function resolveWallCollision(ball, w) {
   // Surface-to-surface: ball disk vs stadium (capsule) around the segment.
   const contactR = BALL_RADIUS + WALL_HALF_WIDTH;
   if (dist < contactR && dist > 0.0001) {
+    // One-sided portal: within aperture, skip collision only on the enterable face.
+    // Back face of the wall stays solid (cannot walk through the portal hole from behind).
+    if (w.portalOpens && w.portalOpens.length) {
+      for (let oi = 0; oi < w.portalOpens.length; oi++) {
+        const op = w.portalOpens[oi];
+        if (t < op.t0 || t > op.t1) continue;
+        // Positive = ball is on the enterable-room side of the centerline.
+        const faceSide = distX * op.nx + distY * op.ny;
+        if (faceSide >= -WALL_HALF_WIDTH * 0.25) {
+          return false;
+        }
+        break; // in aperture but on back — solid bounce below
+      }
+    }
     const nx = distX / dist, ny = distY / dist;
     const overlap = contactR - dist;
     ball.x += nx * (overlap + 0.1);
@@ -1490,11 +1810,6 @@ function latchStickyAfterPutt(ball, hole) {
 // CRITICAL for multiplayer: host and client must call this with the SAME dt schedule per
 // sim tick. Sticky stop thresholds are speed-based and fork hard if one side microsteps more.
 function stepBallPhysics(ball, hole, dt) {
-  let walls = boundaryWallsFor(hole).concat(hole.walls);
-  for (const wm of hole.windmills) walls = walls.concat(getWindmillBlades(wm));
-  if (hole.pendulums.length) walls = walls.concat(hole.pendulums.map(getPendulumSegment));
-  if (hole.gates.length) walls = walls.concat(hole.gates.map(getSlidingGateSegment));
-
   // Normalize legacy balls that still have stuckTo object refs.
   if (typeof ball.stuckStickyIndex !== 'number') {
     ball.stuckStickyIndex = -1;
@@ -1508,6 +1823,7 @@ function stepBallPhysics(ball, hole, dt) {
   const events = {
     holed: false, water: null, blackHole: null, boosts: [],
     bounced: false, enteredSand: false, launched: false, landed: false, stuck: false,
+    portals: [],
   };
 
   for (let s = 0; s < substeps; s++) {
@@ -1590,10 +1906,17 @@ function stepBallPhysics(ball, hole, dt) {
     }
 
     // Airborne balls fly over interior walls and moving obstacles; only the perimeter
-    // fence is "tall" enough to knock them back in.
-    const wallList = ball.z > 0 ? boundaryWallsFor(hole) : walls;
-    for (const w of wallList) {
+    // fence is "tall" enough to knock them back in. Portal apertures are open holes.
+    // Rebuild each substep so moving gate/pendulum portals track live segments.
+    const walls = collisionWallsForHole(hole, ball.z || 0);
+    for (const w of walls) {
       if (resolveWallCollision(ball, w)) events.bounced = true;
+    }
+
+    // Portal teleport after collision so open-hole + inward velocity can fire this substep.
+    if ((ball.z || 0) <= 0) {
+      const pe = tryPortalTeleport(ball, hole);
+      if (pe) events.portals.push(pe);
     }
 
     // Planets / moons: solid bounce (Orbit). Airborne skips interior solids like walls.
@@ -1923,7 +2246,8 @@ function clampDragVector(v) {
 // v3: gravity body radius/mass/fieldRadius/drawRadius as f32 (v1/v2 used i16 qCoord/qF10:
 //     mass clamped at 3276.7; radius quantum 0.1 so sub-0.05 radii became 0 then
 //     normalizeGravityBody's `|| 10` reset them to 10).
-const LEVEL_CODEC_VERSION = 3;
+// v4: portalPairs after gravityBodies (max 2 complete pairs).
+const LEVEL_CODEC_VERSION = 4;
 const LEVEL_MAX_B64_LEN = 4096;
 const LEVEL_MAX_NAME_LEN = 40;
 // Array lengths are packed as u8 in the share codec — hard ceiling per kind is 255.
@@ -1942,6 +2266,7 @@ const LEVEL_CAPS = {
   gates: LEVEL_MAX_KIND_COUNT,
   windmills: LEVEL_MAX_KIND_COUNT,
   gravityBodies: LEVEL_MAX_KIND_COUNT,
+  portalPairs: PORTAL_MAX_PAIRS,
 };
 
 // ---- Level share links (long ?lvl= / short ?lvl_short= via TinyURL) ----
@@ -2066,9 +2391,104 @@ function blankHole(overrides) {
     ramps: [],
     sticky: [],
     gravityBodies: [],
+    portalPairs: [],
   };
   if (overrides && typeof overrides === 'object') Object.assign(h, overrides);
   return h;
+}
+
+function normalizePortalEnd(end) {
+  if (!end || typeof end !== 'object') return null;
+  const host = end.host === 'gate' || end.host === 'pendulum' ? end.host : (end.host === 'wall' ? 'wall' : null);
+  if (!host) return null;
+  let index = Math.round(Number(end.index));
+  if (!Number.isFinite(index) || index < 0) index = 0;
+  if (index > 255) index = 255;
+  let t = Number(end.t);
+  if (!Number.isFinite(t)) t = 0.5;
+  t = Math.max(0, Math.min(1, t));
+  const face = end.face === -1 || end.face === 0 || end.face === false ? -1 : 1;
+  return { host, index, t, face };
+}
+
+/**
+ * Normalize portal pairs: max 2, complete pairs only, shared width, clamp width to hosts,
+ * no overlapping apertures on the same host segment.
+ */
+function normalizePortalPairs(rawPairs, hole) {
+  const src = Array.isArray(rawPairs) ? rawPairs : [];
+  const out = [];
+  for (let i = 0; i < src.length && out.length < PORTAL_MAX_PAIRS; i++) {
+    const p = src[i];
+    if (!p || typeof p !== 'object') continue;
+    const a = normalizePortalEnd(p.a);
+    const b = normalizePortalEnd(p.b);
+    if (!a || !b) continue;
+    // Host indices must exist on the hole.
+    const aArr = portalHostArray(hole, a.host);
+    const bArr = portalHostArray(hole, b.host);
+    if (!aArr || a.index >= aArr.length) continue;
+    if (!bArr || b.index >= bArr.length) continue;
+    let width = Number(p.width);
+    if (!Number.isFinite(width)) width = PORTAL_DEFAULT_WIDTH;
+    width = Math.max(PORTAL_MIN_WIDTH, width);
+    // Clamp width to both host segment lengths.
+    const segA = resolvePortalHostSegment(hole, a.host, a.index);
+    const segB = resolvePortalHostSegment(hole, b.host, b.index);
+    if (!segA || !segB) continue;
+    const lenA = Math.hypot(segA.x2 - segA.x1, segA.y2 - segA.y1);
+    const lenB = Math.hypot(segB.x2 - segB.x1, segB.y2 - segB.y1);
+    const maxW = Math.min(lenA, lenB);
+    if (!(maxW >= PORTAL_MIN_WIDTH)) continue;
+    width = Math.min(width, maxW);
+    // Keep t so aperture fits on segment.
+    const halfTA = (width * 0.5) / lenA;
+    const halfTB = (width * 0.5) / lenB;
+    a.t = Math.max(halfTA, Math.min(1 - halfTA, a.t));
+    b.t = Math.max(halfTB, Math.min(1 - halfTB, b.t));
+    out.push({ width, a, b });
+  }
+  // Drop pairs that overlap apertures on the same host segment.
+  function intervalsOverlap(t0a, t1a, t0b, t1b) {
+    return t0a < t1b - 1e-9 && t0b < t1a - 1e-9;
+  }
+  function pairIntervals(pair) {
+    const list = [];
+    for (const side of ['a', 'b']) {
+      const end = pair[side];
+      const seg = resolvePortalHostSegment(hole, end.host, end.index);
+      if (!seg) continue;
+      const len = Math.hypot(seg.x2 - seg.x1, seg.y2 - seg.y1);
+      if (!(len > 1e-6)) continue;
+      const halfT = (pair.width * 0.5) / len;
+      list.push({ host: end.host, index: end.index, t0: end.t - halfT, t1: end.t + halfT });
+    }
+    return list;
+  }
+  const kept = [];
+  for (const pair of out) {
+    const ivs = pairIntervals(pair);
+    let bad = false;
+    // Self-overlap on same segment (both ends)
+    if (ivs.length === 2 && ivs[0].host === ivs[1].host && ivs[0].index === ivs[1].index) {
+      if (intervalsOverlap(ivs[0].t0, ivs[0].t1, ivs[1].t0, ivs[1].t1)) bad = true;
+    }
+    // Overlap with already kept pairs
+    if (!bad) {
+      for (const other of kept) {
+        const oivs = pairIntervals(other);
+        for (const u of ivs) {
+          for (const v of oivs) {
+            if (u.host === v.host && u.index === v.index && intervalsOverlap(u.t0, u.t1, v.t0, v.t1)) {
+              bad = true;
+            }
+          }
+        }
+      }
+    }
+    if (!bad) kept.push(pair);
+  }
+  return kept;
 }
 
 function qCoord(v) {
@@ -2188,6 +2608,16 @@ function clampEditorProp(selKind, key, value) {
   }
   if (k === 'radius' && selKind === 'cup') {
     return clampCodecQCoord(value, { min: 0.1 });
+  }
+  if (selKind === 'portalPairs') {
+    if (k === 'width') return clampCodecQCoord(value, { min: PORTAL_MIN_WIDTH });
+    if (k === 't') {
+      const n = Number(value);
+      if (!Number.isFinite(n)) return 0.5;
+      return Math.max(0, Math.min(1, codecQuantize(n, CODEC_QF100_STEP)));
+    }
+    if (k === 'face') return Number(value) === -1 ? -1 : 1;
+    if (k === 'index') return Math.max(0, Math.min(255, Math.round(Number(value) || 0)));
   }
   // Gate travel is spatial; pendulum amplitude is angular
   if (k === 'amplitude') {
@@ -2436,7 +2866,9 @@ function normalizeHole(raw) {
     gates: mapGates(raw.gates),
     windmills: mapMills(raw.windmills),
     gravityBodies: mapBodies(raw.gravityBodies),
+    portalPairs: [],
   };
+  hole.portalPairs = normalizePortalPairs(raw.portalPairs, hole);
   delete hole._cupMagnet;
   hole._orbitTick = 0;
   return hole;
@@ -2454,6 +2886,7 @@ function holeObjectCounts(hole) {
     gates: (hole.gates || []).length,
     windmills: (hole.windmills || []).length,
     gravityBodies: (hole.gravityBodies || []).length,
+    portalPairs: (hole.portalPairs || []).length,
   };
 }
 
@@ -2466,14 +2899,16 @@ function validateHole(raw) {
   if (hole.par < 1 || hole.par > 10) return { ok: false, error: 'bad_par' };
   const counts = holeObjectCounts(hole);
   for (const key of Object.keys(counts)) {
-    if (counts[key] > LEVEL_MAX_KIND_COUNT) {
+    const max = key === 'portalPairs' ? PORTAL_MAX_PAIRS : LEVEL_MAX_KIND_COUNT;
+    if (counts[key] > max) {
       // Codec packs each array length as u8 — more than 255 of one kind cannot be encoded.
+      // portalPairs hard-cap at PORTAL_MAX_PAIRS (2).
       return {
         ok: false,
         error: 'over_cap',
         field: key,
         count: counts[key],
-        max: LEVEL_MAX_KIND_COUNT,
+        max,
       };
     }
   }
@@ -2598,6 +3033,23 @@ function packHoleBytes(hole) {
       }
     }
   }
+  function writePortalEnd(end) {
+    const code = PORTAL_HOST_CODES[end.host];
+    w.u8(code != null ? code : 0);
+    w.u8(end.index & 0xff);
+    w.i16(qF100(end.t));
+    w.u8(end.face === -1 ? 0 : 1);
+  }
+  function writePortalPairs(arr) {
+    const n = Math.min(PORTAL_MAX_PAIRS, (arr || []).length);
+    w.u8(n);
+    for (let i = 0; i < n; i++) {
+      const p = arr[i];
+      w.i16(qCoord(p.width));
+      writePortalEnd(p.a);
+      writePortalEnd(p.b);
+    }
+  }
 
   writeWalls(hole.walls);
   writeRects(hole.sand);
@@ -2609,6 +3061,8 @@ function packHoleBytes(hole) {
   writeGates(hole.gates);
   writeMills(hole.windmills);
   writeBodies(hole.gravityBodies);
+  // v4+: portal pairs (always written at current codec version).
+  writePortalPairs(hole.portalPairs || []);
   return w.bytes();
 }
 
@@ -2616,7 +3070,7 @@ function unpackHoleBytes(bytes) {
   const r = new ByteReader(bytes);
   const ver = r.u8();
   // Accept current and prior layouts; unknown versions reject.
-  if (ver !== LEVEL_CODEC_VERSION && ver !== 1 && ver !== 2) {
+  if (ver < 1 || ver > LEVEL_CODEC_VERSION) {
     const err = new Error('bad_version');
     err.code = 'bad_version';
     err.version = ver;
@@ -2749,6 +3203,32 @@ function unpackHoleBytes(bytes) {
     return arr;
   }
 
+  function readPortalEnd() {
+    const code = r.u8();
+    const host = PORTAL_HOST_NAMES[code] || 'wall';
+    const index = r.u8();
+    const t = uqF100(r.i16());
+    const face = r.u8() === 0 ? -1 : 1;
+    return { host, index, t, face };
+  }
+  function readPortalPairs() {
+    if (ver < 4) return [];
+    const n = r.u8();
+    const arr = [];
+    const count = Math.min(PORTAL_MAX_PAIRS, n);
+    for (let i = 0; i < count; i++) {
+      const width = uqCoord(r.i16());
+      const a = readPortalEnd();
+      const b = readPortalEnd();
+      arr.push({ width, a, b });
+    }
+    // Consume any extra pairs beyond max without corrupting stream (defensive).
+    for (let i = count; i < n; i++) {
+      r.i16(); readPortalEnd(); readPortalEnd();
+    }
+    return arr;
+  }
+
   const raw = {
     name, par, tee, cup,
     walls: readWalls(),
@@ -2761,6 +3241,7 @@ function unpackHoleBytes(bytes) {
     gates: readGates(),
     windmills: readMills(),
     gravityBodies: readBodies(),
+    portalPairs: readPortalPairs(),
   };
   return normalizeHole(raw);
 }
@@ -2843,6 +3324,7 @@ function createTrajectorySim(hole, startBall, vx, vy, opts) {
     gates: hole.gates,
     windmills: hole.windmills,
     gravityBodies: hole.gravityBodies,
+    portalPairs: hole.portalPairs || [],
   })));
   // Preserve current obstacle phases from the live hole when frozen.
   if (hole.windmills) {
@@ -2914,7 +3396,12 @@ function stepTrajectorySim(sim, budgetTicks) {
     }
     if (sim.advanceMovers) advanceHoleObstacles(sim.h, TICK_DT);
     const ev = stepBallPhysics(sim.ball, sim.h, TICK_DT);
-    if (sim.ticksRun % sim.sampleEvery === 0) {
+    // Portal teleports: insert a path break so the ghost dotted line does not draw
+    // a diagonal across the map between entry and exit.
+    if (ev.portals && ev.portals.length) {
+      sim.pts.push(null); // break sentinel
+      sim.pts.push({ x: sim.ball.x, y: sim.ball.y });
+    } else if (sim.ticksRun % sim.sampleEvery === 0) {
       sim.pts.push({ x: sim.ball.x, y: sim.ball.y });
     }
     sim.ticksRun++;
@@ -2963,6 +3450,7 @@ return {
   RAMP_MIN_SPEED, RAMP_GRAVITY, RAMP_VZ_SCALE, RAMP_VZ_MIN, RAMP_VZ_MAX,
   FRICTION_STICKY, STICKY_STOP_SPEED, STICKY_LAUNCH_FACTOR, FRICTION_WET_GOO,
   GRAVITY_G, PLANET_RESTITUTION, ESCAPE_SPEED_MARGIN,
+  PORTAL_MAX_PAIRS, PORTAL_MIN_WIDTH, PORTAL_DEFAULT_WIDTH, PORTAL_ENTER_DOT_EPS, PORTAL_EXIT_CLEAR,
   wall, sandRect, waterRect, boostRect, rampRect, stickyRect, pendulum, getPendulumSegment, slidingGate,
   getSlidingGateSegment, ringBumpers, pointInZone, circleTouchesZone, zoneBounds, cupHasGravity,
   zoneCenterXY, orientedRectCorners, circleTouchesOrientedRect, circleTouchesRamp,
@@ -2974,6 +3462,8 @@ return {
   setMoonPoseAtTick, applyGravityAcceleration, resolvePlanetCollision, blackHoleCaptures,
   BOUNDARY_WALLS, SPACE_BOUND, SPACE_BOUNDARY_WALLS, boundaryWallsFor, HOLES, ORBIT_HOLES, COURSES,
   resolveWallCollision, getWindmillBlades,
+  portalPairColors, resolvePortalHostSegment, resolvePortalAperture, mapVelocityThroughPortals,
+  tryPortalTeleport, carvePortalOpenings, collisionWallsForHole, normalizePortalPairs,
   createBallState, stepBallPhysics, advanceHoleObstacles, setHoleObstaclesAtTick, resetHoleObstacles,
   computeLaunchVelocity, clampDragVector, stickyLaunchFactor, stickyIndexAt, latchStickyAfterPutt,
   markWetFromWater, noteWetPutt,

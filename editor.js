@@ -22,6 +22,8 @@
     CODEC_QF100_STEP, CODEC_QF100_MIN, CODEC_QF100_MAX,
     CODEC_I16_MAX,
     clampEditorProp, clampObjectForCodec,
+    PORTAL_MAX_PAIRS, PORTAL_MIN_WIDTH, PORTAL_DEFAULT_WIDTH,
+    resolvePortalHostSegment, resolvePortalAperture, normalizePortalPairs, portalPairColors,
   } = S;
 
   const SNAP = 5;
@@ -67,6 +69,8 @@
   /** Fixed-step residual for Test physics (matches Shared.TICK_DT / game TICK_HZ). */
   let testPhysAcc = 0;
   let placeStart = null;
+  /** While placing a portal pair: first end { host, index, t, face } or null. */
+  let portalPlaceA = null;
   /** Magnet crosshair target while dragging/placing ({x,y} or null). */
   let snapIndicator = null;
 
@@ -139,6 +143,7 @@
       btn.classList.add('active');
       tool = btn.dataset.tool;
       placeStart = null;
+      if (tool !== 'portal') portalPlaceA = null;
     });
   });
 
@@ -159,8 +164,53 @@
     if (!arr || selection.index < 0) return;
     arr.splice(selection.index, 1);
     selection = null;
+    portalPlaceA = null;
     renderProps();
   });
+
+  /**
+   * Hit-test wall / gate / pendulum segments for portal attachment.
+   * Returns { host, index, t, face } or null.
+   */
+  function hitPortalHost(x, y) {
+    const candidates = [];
+    function consider(host, index, seg) {
+      if (!seg) return;
+      const dx = seg.x2 - seg.x1, dy = seg.y2 - seg.y1;
+      const lenSq = dx * dx + dy * dy;
+      if (!(lenSq > 1e-6)) return;
+      const len = Math.sqrt(lenSq);
+      let t = ((x - seg.x1) * dx + (y - seg.y1) * dy) / lenSq;
+      t = Math.max(0, Math.min(1, t));
+      const cx = seg.x1 + t * dx, cy = seg.y1 + t * dy;
+      const dist = Math.hypot(x - cx, y - cy);
+      if (dist > 14) return;
+      const tx = dx / len, ty = dy / len;
+      const n0x = -ty, n0y = tx;
+      // Face points toward the click from the segment.
+      const side = (x - cx) * n0x + (y - cy) * n0y;
+      const face = side >= 0 ? 1 : -1;
+      candidates.push({ host, index, t, face, dist });
+    }
+    for (let i = 0; i < (hole.walls || []).length; i++) {
+      const w = hole.walls[i];
+      consider('wall', i, { x1: w.x1, y1: w.y1, x2: w.x2, y2: w.y2 });
+    }
+    for (let i = 0; i < (hole.gates || []).length; i++) {
+      consider('gate', i, getSlidingGateSegment(hole.gates[i]));
+    }
+    for (let i = 0; i < (hole.pendulums || []).length; i++) {
+      consider('pendulum', i, getPendulumSegment(hole.pendulums[i]));
+    }
+    if (!candidates.length) return null;
+    candidates.sort((a, b) => a.dist - b.dist);
+    const best = candidates[0];
+    return { host: best.host, index: best.index, t: best.t, face: best.face };
+  }
+
+  function reclampPortalPairs() {
+    hole.portalPairs = normalizePortalPairs(hole.portalPairs || [], hole);
+  }
 
   document.addEventListener('keydown', (e) => {
     if (mode !== 'edit') return;
@@ -299,7 +349,45 @@
       }
       return null;
     }
+    /**
+     * Portals first: full aperture segment (not only center), so both pairs are
+     * clickable and wall hosts under the aperture do not steal the click.
+     */
+    function hitPortalPairs() {
+      const pairs = hole.portalPairs || [];
+      if (!pairs.length || !resolvePortalAperture) return null;
+      const HIT_R = 14;
+      let best = null;
+      let bestDist = HIT_R;
+      for (let i = pairs.length - 1; i >= 0; i--) {
+        const pair = pairs[i];
+        if (!pair) continue;
+        for (const side of ['a', 'b']) {
+          const ap = resolvePortalAperture(hole, pair[side], pair.width);
+          if (!ap) continue;
+          const half = (pair.width || 0) * 0.5;
+          const x1 = ap.cx - ap.tx * half;
+          const y1 = ap.cy - ap.ty * half;
+          const x2 = ap.cx + ap.tx * half;
+          const y2 = ap.cy + ap.ty * half;
+          const dx = x2 - x1;
+          const dy = y2 - y1;
+          const lenSq = dx * dx + dy * dy;
+          let t = lenSq > 0 ? ((x - x1) * dx + (y - y1) * dy) / lenSq : 0.5;
+          t = Math.max(0, Math.min(1, t));
+          const cx = x1 + t * dx;
+          const cy = y1 + t * dy;
+          const d = Math.hypot(x - cx, y - cy);
+          if (d < bestDist) {
+            bestDist = d;
+            best = { kind: 'portalPairs', index: i };
+          }
+        }
+      }
+      return best;
+    }
     let h;
+    h = hitPortalPairs(); if (h) return h;
     h = hitWall(hole.walls, 'walls'); if (h) return h;
     h = hitRect(hole.sand, 'sand'); if (h) return h;
     h = hitRect(hole.water, 'water'); if (h) return h;
@@ -394,6 +482,14 @@
       num('amplitude', 'Amplitude', qc, 0, qchi);
       num('period', 'Period', q100, 0.01, q100hi);
       num('phase0', 'Phase offset (s)', q100, q100lo, q100hi);
+    } else if (selection.kind === 'portalPairs') {
+      const minW = PORTAL_MIN_WIDTH || 18;
+      num('width', 'Width (shared)', qc, minW, qchi);
+      fields.push(`<p class="muted">End A: ${obj.a.host}#${obj.a.index} · End B: ${obj.b.host}#${obj.b.index}</p>`);
+      fields.push(`<label>A t<input data-k="a.t" type="number" step="${q100}" min="0" max="1" value="${obj.a.t}"></label>`);
+      fields.push(`<label>B t<input data-k="b.t" type="number" step="${q100}" min="0" max="1" value="${obj.b.t}"></label>`);
+      fields.push(`<label>A face<select data-k="a.face"><option value="1" ${obj.a.face === 1 ? 'selected' : ''}>+1</option><option value="-1" ${obj.a.face === -1 ? 'selected' : ''}>−1</option></select></label>`);
+      fields.push(`<label>B face<select data-k="b.face"><option value="1" ${obj.b.face === 1 ? 'selected' : ''}>+1</option><option value="-1" ${obj.b.face === -1 ? 'selected' : ''}>−1</option></select></label>`);
     } else if (selection.kind === 'windmills') {
       num('cx', 'CX', qc, qclo, qchi); num('cy', 'CY', qc, qclo, qchi);
       num('armLength', 'Arm', qc, 0, qchi);
@@ -473,14 +569,45 @@
       applyLivePoseFromPhase0(obj, 'gravityBodies');
       return;
     }
+    // Portal pair nested props: a.t / b.t / a.face / b.face
+    if (selection.kind === 'portalPairs' && k && k.indexOf('.') === 1) {
+      const side = k[0]; // 'a' or 'b'
+      const field = k.slice(2);
+      if ((side === 'a' || side === 'b') && obj[side]) {
+        if (field === 'face') {
+          obj[side].face = Number(el.value) === -1 ? -1 : 1;
+        } else if (field === 't') {
+          obj[side].t = clampEditorProp('portalPairs', 't', el.value);
+          if (el.type === 'number') el.value = String(obj[side].t);
+        }
+        reclampPortalPairs();
+        // Selection may have been dropped if pair became invalid — re-resolve.
+        if (!hole.portalPairs[selection.index]) {
+          selection = hole.portalPairs.length
+            ? { kind: 'portalPairs', index: hole.portalPairs.length - 1 }
+            : null;
+        }
+        renderProps();
+        return;
+      }
+    }
     const raw = Number(el.value);
     if (!Number.isFinite(raw) && el.tagName !== 'SELECT') return;
     const n = clampEditorProp(selection.kind, k, raw);
     obj[k] = n;
+    if (selection.kind === 'portalPairs' && k === 'width') {
+      reclampPortalPairs();
+      renderProps();
+      return;
+    }
     // Reflect clamp back into the field so the UI never shows a non-shareable value.
     if (el.type === 'number' && Number(el.value) !== n) el.value = String(n);
     if (selection.kind === 'walls') {
       hole.walls[selection.index] = wall(obj.x1, obj.y1, obj.x2, obj.y2, { bumper: !!obj.bumper });
+      reclampPortalPairs();
+    }
+    if (selection.kind === 'gates' || selection.kind === 'pendulums') {
+      reclampPortalPairs();
     }
     if (k === 'phase0' || k === 'rotationSpeed') {
       applyLivePoseFromPhase0(obj, selection.kind);
@@ -566,8 +693,11 @@
       selection = hitTest(p.x, p.y);
       if (selection) {
         const obj = selectedObject();
-        drag = { mode: 'move', ox: p.x, oy: p.y, start: JSON.parse(JSON.stringify(obj)) };
-        capturePointer(e);
+        // Portal pairs move via host t gizmos, not free translate.
+        if (selection.kind !== 'portalPairs') {
+          drag = { mode: 'move', ox: p.x, oy: p.y, start: JSON.parse(JSON.stringify(obj)) };
+          capturePointer(e);
+        }
       }
       renderProps();
       return;
@@ -637,6 +767,42 @@
       hole.gravityBodies.push(moon(sx, sy, 90, 14, 22, 240, { orbitPhase0: 0 }));
       selection = { kind: 'gravityBodies', index: hole.gravityBodies.length - 1 };
       renderProps();
+      return;
+    }
+    if (tool === 'portal') {
+      const maxPairs = PORTAL_MAX_PAIRS || 2;
+      if ((hole.portalPairs || []).length >= maxPairs && !portalPlaceA) {
+        setStatus('Max ' + maxPairs + ' portal pairs', true);
+        return;
+      }
+      const end = hitPortalHost(p.x, p.y);
+      if (!end) {
+        setStatus('Click a wall, gate, or pendulum for the portal', true);
+        return;
+      }
+      if (!portalPlaceA) {
+        portalPlaceA = end;
+        setStatus('Portal end A placed — click partner host (wall/gate/pendulum)');
+        return;
+      }
+      const pair = {
+        width: PORTAL_DEFAULT_WIDTH || 48,
+        a: portalPlaceA,
+        b: end,
+      };
+      if (!hole.portalPairs) hole.portalPairs = [];
+      const before = hole.portalPairs.length;
+      hole.portalPairs.push(pair);
+      reclampPortalPairs();
+      if (hole.portalPairs.length <= before) {
+        setStatus('Portal pair rejected (overlap, short host, or invalid)', true);
+        portalPlaceA = null;
+        return;
+      }
+      selection = { kind: 'portalPairs', index: hole.portalPairs.length - 1 };
+      portalPlaceA = null;
+      setStatus('Portal pair added (' + hole.portalPairs.length + '/' + maxPairs + ')');
+      renderProps();
     }
   });
 
@@ -700,11 +866,21 @@
       const tag = EG.applyHandleDrag(selection.kind, obj, st, drag.handle, sn.x, sn.y, {
         setMoonPoseAtTick: S.setMoonPoseAtTick,
         tick: Math.floor(hole._orbitTick || 0),
+        hole,
       });
       // Keep drag results within share-link quantizer limits (power, orbit R, etc.).
       if (typeof clampObjectForCodec === 'function') clampObjectForCodec(selection.kind, obj);
       if (tag && tag.rebuildWall && selection.kind === 'walls') {
         hole.walls[selection.index] = wall(obj.x1, obj.y1, obj.x2, obj.y2, { bumper: !!st.bumper });
+      }
+      // Host geometry changed (wall ends, gate, pendulum) → clamp portal width/t to hosts.
+      if (
+        selection.kind === 'walls' ||
+        selection.kind === 'gates' ||
+        selection.kind === 'pendulums' ||
+        (selection.kind === 'portalPairs' && tag && (tag.portalT || tag.portalW))
+      ) {
+        reclampPortalPairs();
       }
       // Keep props in sync while dragging handles (angles, radii, etc.)
       // Avoid full re-render every frame of prop DOM — only when pointer settles on up;
@@ -723,6 +899,7 @@
         if (selection.kind === 'walls') {
           hole.walls[selection.index] = wall(obj.x1, obj.y1, obj.x2, obj.y2, { bumper: !!st.bumper });
         }
+        reclampPortalPairs();
       } else if (selection.kind === 'sand' || selection.kind === 'water' || selection.kind === 'boost' || selection.kind === 'ramps' || selection.kind === 'sticky') {
         const d = snappedMoveDelta(st.x1, st.y1, dx, dy, e);
         obj.x1 = st.x1 + d.dx; obj.y1 = st.y1 + d.dy;
@@ -734,6 +911,7 @@
       } else if (selection.kind === 'pendulums' || selection.kind === 'windmills') {
         const d = snappedMoveDelta(st.cx, st.cy, dx, dy, e);
         obj.cx = st.cx + d.dx; obj.cy = st.cy + d.dy;
+        if (selection.kind === 'pendulums') reclampPortalPairs();
       } else if (selection.kind === 'gravityBodies') {
         if (obj.kind === 'moon') {
           const d = snappedMoveDelta(st.orbitCenter.x, st.orbitCenter.y, dx, dy, e);
@@ -1513,9 +1691,20 @@
       ctx.lineWidth = 2;
       ctx.setLineDash([3, 5]);
       ctx.beginPath();
-      ctx.moveTo(trajectoryPts[0].x, trajectoryPts[0].y);
-      for (let i = 1; i < trajectoryPts.length; i++) {
-        ctx.lineTo(trajectoryPts[i].x, trajectoryPts[i].y);
+      let drawing = false;
+      for (let i = 0; i < trajectoryPts.length; i++) {
+        const p = trajectoryPts[i];
+        // null = portal teleport break — stop segment and start fresh after exit.
+        if (!p || !Number.isFinite(p.x) || !Number.isFinite(p.y)) {
+          drawing = false;
+          continue;
+        }
+        if (!drawing) {
+          ctx.moveTo(p.x, p.y);
+          drawing = true;
+        } else {
+          ctx.lineTo(p.x, p.y);
+        }
       }
       ctx.stroke();
       ctx.setLineDash([]);

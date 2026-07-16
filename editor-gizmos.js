@@ -320,6 +320,35 @@
       return [windmillArmHandle(hole.windmills[idx])];
     }
 
+    if (kind === 'portalPairs' && hole.portalPairs && hole.portalPairs[idx]) {
+      const pair = hole.portalPairs[idx];
+      const S = (typeof root !== 'undefined' && root.Shared) || (typeof window !== 'undefined' && window.Shared);
+      const resolve = S && S.resolvePortalAperture;
+      const hs = [];
+      if (resolve) {
+        for (const side of ['a', 'b']) {
+          const ap = resolve(hole, pair[side], pair.width);
+          if (!ap) continue;
+          const end = pair[side];
+          // wSign: which side of the midpoint the width handle sits on (± along tangent).
+          // Dragging it through the position handle flips face and keeps it on the far side.
+          const wSign = end && end.wSign === -1 ? -1 : 1;
+          // Position (midpoint): slide along host
+          hs.push({ id: 't_' + side, kind: 'portalT', side, x: ap.cx, y: ap.cy });
+          // Width: existing single endpoint gizmo (no extra handles)
+          const half = pair.width * 0.5;
+          hs.push({
+            id: 'w_' + side,
+            kind: 'portalW',
+            side,
+            x: ap.cx + ap.tx * half * wSign,
+            y: ap.cy + ap.ty * half * wSign,
+          });
+        }
+      }
+      return hs;
+    }
+
     if (kind === 'gravityBodies' && hole.gravityBodies && hole.gravityBodies[idx]) {
       const b = hole.gravityBodies[idx];
       if (b.kind === 'moon' && b.orbitCenter) {
@@ -483,6 +512,72 @@
     if (selKind === 'windmills' && id === 'arm') {
       obj.armLength = lengthFromPivot(start.cx, start.cy, px, py, MIN_LENGTH);
       return { arm: true };
+    }
+
+    if (selKind === 'portalPairs') {
+      const S = (typeof root !== 'undefined' && root.Shared) || (typeof window !== 'undefined' && window.Shared);
+      const resolveHost = S && S.resolvePortalHostSegment;
+      if (id === 't_a' || id === 't_b') {
+        const side = id === 't_a' ? 'a' : 'b';
+        const end = obj[side];
+        if (end && resolveHost) {
+          // Need hole context — pass via opts.hole
+          const hole = opts.hole;
+          if (hole) {
+            const seg = resolveHost(hole, end.host, end.index);
+            if (seg) {
+              const dx = seg.x2 - seg.x1, dy = seg.y2 - seg.y1;
+              const lenSq = dx * dx + dy * dy;
+              if (lenSq > 1e-6) {
+                let t = ((px - seg.x1) * dx + (py - seg.y1) * dy) / lenSq;
+                t = Math.max(0, Math.min(1, t));
+                end.t = t;
+                return { portalT: true, side };
+              }
+            }
+          }
+        }
+      }
+      if (id === 'w_a' || id === 'w_b') {
+        const side = id === 'w_a' ? 'a' : 'b';
+        const end = obj[side];
+        const hole = opts.hole;
+        // start snapshot (restored every move frame) — face flip is relative to gesture start
+        const startEnd = start && start[side] ? start[side] : null;
+        if (end && hole && resolveHost) {
+          const seg = resolveHost(hole, end.host, end.index);
+          if (seg) {
+            const dx = seg.x2 - seg.x1, dy = seg.y2 - seg.y1;
+            const len = Math.hypot(dx, dy);
+            if (len > 1e-6) {
+              const tx = dx / len, ty = dy / len;
+              // Use live t from end (already restored from start each frame, then t may match start)
+              const cx = seg.x1 + end.t * dx, cy = seg.y1 + end.t * dy;
+              const along = (px - cx) * tx + (py - cy) * ty;
+              const minW = (S && S.PORTAL_MIN_WIDTH) || 18;
+              obj.width = Math.max(minW, Math.abs(along) * 2);
+
+              // Width handle side of midpoint (± along wall). Crossing the position
+              // gizmo (along sign vs gesture start) flips face; handle stays on that side.
+              const CROSS_EPS = 2;
+              const startWSign = startEnd && startEnd.wSign === -1 ? -1 : 1;
+              const startFace = startEnd && startEnd.face === -1 ? -1 : 1;
+              if (Math.abs(along) > CROSS_EPS) {
+                const curSign = along > 0 ? 1 : -1;
+                end.wSign = curSign;
+                // Flipped iff width handle is on the opposite side of midpoint from where drag began
+                end.face = (curSign !== startWSign) ? -startFace : startFace;
+              } else {
+                // Dead zone on the midpoint — keep start face/side
+                end.wSign = startWSign;
+                end.face = startFace;
+              }
+              return { portalW: true, side };
+            }
+          }
+        }
+      }
+      return null;
     }
 
     if (selKind === 'gravityBodies') {
