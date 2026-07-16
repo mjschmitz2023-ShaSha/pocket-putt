@@ -12,8 +12,10 @@
   const CACHE_PREFIX = 'pp_lvl_short_';
   let menuEl = null;
   let statusEl = null;
+  let urlPreviewEl = null;
   let pendingLvl = null;
   let busy = false;
+  let closeTimer = null;
 
   function cacheKey(lvl) {
     // Stable short key without storing the whole base64 blob as the storage key.
@@ -47,7 +49,7 @@
   }
 
   async function copyText(text) {
-    if (navigator.clipboard && navigator.clipboard.writeText) {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
       await navigator.clipboard.writeText(text);
       return;
     }
@@ -58,18 +60,65 @@
     ta.style.position = 'fixed';
     ta.style.left = '-9999px';
     document.body.appendChild(ta);
+    ta.focus();
     ta.select();
+    ta.setSelectionRange(0, text.length);
     try {
-      if (!document.execCommand('copy')) throw new Error('copy failed');
+      if (!document.execCommand('copy')) throw new Error('clipboard unavailable');
     } finally {
       document.body.removeChild(ta);
     }
   }
 
-  function setStatus(msg, isError) {
+  function setBusy(on) {
+    busy = !!on;
+    const shortBtn = document.getElementById('btn-share-short');
+    const longBtn = document.getElementById('btn-share-long');
+    if (shortBtn) shortBtn.disabled = !!on;
+    if (longBtn) longBtn.disabled = !!on;
+  }
+
+  function resetChoiceButtons() {
+    const shortBtn = document.getElementById('btn-share-short');
+    const longBtn = document.getElementById('btn-share-long');
+    if (shortBtn) {
+      shortBtn.disabled = false;
+      shortBtn.classList.remove('is-copied');
+      shortBtn.querySelector('.share-choice-title').textContent = 'Copy short link';
+    }
+    if (longBtn) {
+      longBtn.disabled = false;
+      longBtn.classList.remove('is-copied');
+      longBtn.querySelector('.share-choice-title').textContent = 'Copy permanent link';
+    }
+  }
+
+  function setStatus(msg, kind) {
+    // kind: '' | 'ok' | 'error' | 'pending'
     if (!statusEl) return;
     statusEl.textContent = msg || '';
-    statusEl.classList.toggle('is-error', !!isError);
+    statusEl.classList.remove('is-error', 'is-ok', 'is-pending');
+    if (kind === 'error') statusEl.classList.add('is-error');
+    else if (kind === 'ok') statusEl.classList.add('is-ok');
+    else if (kind === 'pending') statusEl.classList.add('is-pending');
+  }
+
+  function setUrlPreview(url) {
+    if (!urlPreviewEl) return;
+    if (!url) {
+      urlPreviewEl.classList.add('hidden');
+      urlPreviewEl.value = '';
+      return;
+    }
+    urlPreviewEl.value = url;
+    urlPreviewEl.classList.remove('hidden');
+    // Select so user can Cmd+C again if clipboard failed silently.
+    try {
+      urlPreviewEl.focus();
+      urlPreviewEl.select();
+    } catch {
+      /* ignore */
+    }
   }
 
   function ensureMenu() {
@@ -80,22 +129,31 @@
       menuEl.id = 'share-level-menu';
       menuEl.className = 'hidden';
       menuEl.innerHTML =
-        '<div class="share-level-card" role="dialog" aria-labelledby="share-level-title">' +
-        '<h3 id="share-level-title">Share level</h3>' +
-        '<p class="share-level-lead">Copy a link friends can open in the browser.</p>' +
-        '<button type="button" id="btn-share-short" class="share-choice-btn">Short link</button>' +
-        '<p class="share-choice-desc">Compact URL via TinyURL. Share as pocketputt.net/?lvl_short=…</p>' +
-        '<button type="button" id="btn-share-long" class="share-choice-btn share-choice-secondary">Long link</button>' +
-        '<p class="share-choice-desc">Permanent — full level data lives in the URL.</p>' +
-        '<button type="button" id="btn-share-cancel" class="btn-quiet share-cancel-btn">Cancel</button>' +
-        '<p id="share-level-status" class="share-level-status" aria-live="polite"></p>' +
+        '<div class="share-level-card" role="dialog" aria-modal="true" aria-labelledby="share-level-title">' +
+        '<h3 id="share-level-title">Share this level</h3>' +
+        '<p class="share-level-lead">Pick a link type, then we copy it to your clipboard.</p>' +
+        '<div class="share-choice-list">' +
+        '<button type="button" id="btn-share-short" class="share-choice-btn">' +
+        '<span class="share-choice-title">Copy short link</span>' +
+        '<span class="share-choice-desc">Compact — easy to text or paste in chat. Uses TinyURL under the hood (may not last forever).</span>' +
+        '</button>' +
+        '<button type="button" id="btn-share-long" class="share-choice-btn share-choice-secondary">' +
+        '<span class="share-choice-title">Copy permanent link</span>' +
+        '<span class="share-choice-desc">Longer URL with the full level baked in. Always works; never depends on TinyURL.</span>' +
+        '</button>' +
+        '</div>' +
+        '<p id="share-level-status" class="share-level-status" aria-live="assertive"></p>' +
+        '<label class="share-url-label hidden" id="share-url-label" for="share-level-url">Link on clipboard</label>' +
+        '<input type="text" id="share-level-url" class="share-level-url hidden" readonly aria-label="Copied share link">' +
+        '<button type="button" id="btn-share-cancel" class="btn-quiet share-cancel-btn">Close</button>' +
         '</div>';
       document.body.appendChild(menuEl);
     }
     statusEl = document.getElementById('share-level-status');
+    urlPreviewEl = document.getElementById('share-level-url');
 
     menuEl.addEventListener('click', (e) => {
-      if (e.target === menuEl) closeShareMenu();
+      if (e.target === menuEl && !busy) closeShareMenu();
     });
     const btnShort = document.getElementById('btn-share-short');
     const btnLong = document.getElementById('btn-share-long');
@@ -103,8 +161,13 @@
     if (btnShort) btnShort.addEventListener('click', () => void onChooseShort());
     if (btnLong) btnLong.addEventListener('click', () => void onChooseLong());
     if (btnCancel) btnCancel.addEventListener('click', closeShareMenu);
+    if (urlPreviewEl) {
+      urlPreviewEl.addEventListener('click', () => {
+        try { urlPreviewEl.select(); } catch { /* ignore */ }
+      });
+    }
     document.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape' && menuEl && !menuEl.classList.contains('hidden')) {
+      if (e.key === 'Escape' && menuEl && !menuEl.classList.contains('hidden') && !busy) {
         closeShareMenu();
       }
     });
@@ -116,10 +179,18 @@
       console.warn('openShareMenu: missing lvl');
       return;
     }
+    if (closeTimer) {
+      clearTimeout(closeTimer);
+      closeTimer = null;
+    }
     pendingLvl = lvl;
     busy = false;
     ensureMenu();
-    setStatus('');
+    resetChoiceButtons();
+    setStatus('Tap a button above to copy a link.', '');
+    setUrlPreview('');
+    const urlLabel = document.getElementById('share-url-label');
+    if (urlLabel) urlLabel.classList.add('hidden');
     menuEl.classList.remove('hidden');
     const shortBtn = document.getElementById('btn-share-short');
     if (shortBtn) shortBtn.focus();
@@ -127,24 +198,70 @@
 
   function closeShareMenu() {
     if (!menuEl) return;
+    if (closeTimer) {
+      clearTimeout(closeTimer);
+      closeTimer = null;
+    }
     menuEl.classList.add('hidden');
     pendingLvl = null;
     busy = false;
     setStatus('');
+    setUrlPreview('');
+    resetChoiceButtons();
+  }
+
+  function markCopied(which, url) {
+    const btn = document.getElementById(which === 'short' ? 'btn-share-short' : 'btn-share-long');
+    if (btn) {
+      btn.classList.add('is-copied');
+      const title = btn.querySelector('.share-choice-title');
+      if (title) title.textContent = '✓ Copied!';
+    }
+    setUrlPreview(url);
+    const urlLabel = document.getElementById('share-url-label');
+    if (urlLabel) {
+      urlLabel.classList.remove('hidden');
+      urlLabel.textContent = 'Copied — paste anywhere (or select below to re-copy)';
+    }
+    setStatus(
+      which === 'short'
+        ? 'Short link copied to clipboard.'
+        : 'Permanent link copied to clipboard.',
+      'ok'
+    );
+    // Keep the success state on screen long enough to read; do not vanish instantly.
+    if (closeTimer) clearTimeout(closeTimer);
+    closeTimer = setTimeout(() => {
+      closeTimer = null;
+      // Leave dialog open — user closes when ready. Just clear busy.
+      setBusy(false);
+    }, 400);
   }
 
   async function onChooseLong() {
     if (busy || !pendingLvl) return;
-    busy = true;
-    setStatus('Copying…');
+    setBusy(true);
+    setStatus('Copying permanent link…', 'pending');
+    setUrlPreview('');
     try {
       const url = S.buildLongLevelUrl(pendingLvl, pageBaseHref());
       await copyText(url);
-      setStatus('Long link copied (' + url.length + ' chars)');
-      setTimeout(closeShareMenu, 700);
+      markCopied('long', url);
     } catch (e) {
-      setStatus('Copy failed: ' + (e && e.message ? e.message : e), true);
-      busy = false;
+      setStatus(
+        'Could not copy. Select the link below and press ⌘C / Ctrl+C.',
+        'error'
+      );
+      try {
+        const url = S.buildLongLevelUrl(pendingLvl, pageBaseHref());
+        setUrlPreview(url);
+        const urlLabel = document.getElementById('share-url-label');
+        if (urlLabel) {
+          urlLabel.classList.remove('hidden');
+          urlLabel.textContent = 'Copy this permanent link manually';
+        }
+      } catch { /* ignore */ }
+      setBusy(false);
     }
   }
 
@@ -170,23 +287,20 @@
 
   async function onChooseShort() {
     if (busy || !pendingLvl) return;
-    busy = true;
-    setStatus('Creating short link…');
-    const shortBtn = document.getElementById('btn-share-short');
-    if (shortBtn) shortBtn.disabled = true;
+    setBusy(true);
+    setStatus('Creating short link via TinyURL…', 'pending');
+    setUrlPreview('');
     try {
       const url = await createShortShareUrl(pendingLvl);
       await copyText(url);
-      setStatus('Short link copied');
-      setTimeout(closeShareMenu, 700);
+      markCopied('short', url);
     } catch (e) {
+      const detail = e && e.message ? e.message : String(e);
       setStatus(
-        'Short link failed: ' + (e && e.message ? e.message : e) + ' — try Long link instead.',
-        true
+        'Short link failed (' + detail + '). Try “Copy permanent link” instead.',
+        'error'
       );
-      busy = false;
-    } finally {
-      if (shortBtn) shortBtn.disabled = false;
+      setBusy(false);
     }
   }
 

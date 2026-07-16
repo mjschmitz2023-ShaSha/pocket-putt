@@ -1293,7 +1293,11 @@ function mpApplyCustomFromLobby(msg) {
       Game.pendingCustomLvl = msg.customLvl;
     }
   } else if (msg.hasCustomHole === false) {
-    Game.customHole = null;
+    // Room no longer has a custom hole — only clear if we weren't opened on a share link.
+    // (Host may still have pendingCustomLvl from URL before attaching it.)
+    if (!mpIsHost || !Game.pendingCustomLvl) {
+      Game.customHole = null;
+    }
   }
   const customLabel = document.getElementById('lobby-custom-label');
   const clearBtn = document.getElementById('btn-clear-custom');
@@ -1309,6 +1313,7 @@ function mpApplyCustomFromLobby(msg) {
   if (clearBtn) {
     clearBtn.classList.toggle('hidden', !(mpIsHost && msg.hasCustomHole));
   }
+  updateShareLevelButton();
 }
 
 function mpRenderLobby(msg) {
@@ -1367,8 +1372,12 @@ let mpConnectGeneration = 0;
 let mpPendingAction = null; // { type: 'create' } | { type: 'join', code }
 
 function mpClearRoomCreds() {
-  localStorage.removeItem('pocketPuttRoomCode');
-  localStorage.removeItem('pocketPuttReconnectToken');
+  // Room membership is session-only — never persist codes/tokens across visits.
+  // Stale localStorage keys from older builds are scrubbed here too.
+  try {
+    localStorage.removeItem('pocketPuttRoomCode');
+    localStorage.removeItem('pocketPuttReconnectToken');
+  } catch { /* private mode */ }
   mpRoomCode = null;
 }
 
@@ -1377,6 +1386,7 @@ function mpSocketOpen() {
 }
 
 function mpConnect(opts = {}) {
+  // skipAutoRejoin kept for call-site compat; we never auto-rejoin from storage.
   const skipAutoRejoin = !!opts.skipAutoRejoin;
   // Drop a half-open socket so create/join always get a clean handshake.
   if (mpSocket && (mpSocket.readyState === WebSocket.OPEN || mpSocket.readyState === WebSocket.CONNECTING)) {
@@ -1387,18 +1397,19 @@ function mpConnect(opts = {}) {
   mpSocket = new WebSocket(RELAY_WS);
   mpSocket.addEventListener('open', () => {
     if (gen !== mpConnectGeneration) return;
-    const savedToken = localStorage.getItem('pocketPuttReconnectToken');
     const savedName = localStorage.getItem('pocketPuttName') || '';
-    const savedRoom = localStorage.getItem('pocketPuttRoomCode') || '';
     const queryRoom = (MP_PARAMS.get('room') || '').trim().toUpperCase();
+    // Custom level share links must never be hijacked by a leftover room join.
+    // Prefer ?lvl= (and in-memory pending) over any ambient room auto-join.
+    const hasCustomLevel =
+      !!Game.pendingCustomLvl || !!(MP_PARAMS.get('lvl') || '').trim();
     document.getElementById('lobby-name-input').value = savedName;
-    // Prefill the join field ONLY from ?room= in the URL — never from localStorage,
-    // so a hard refresh doesn't look like a leftover "cookie" room code.
+    // Prefill the join field ONLY from ?room= in the URL.
     const roomInput = document.getElementById('lobby-room-input');
-    if (roomInput && queryRoom) roomInput.value = queryRoom;
+    if (roomInput && queryRoom && !hasCustomLevel) roomInput.value = queryRoom;
     mpSetRelayStatus('Connected. Create a room or join with a code.');
 
-    // Pending user action after a reconnect wins over auto-rejoin.
+    // Pending user action after a reconnect wins over deep-link join.
     if (mpPendingAction) {
       const action = mpPendingAction;
       mpPendingAction = null;
@@ -1413,23 +1424,13 @@ function mpConnect(opts = {}) {
     if (skipAutoRejoin) return;
 
     // Deep link: https://host/?room=ABCDEF — join that room once.
-    // Do not auto-rejoin from localStorage alone (stale codes after free-tier sleep
-    // were closing sessions and stuffing the input field on every visit).
-    if (queryRoom) {
+    // Never rejoin from localStorage (removed): it stole focus from custom level links.
+    if (queryRoom && !hasCustomLevel) {
       mpSetRelayStatus(`Joining ${queryRoom}…`);
       mpSocket.send(JSON.stringify({
         type: 'relay_join',
         room_code: queryRoom,
         player_name: savedName || 'Player',
-      }));
-    } else if (savedRoom && savedToken) {
-      // Silent resume only — leave the join field empty.
-      mpSetRelayStatus(`Reconnecting to last room…`);
-      mpSocket.send(JSON.stringify({
-        type: 'relay_reconnect',
-        room_code: savedRoom,
-        token: savedToken,
-        player_name: savedName,
       }));
     }
   });
@@ -1453,7 +1454,7 @@ function mpConnect(opts = {}) {
         bad_handshake: 'Still connecting — try Create/Join once more.',
         join_failed: 'Could not join — try again.',
       };
-      // Stale room/token must not block a fresh create on the same socket.
+      // Stale room must not block a fresh create on the same socket.
       if (msg.code === 'room_not_found' || msg.code === 'bad_token') {
         mpClearRoomCreds();
       }
@@ -1461,20 +1462,15 @@ function mpConnect(opts = {}) {
       return;
     }
     if (msg.type === 'relay_created' || msg.type === 'relay_reconnected') {
-      mpRoomCode = msg.room_code;
-      if (msg.room_code) localStorage.setItem('pocketPuttRoomCode', msg.room_code);
-      if (msg.token) localStorage.setItem('pocketPuttReconnectToken', msg.token);
+      mpRoomCode = msg.room_code || null;
+      // Intentionally not writing room codes/tokens to localStorage.
       mpSetRelayStatus(msg.room_code ? `In room ${msg.room_code}` : '');
       return;
     }
     if (msg.type === 'welcome') {
       mpPlayerId = msg.playerId;
       mpIsHost = msg.isHost;
-      localStorage.setItem('pocketPuttReconnectToken', msg.reconnectToken);
-      if (msg.roomCode) {
-        mpRoomCode = msg.roomCode;
-        localStorage.setItem('pocketPuttRoomCode', msg.roomCode);
-      }
+      if (msg.roomCode) mpRoomCode = msg.roomCode;
       document.getElementById('lobby-join').classList.add('hidden');
       document.getElementById('lobby-joined').classList.remove('hidden');
       const rename = document.getElementById('lobby-rename-input');
@@ -1485,6 +1481,7 @@ function mpConnect(opts = {}) {
       if (mpIsHost && Game.pendingCustomLvl && mpSocket && mpSocket.readyState === WebSocket.OPEN) {
         mpSocket.send(JSON.stringify({ type: 'setCustomHole', lvl: Game.pendingCustomLvl }));
       }
+      updateShareLevelButton();
     } else if (msg.type === 'notice') {
       mpShowBanner(msg.text);
     } else if (msg.type === 'lobbyState') {
@@ -1579,6 +1576,8 @@ function mpBeginHole(msg) {
   setHudText(hudHole, `Hole ${msg.holeIndex + 1}/${currentHoles().length} — ${hole.name}`);
   setHudText(hudPar, `Par ${hole.par}`);
   // MP round does not go through loadHole — surface share control for custom holes.
+  // Keep pending payload even if roundState omitted customLvl (already on client).
+  if (!Game.pendingCustomLvl && msg.customLvl) Game.pendingCustomLvl = msg.customLvl;
   updateShareLevelButton();
 }
 
@@ -2141,19 +2140,20 @@ function mpDoCreateRoom() {
 function mpDoJoinRoom(code) {
   const name = mpLobbyName();
   localStorage.setItem('pocketPuttName', name);
+  mpRoomCode = null; // joining a new code; in-memory only
   mpSetRelayStatus(`Joining ${code}…`);
   mpSocket.send(JSON.stringify({ type: 'relay_join', room_code: code, player_name: name }));
 }
 
 function mpSendCreateRoom() {
-  // Fresh create must not reuse a half-handshaken socket that already tried reconnect.
+  // Fresh create must not reuse a half-handshaken socket already in a room.
   if (!mpSocketOpen()) {
     mpPendingAction = { type: 'create' };
     mpConnect({ skipAutoRejoin: true });
     return;
   }
-  // If we auto-rejoined or failed a reconnect on this socket, open a clean one for create.
-  if (mpRoomCode || localStorage.getItem('pocketPuttRoomCode')) {
+  // Already in a room on this socket — open a clean one for create.
+  if (mpRoomCode) {
     mpPendingAction = { type: 'create' };
     mpConnect({ skipAutoRejoin: true });
     return;
@@ -2287,6 +2287,8 @@ document.getElementById('btn-play-again').addEventListener('click', () => {
 /** Encoded payload for share links (pending URL, live custom hole, or MP host attach). */
 function getCustomLevelPayload() {
   if (Game.pendingCustomLvl) return Game.pendingCustomLvl;
+  const fromUrl = (MP_PARAMS.get('lvl') || '').trim();
+  if (fromUrl) return fromUrl;
   if (Game.customHole) {
     try {
       return encodeHole(Game.customHole);
@@ -2294,8 +2296,7 @@ function getCustomLevelPayload() {
       return null;
     }
   }
-  const fromUrl = (MP_PARAMS.get('lvl') || '').trim();
-  return fromUrl || null;
+  return null;
 }
 
 function openCustomLevelShare() {
@@ -2306,7 +2307,11 @@ function openCustomLevelShare() {
   }
 }
 
-/** Corner Share while a custom hole is active (hidden on start menu; start panel has its own). */
+/**
+ * Corner Share while a custom level is active.
+ * Visible during MP/solo play (all menu screens hidden) and results overlays —
+ * start menu uses its own Share control instead.
+ */
 function updateShareLevelButton() {
   const btn = document.getElementById('btn-share-level');
   if (!btn) return;
@@ -2315,8 +2320,8 @@ function updateShareLevelButton() {
   const lobbyEl = document.getElementById('screen-lobby');
   const onLobby = lobbyEl && !lobbyEl.classList.contains('hidden');
   const hasPayload = !!getCustomLevelPayload();
-  // Show during play / hole-complete / scorecard for custom levels only.
-  const show = !!Game.customHole && hasPayload && !onStart && !onLobby;
+  // pendingCustomLvl alone is enough (joiners / encode-fragile live holes).
+  const show = hasPayload && !onStart && !onLobby;
   btn.classList.toggle('hidden', !show);
 }
 
@@ -2407,6 +2412,9 @@ if (btnShareLevel) {
 }
 
 // ---- Init ----
+// Scrub legacy room auto-rejoin keys so custom level links always win a fresh visit.
+mpClearRoomCreds();
+
 // ?lvl_short=alias → TinyURL redirect → comes back with permanent ?lvl=
 if (window.ShareLevel && ShareLevel.resolveLvlShortFromLocation(MP_PARAMS)) {
   // Navigation in progress; skip rest of boot.

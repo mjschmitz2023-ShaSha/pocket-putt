@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <title>Pocket Putt — Mini Golf</title>
-<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="style.css?v=shareux1">
 </head>
 <body>
   <div id="game-menu" class="hidden">
@@ -32,8 +32,6 @@
       <button type="button" id="btn-respawn">Respawn at tee</button>
       <button type="button" id="btn-respawn-dismiss" class="btn-quiet">Keep waiting</button>
     </div>
-
-    <button type="button" id="btn-share-level" class="hidden" title="Share this custom level">Share</button>
 
     <div id="screen-start" class="screen">
       <h1>⛳ Pocket Putt</h1>
@@ -137,11 +135,14 @@
       <p id="scorecard-rating"></p>
       <button id="btn-replay">Play Again</button>
     </div>
+
+    <!-- After screens so z-order stays above menu overlays during custom play -->
+    <button type="button" id="btn-share-level" class="hidden" title="Share this custom level">Share</button>
   </div>
 
-  <script src="shared.js?v=deorbit4"></script>
-  <script src="share-level.js?v=deorbit4"></script>
-  <script src="draw.js?v=deorbit4"></script>
-  <script src="game.js?v=deorbit4"></script>
+  <script src="shared.js?v=shareux1"></script>
+  <script src="share-level.js?v=shareux1"></script>
+  <script src="draw.js?v=shareux1"></script>
+  <script src="game.js?v=shareux1"></script>
 </body>
 </html>
