@@ -14,6 +14,7 @@
     "test:boost": "node test/boost-latch.js",
     "test:level": "node test/level-codec.js",
     "test:share": "node test/share-level.js",
+    "test:share-modal": "node test/share-modal-visual.js",
     "test:draw": "node test/draw-shared.js",
     "test:phase": "node test/editor-phase.js",
     "test:snap": "node test/editor-snap.js",

@@ -1,6 +1,5 @@
 // Pocket Putt — custom level share modal (short via TinyURL / long permanent).
-// Matches editor Import modal chrome. Depends on window.Shared.
-// Markup: #share-modal in index.html + editor.html (creates a fallback if missing).
+// True viewport overlay (same shell as editor Import). Depends on window.Shared.
 (function (root) {
   'use strict';
 
@@ -11,7 +10,45 @@
   }
 
   const CACHE_PREFIX = 'pp_lvl_short_';
+  /** Inline shell styles so a missing/stale CSS sheet cannot leave the dialog in document flow. */
+  const OVERLAY_STYLE = {
+    position: 'fixed',
+    top: '0',
+    right: '0',
+    bottom: '0',
+    left: '0',
+    inset: '0',
+    zIndex: '10000',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: '20px',
+    margin: '0',
+    boxSizing: 'border-box',
+    background: 'rgba(0, 0, 0, 0.55)',
+    WebkitBackdropFilter: 'blur(2px)',
+    backdropFilter: 'blur(2px)',
+  };
+  const CARD_STYLE = {
+    position: 'relative',
+    zIndex: '1',
+    width: 'min(420px, 100%)',
+    maxWidth: '420px',
+    margin: '0',
+    background: '#1e2e22',
+    borderRadius: '12px',
+    padding: '20px 22px',
+    border: '1px solid rgba(255, 255, 255, 0.1)',
+    boxShadow: '0 20px 50px rgba(0, 0, 0, 0.5)',
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '10px',
+    textAlign: 'left',
+    boxSizing: 'border-box',
+  };
+
   let modalEl = null;
+  let cardEl = null;
   let statusEl = null;
   let urlPreviewEl = null;
   let urlLabelEl = null;
@@ -51,6 +88,17 @@
     return location.href;
   }
 
+  function applyStyles(el, styles) {
+    if (!el) return;
+    for (const k of Object.keys(styles)) {
+      el.style[k] = styles[k];
+    }
+  }
+
+  function clearInlineDisplay(el) {
+    if (el) el.style.display = '';
+  }
+
   async function copyText(text) {
     if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
       await navigator.clipboard.writeText(text);
@@ -72,22 +120,22 @@
     }
   }
 
-  function modalHtml() {
+  function modalInnerHtml() {
     return (
-      '<div class="pp-modal-card share-modal-card" role="document">' +
+      '<div class="pp-modal-card share-modal-card editor-modal-card" role="document" data-share-card="1">' +
       '<h2 id="share-modal-title">Share level</h2>' +
       '<p class="share-modal-lead">Choose a link to copy. Friends open it in any browser.</p>' +
       '<div class="share-option" data-kind="short">' +
       '<div class="share-option-text">' +
-      '<strong>Short link</strong>' +
-      '<span>Compact for chat. Uses TinyURL under the hood (may not last forever).</span>' +
+      '<strong class="share-option-title">Short link</strong>' +
+      '<span class="share-option-desc">Compact for chat. Uses TinyURL under the hood (may not last forever).</span>' +
       '</div>' +
       '<button type="button" id="btn-share-short" class="btn-small">Copy short</button>' +
       '</div>' +
       '<div class="share-option" data-kind="long">' +
       '<div class="share-option-text">' +
-      '<strong>Permanent link</strong>' +
-      '<span>Longer URL with the full level baked in. Always works.</span>' +
+      '<strong class="share-option-title">Permanent link</strong>' +
+      '<span class="share-option-desc">Longer URL with the full level baked in. Always works.</span>' +
       '</div>' +
       '<button type="button" id="btn-share-long" class="btn-small">Copy permanent</button>' +
       '</div>' +
@@ -101,20 +149,45 @@
     );
   }
 
-  function ensureModal() {
-    if (modalEl && document.body.contains(modalEl)) return modalEl;
+  /**
+   * Always mount as a direct child of <body> so no transformed ancestor
+   * can trap position:fixed into a local box.
+   */
+  function mountOnBody(el) {
+    if (el.parentNode !== document.body) {
+      document.body.appendChild(el);
+    }
+  }
 
+  function ensureModal() {
     modalEl = document.getElementById('share-modal');
     if (!modalEl) {
       modalEl = document.createElement('div');
       modalEl.id = 'share-modal';
-      modalEl.className = 'pp-modal hidden';
       modalEl.setAttribute('role', 'dialog');
       modalEl.setAttribute('aria-modal', 'true');
       modalEl.setAttribute('aria-labelledby', 'share-modal-title');
-      modalEl.innerHTML = modalHtml();
+      modalEl.innerHTML = modalInnerHtml();
       document.body.appendChild(modalEl);
+    } else {
+      // Repair incomplete markup (e.g. partial deploy / old cache).
+      if (!modalEl.querySelector('[data-share-card], .share-modal-card, .pp-modal-card')) {
+        modalEl.innerHTML = modalInnerHtml();
+      }
+      mountOnBody(modalEl);
     }
+
+    // Classes: editor-modal is the proven import-dialog shell; pp-modal is the shared alias.
+    modalEl.className = 'pp-modal editor-modal hidden';
+    modalEl.setAttribute('role', 'dialog');
+    modalEl.setAttribute('aria-modal', 'true');
+    modalEl.setAttribute('aria-labelledby', 'share-modal-title');
+
+    cardEl =
+      modalEl.querySelector('[data-share-card]') ||
+      modalEl.querySelector('.share-modal-card') ||
+      modalEl.querySelector('.pp-modal-card') ||
+      modalEl.firstElementChild;
 
     statusEl = document.getElementById('share-modal-status');
     urlPreviewEl = document.getElementById('share-modal-url');
@@ -141,12 +214,85 @@
         });
       }
       document.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape' && modalEl && !modalEl.classList.contains('hidden') && !busy) {
-          closeShareMenu();
-        }
+        if (e.key === 'Escape' && isOpen() && !busy) closeShareMenu();
       });
     }
     return modalEl;
+  }
+
+  function isOpen() {
+    return !!(modalEl && !modalEl.classList.contains('hidden'));
+  }
+
+  function paintOptionRows() {
+    if (!modalEl) return;
+    modalEl.querySelectorAll('.share-option').forEach((opt) => {
+      opt.style.cssText = [
+        'display:grid',
+        'grid-template-columns:minmax(0,1fr) auto',
+        'align-items:center',
+        'column-gap:12px',
+        'padding:12px',
+        'border-radius:10px',
+        'background:rgba(0,0,0,0.28)',
+        'border:1px solid rgba(255,255,255,0.1)',
+        'box-sizing:border-box',
+      ].join(';');
+      const text = opt.querySelector('.share-option-text');
+      if (text) {
+        text.style.cssText =
+          'display:flex;flex-direction:column;align-items:flex-start;gap:3px;min-width:0;grid-column:1';
+      }
+      const title = opt.querySelector('.share-option-title, strong');
+      if (title) {
+        title.style.cssText =
+          'display:block;font-size:14px;font-weight:700;color:#eef7ee;line-height:1.3';
+      }
+      const desc = opt.querySelector('.share-option-desc, span.share-option-desc, .share-option-text > span');
+      if (desc) {
+        desc.style.cssText =
+          'display:block;font-size:12px;line-height:1.4;opacity:0.72;font-weight:400;color:#eef7ee;white-space:normal';
+      }
+      const btn = opt.querySelector('button');
+      if (btn) {
+        btn.style.gridColumn = '2';
+        btn.style.alignSelf = 'center';
+        btn.style.margin = '0';
+        btn.style.minWidth = '7.5rem';
+        btn.style.whiteSpace = 'nowrap';
+      }
+    });
+    const lead = modalEl.querySelector('.share-modal-lead');
+    if (lead) {
+      lead.style.cssText =
+        'display:block;margin:0 0 4px;font-size:13px;line-height:1.45;opacity:0.75;color:#eef7ee';
+    }
+    const title = modalEl.querySelector('#share-modal-title, h2');
+    if (title) {
+      title.style.cssText = 'margin:0;font-size:18px;font-weight:700;color:#eef7ee';
+    }
+    const actions = modalEl.querySelector('.modal-actions');
+    if (actions) {
+      actions.style.cssText = 'display:flex;justify-content:flex-end;gap:8px;margin-top:4px';
+    }
+  }
+
+  /** Apply fixed overlay styles that cannot be defeated by layout CSS. */
+  function paintOpenShell() {
+    applyStyles(modalEl, OVERLAY_STYLE);
+    modalEl.style.setProperty('display', 'flex', 'important');
+    modalEl.style.setProperty('position', 'fixed', 'important');
+    modalEl.style.setProperty('z-index', '10000', 'important');
+    if (cardEl) applyStyles(cardEl, CARD_STYLE);
+    paintOptionRows();
+  }
+
+  function paintClosedShell() {
+    if (!modalEl) return;
+    // Keep position fixed even when closed so reopening never flash-layouts in flow.
+    applyStyles(modalEl, OVERLAY_STYLE);
+    modalEl.style.setProperty('display', 'none', 'important');
+    if (cardEl) applyStyles(cardEl, CARD_STYLE);
   }
 
   function setBusy(on) {
@@ -156,6 +302,7 @@
   }
 
   function clearOptionState() {
+    if (!modalEl) return;
     modalEl.querySelectorAll('.share-option').forEach((el) => {
       el.classList.remove('is-copied', 'is-busy');
     });
@@ -205,18 +352,20 @@
     }
     pendingLvl = lvl;
     ensureModal();
+    mountOnBody(modalEl);
     clearOptionState();
     setBusy(false);
     setStatus('', '');
     setUrlPreview('');
     modalEl.classList.remove('hidden');
-    // Prefer focusing the permanent option first? Short is fine as default.
+    paintOpenShell();
     if (shortBtn) shortBtn.focus();
   }
 
   function closeShareMenu() {
     if (!modalEl) return;
     modalEl.classList.add('hidden');
+    paintClosedShell();
     pendingLvl = null;
     busy = false;
     clearOptionState();
@@ -300,10 +449,6 @@
     }
   }
 
-  /**
-   * ?lvl_short=alias → navigate to tinyurl.com/alias → 301 back with permanent ?lvl=
-   * @returns {boolean} true if redirect started
-   */
   function resolveLvlShortFromLocation(searchParams) {
     const params = searchParams || new URLSearchParams(location.search);
     if ((params.get(S.LVL_PARAM) || '').trim()) return false;
@@ -326,11 +471,25 @@
     return true;
   }
 
+  // Pre-mount closed shell so first open never paints in-flow.
+  if (typeof document !== 'undefined') {
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', () => {
+        ensureModal();
+        paintClosedShell();
+      });
+    } else {
+      ensureModal();
+      paintClosedShell();
+    }
+  }
+
   root.ShareLevel = {
     openShareMenu,
     closeShareMenu,
     createShortShareUrl,
     resolveLvlShortFromLocation,
+    isOpen,
     buildLongLevelUrl: (lvl) => S.buildLongLevelUrl(lvl, pageBaseHref()),
     buildShortLevelUrl: (alias) => S.buildShortLevelUrl(alias, pageBaseHref()),
   };
