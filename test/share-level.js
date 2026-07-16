@@ -74,6 +74,14 @@ function main() {
   const iGame = indexHtml.indexOf('game.js');
   assert.ok(iShared >= 0 && iShare > iShared && iGame > iShare, 'index: shared → share-level → game');
 
+  // Polished modal markup present in both shells (Import-style centered card).
+  for (const [name, html] of [['index', indexHtml], ['editor', editorHtml]]) {
+    assert.ok(/id="share-modal"/.test(html), name + ' has #share-modal');
+    assert.ok(/class="[^"]*pp-modal/.test(html), name + ' uses pp-modal shell');
+    assert.ok(/id="btn-share-short"/.test(html) && /id="btn-share-long"/.test(html), name + ' has short/long copy actions');
+    assert.ok(/id="share-modal-url"/.test(html), name + ' has URL preview field');
+  }
+
   console.log('share-level: OK');
 }
 

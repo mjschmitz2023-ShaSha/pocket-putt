@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <title>Pocket Putt — Mini Golf</title>
-<link rel="stylesheet" href="style.css?v=shareux1">
+<link rel="stylesheet" href="style.css?v=shareux2">
 </head>
 <body>
   <div id="game-menu" class="hidden">
@@ -140,9 +140,36 @@
     <button type="button" id="btn-share-level" class="hidden" title="Share this custom level">Share</button>
   </div>
 
-  <script src="shared.js?v=shareux1"></script>
-  <script src="share-level.js?v=shareux1"></script>
-  <script src="draw.js?v=shareux1"></script>
-  <script src="game.js?v=shareux1"></script>
+  <div id="share-modal" class="pp-modal hidden" role="dialog" aria-modal="true" aria-labelledby="share-modal-title">
+    <div class="pp-modal-card share-modal-card" role="document">
+      <h2 id="share-modal-title">Share level</h2>
+      <p class="share-modal-lead">Choose a link to copy. Friends open it in any browser.</p>
+      <div class="share-option" data-kind="short">
+        <div class="share-option-text">
+          <strong>Short link</strong>
+          <span>Compact for chat. Uses TinyURL under the hood (may not last forever).</span>
+        </div>
+        <button type="button" id="btn-share-short" class="btn-small">Copy short</button>
+      </div>
+      <div class="share-option" data-kind="long">
+        <div class="share-option-text">
+          <strong>Permanent link</strong>
+          <span>Longer URL with the full level baked in. Always works.</span>
+        </div>
+        <button type="button" id="btn-share-long" class="btn-small">Copy permanent</button>
+      </div>
+      <p id="share-modal-status" class="share-modal-status" aria-live="assertive"></p>
+      <label id="share-url-label" class="share-url-label hidden" for="share-modal-url">Copied link</label>
+      <input type="text" id="share-modal-url" class="share-modal-url hidden" readonly spellcheck="false">
+      <div class="modal-actions">
+        <button type="button" id="btn-share-close" class="btn-small">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="shared.js?v=shareux2"></script>
+  <script src="share-level.js?v=shareux2"></script>
+  <script src="draw.js?v=shareux2"></script>
+  <script src="game.js?v=shareux2"></script>
 </body>
 </html>

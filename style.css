@@ -660,18 +660,18 @@ a.btn-small:visited {
   z-index: 40;
   pointer-events: auto;
   min-width: 0;
-  padding: 6px 11px;
+  padding: 6px 12px;
   font-size: 12px;
   font-weight: 700;
   letter-spacing: 0.2px;
-  border-radius: 999px;
-  background: rgba(12, 18, 14, 0.78);
+  border-radius: 8px;
+  background: rgba(12, 18, 14, 0.82);
   color: #eef7ee;
-  border: 1px solid rgba(255, 255, 255, 0.18);
+  border: 1px solid rgba(255, 255, 255, 0.16);
   box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
 }
 #btn-share-level:hover {
-  background: rgba(20, 32, 24, 0.92);
+  background: rgba(20, 32, 24, 0.95);
   transform: translateY(-1px);
   box-shadow: 0 6px 16px rgba(0, 0, 0, 0.4);
 }
@@ -679,149 +679,147 @@ a.btn-small:visited {
   transform: translateY(0) scale(0.97);
 }
 
-/* Short/long share picker */
-#share-level-menu {
+/*
+ * Shared modal shell — same language as editor Import modal
+ * (centered card, dim backdrop, dark panel chrome).
+ */
+.pp-modal {
   position: fixed;
   inset: 0;
   z-index: 200;
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 16px;
-  background: rgba(6, 12, 8, 0.55);
-  backdrop-filter: blur(3px);
+  padding: 20px;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(2px);
 }
-#share-level-menu.hidden {
+.pp-modal.hidden {
   display: none !important;
 }
-.share-level-card {
-  width: min(400px, 100%);
-  padding: 20px 18px 16px;
-  border-radius: 14px;
-  background: #1e2f24;
-  border: 1px solid rgba(255, 255, 255, 0.12);
-  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.55);
-  text-align: center;
-}
-.share-level-card h3 {
-  margin: 0 0 6px;
-  font-size: 20px;
-}
-.share-level-lead {
-  margin: 0 0 16px;
-  font-size: 13px;
-  line-height: 1.45;
-  opacity: 0.8;
-}
-.share-choice-list {
+.pp-modal-card {
+  width: min(420px, 100%);
+  background: #1e2e22;
+  border-radius: 12px;
+  padding: 20px 22px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5);
   display: flex;
   flex-direction: column;
   gap: 10px;
+  text-align: left;
 }
-.share-choice-btn {
+.pp-modal-card h2 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 700;
+}
+.share-modal-lead {
+  margin: 0 0 4px;
+  font-size: 13px;
+  line-height: 1.45;
+  opacity: 0.75;
+}
+.share-option {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 12px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.28);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+.share-option.is-busy {
+  opacity: 0.75;
+}
+.share-option.is-copied {
+  border-color: rgba(94, 207, 112, 0.55);
+  background: rgba(47, 120, 70, 0.28);
+  box-shadow: 0 0 0 1px rgba(94, 207, 112, 0.2);
+}
+.share-option-text {
+  flex: 1;
+  min-width: 0;
   display: flex;
   flex-direction: column;
-  align-items: flex-start;
-  gap: 4px;
-  width: 100%;
-  box-sizing: border-box;
-  margin: 0;
-  padding: 12px 14px;
-  border-radius: 12px;
-  text-align: left;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
-  transition: transform 0.08s ease, box-shadow 0.08s ease, background 0.15s ease;
+  gap: 3px;
 }
-.share-choice-btn:disabled {
-  opacity: 0.65;
-  cursor: wait;
-  transform: none;
-}
-.share-choice-btn .share-choice-title {
-  display: block;
-  font-size: 15px;
-  font-weight: 800;
-  letter-spacing: 0.2px;
-}
-.share-choice-btn .share-choice-desc {
-  display: block;
-  margin: 0;
-  padding: 0;
-  font-size: 12px;
-  font-weight: 500;
-  line-height: 1.4;
-  opacity: 0.8;
-  text-align: left;
-  white-space: normal;
-}
-.share-choice-secondary {
-  background: #3d6b4a;
+.share-option-text strong {
+  font-size: 14px;
+  font-weight: 700;
   color: #eef7ee;
 }
-.share-choice-secondary:hover:not(:disabled) {
-  background: #478456;
-}
-.share-choice-btn.is-copied {
-  background: #2f9e5f !important;
-  color: #fff !important;
-  box-shadow: 0 0 0 2px rgba(120, 220, 160, 0.55);
-}
-.share-choice-btn.is-copied .share-choice-desc {
-  opacity: 0.9;
-}
-.share-level-status {
-  min-height: 1.35em;
-  margin: 14px 0 8px;
-  font-size: 13px;
-  font-weight: 700;
+.share-option-text span {
+  font-size: 12px;
   line-height: 1.4;
-  opacity: 0.95;
+  opacity: 0.72;
+  font-weight: 400;
 }
-.share-level-status.is-pending {
+/* btn-small inside options: compact gold CTA, not full-width hero buttons */
+.share-option .btn-small {
+  flex-shrink: 0;
+  margin: 0;
+  min-width: 7.5rem;
+  white-space: nowrap;
+}
+.share-option .btn-small:disabled {
+  opacity: 0.7;
+  cursor: wait;
+  transform: none;
+  box-shadow: none;
+}
+.share-modal-status {
+  min-height: 1.2em;
+  margin: 2px 0 0;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.4;
+  opacity: 0.85;
+}
+.share-modal-status.is-pending {
   color: #f4c542;
   opacity: 1;
 }
-.share-level-status.is-ok {
+.share-modal-status.is-ok {
   color: #7defa8;
   opacity: 1;
 }
-.share-level-status.is-error {
+.share-modal-status.is-error {
   color: #f8a8a0;
   opacity: 1;
-  font-weight: 600;
 }
 .share-url-label {
   display: block;
-  margin: 0 0 4px;
+  margin: 0;
   font-size: 11px;
   font-weight: 600;
-  text-align: left;
-  opacity: 0.75;
+  letter-spacing: 0.02em;
+  opacity: 0.7;
 }
-.share-level-url {
+.share-modal-url {
   display: block;
   width: 100%;
   box-sizing: border-box;
-  margin: 0 0 10px;
+  margin: 0;
   padding: 8px 10px;
   border-radius: 8px;
-  border: 1px solid rgba(255, 255, 255, 0.18);
-  background: rgba(0, 0, 0, 0.35);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(0, 0, 0, 0.4);
   color: #eef7ee;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 11px;
   line-height: 1.35;
-  word-break: break-all;
 }
-.share-level-url:focus {
-  outline: 2px solid rgba(244, 197, 66, 0.55);
+.share-modal-url:focus {
+  outline: 2px solid rgba(244, 197, 66, 0.5);
   outline-offset: 1px;
 }
-.share-cancel-btn {
+/* Align with editor .modal-actions when that stylesheet is absent (game). */
+.pp-modal .modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
   margin-top: 4px;
-  min-width: 120px;
-  padding: 8px 14px !important;
-  font-size: 13px !important;
 }
 .lvl-short-resolving {
   position: fixed;
