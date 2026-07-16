@@ -51,6 +51,7 @@ const STATIC_FILES = [
   'style.css',
   'game.js',
   'shared.js',
+  'share-level.js',
   'draw.js',
   'editor.html',
   'editor.js',

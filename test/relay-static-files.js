@@ -57,7 +57,7 @@ async function main() {
   const files = extractStaticFiles(src);
   console.log('STATIC_FILES:', files.join(', '));
 
-  for (const need of ['index.html', 'game.js', 'shared.js', 'draw.js', 'style.css', 'editor.html', 'editor.js', 'editor-snap.js', 'editor-gizmos.js', 'editor.css']) {
+  for (const need of ['index.html', 'game.js', 'shared.js', 'share-level.js', 'draw.js', 'style.css', 'editor.html', 'editor.js', 'editor-snap.js', 'editor-gizmos.js', 'editor.css']) {
     assert.ok(files.includes(need), `relay STATIC_FILES missing ${need}`);
     assert.ok(fs.existsSync(path.join(ROOT, need)), `file missing on disk: ${need}`);
   }
@@ -84,6 +84,7 @@ async function main() {
       '/editor.css',
       '/game.js',
       '/shared.js',
+      '/share-level.js',
       '/draw.js',
       '/style.css',
     ];

@@ -33,6 +33,8 @@
       <button type="button" id="btn-respawn-dismiss" class="btn-quiet">Keep waiting</button>
     </div>
 
+    <button type="button" id="btn-share-level" class="hidden" title="Share this custom level">Share</button>
+
     <div id="screen-start" class="screen">
       <h1>⛳ Pocket Putt</h1>
       <p class="subtitle">A simple, super fun mini golf game — four 19-hole courses</p>
@@ -42,6 +44,7 @@
         <p class="instructions" style="margin:6px 0 0;font-size:13px">Play creates a multiplayer room with this hole (you can start alone or invite friends with the room code).</p>
         <div class="custom-level-actions">
           <button id="btn-play-custom" type="button">Play this level ▶</button>
+          <button id="btn-share-custom" type="button" class="btn-small">Share link</button>
           <button id="btn-edit-level" type="button" class="btn-small">Edit</button>
           <button id="btn-create-with-level" type="button" class="btn-small">Create room</button>
         </div>
@@ -137,6 +140,7 @@
   </div>
 
   <script src="shared.js?v=deorbit4"></script>
+  <script src="share-level.js?v=deorbit4"></script>
   <script src="draw.js?v=deorbit4"></script>
   <script src="game.js?v=deorbit4"></script>
 </body>

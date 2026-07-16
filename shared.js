@@ -1944,6 +1944,68 @@ const LEVEL_CAPS = {
   gravityBodies: LEVEL_MAX_KIND_COUNT,
 };
 
+// ---- Level share links (long ?lvl= / short ?lvl_short= via TinyURL) ----
+const LVL_PARAM = 'lvl';
+const LVL_SHORT_PARAM = 'lvl_short';
+/** Free TinyURL create endpoint (returns plain-text short URL). */
+const TINYURL_CREATE_API = 'https://tinyurl.com/api-create.php';
+const TINYURL_OPEN_BASE = 'https://tinyurl.com/';
+/** Alias characters TinyURL issues; also our open-redirect allowlist for lvl_short. */
+const TINYURL_ALIAS_RE = /^[A-Za-z0-9_-]{2,40}$/;
+
+function isValidTinyAlias(alias) {
+  return typeof alias === 'string' && TINYURL_ALIAS_RE.test(alias);
+}
+
+/** Extract alias from a TinyURL create response (`https://tinyurl.com/abc123`). */
+function extractTinyAlias(tinyUrl) {
+  if (typeof tinyUrl !== 'string') return null;
+  const m = tinyUrl.trim().match(/^https?:\/\/(?:www\.)?tinyurl\.com\/([A-Za-z0-9_-]{2,40})\/?$/i);
+  return m && isValidTinyAlias(m[1]) ? m[1] : null;
+}
+
+/**
+ * Normalize a page URL to the main game entry (index), stripping query/hash.
+ * Accepts absolute href or origin+path; editor.html → index.html.
+ */
+function gameEntryUrl(baseHref) {
+  const u = new URL(baseHref || 'https://pocketputt.net/');
+  let path = u.pathname || '/';
+  if (/editor\.html$/i.test(path)) {
+    path = path.replace(/editor\.html$/i, 'index.html');
+  } else if (path.endsWith('/') || path === '') {
+    // keep directory root (production often serves / as index)
+  } else if (!/index\.html$/i.test(path) && !path.includes('.')) {
+    // path-only routes: leave as-is
+  }
+  u.pathname = path;
+  u.search = '';
+  u.hash = '';
+  return u;
+}
+
+/** Permanent share link: full level payload in ?lvl=. */
+function buildLongLevelUrl(lvl, baseHref) {
+  if (typeof lvl !== 'string' || !lvl) throw new Error('missing level payload');
+  const u = gameEntryUrl(baseHref);
+  u.searchParams.set(LVL_PARAM, lvl);
+  return u.toString();
+}
+
+/** Compact share link: pocketputt hosts ?lvl_short=alias which expands via TinyURL. */
+function buildShortLevelUrl(alias, baseHref) {
+  if (!isValidTinyAlias(alias)) throw new Error('invalid short alias');
+  const u = gameEntryUrl(baseHref);
+  u.searchParams.set(LVL_SHORT_PARAM, alias);
+  return u.toString();
+}
+
+/** Browser navigates here; TinyURL 301s to the long ?lvl= URL. */
+function tinyurlExpandUrl(alias) {
+  if (!isValidTinyAlias(alias)) throw new Error('invalid short alias');
+  return TINYURL_OPEN_BASE + alias;
+}
+
 function blankHole(overrides) {
   const h = {
     name: 'Custom Hole',
@@ -2875,6 +2937,8 @@ return {
   WATER_WAVE, WATER_FLOAT_TICKS, WATER_FLOAT_DRIFT, WATER_FLOAT_CARRY,
   waterWaveFrontAt, stepWaterFloat,
   LEVEL_CODEC_VERSION, LEVEL_MAX_B64_LEN, LEVEL_MAX_KIND_COUNT, LEVEL_CAPS, LEVEL_MAX_NAME_LEN,
+  LVL_PARAM, LVL_SHORT_PARAM, TINYURL_CREATE_API, TINYURL_OPEN_BASE,
+  isValidTinyAlias, extractTinyAlias, gameEntryUrl, buildLongLevelUrl, buildShortLevelUrl, tinyurlExpandUrl,
   CODEC_I16_MAX, CODEC_I16_MIN, CODEC_QCOORD_STEP, CODEC_QCOORD_MAX, CODEC_QCOORD_MIN,
   CODEC_QF10_STEP, CODEC_QF10_MAX, CODEC_QF10_MIN, CODEC_QF100_STEP, CODEC_QF100_MAX, CODEC_QF100_MIN,
   clampCodecQCoord, clampCodecQF10, clampCodecQF100, clampEditorProp, clampObjectForCodec,

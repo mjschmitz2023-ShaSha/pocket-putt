@@ -43,22 +43,26 @@ function main() {
   const snapSrc = read('editor-snap.js');
 
   // --- HTML load order ---
-  // index: shared → draw → game
+  // index: shared → share-level → draw → game
   const iShared = scriptIndex(indexHtml, 'shared.js');
+  const iShare = scriptIndex(indexHtml, 'share-level.js');
   const iDraw = scriptIndex(indexHtml, 'draw.js');
   const iGame = scriptIndex(indexHtml, 'game.js');
   assert.ok(iShared >= 0, 'index.html loads shared.js');
-  assert.ok(iDraw > iShared, 'index.html: draw.js after shared.js');
+  assert.ok(iShare > iShared, 'index.html: share-level.js after shared.js');
+  assert.ok(iDraw > iShare, 'index.html: draw.js after share-level.js');
   assert.ok(iGame > iDraw, 'index.html: game.js after draw.js');
 
-  // editor: shared → draw → snap → gizmos → editor
+  // editor: shared → share-level → draw → snap → gizmos → editor
   const eShared = scriptIndex(editorHtml, 'shared.js');
+  const eShare = scriptIndex(editorHtml, 'share-level.js');
   const eDraw = scriptIndex(editorHtml, 'draw.js');
   const eSnap = scriptIndex(editorHtml, 'editor-snap.js');
   const eGiz = scriptIndex(editorHtml, 'editor-gizmos.js');
   const eEd = scriptIndex(editorHtml, 'editor.js');
   assert.ok(eShared >= 0, 'editor.html loads shared.js');
-  assert.ok(eDraw > eShared, 'editor.html: draw.js after shared.js');
+  assert.ok(eShare > eShared, 'editor.html: share-level.js after shared.js');
+  assert.ok(eDraw > eShare, 'editor.html: draw.js after share-level.js');
   assert.ok(eSnap > eDraw, 'editor.html: editor-snap.js after draw.js');
   assert.ok(eGiz > eSnap, 'editor.html: editor-gizmos.js after editor-snap.js');
   assert.ok(eEd > eGiz, 'editor.html: editor.js after snap/gizmos');
@@ -67,6 +71,7 @@ function main() {
   const staticFiles = extractStaticFiles(relaySrc);
   for (const need of [
     'draw.js',
+    'share-level.js',
     'editor.html',
     'editor.js',
     'editor.css',

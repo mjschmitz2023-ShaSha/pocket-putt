@@ -242,11 +242,20 @@
     return u.toString();
   }
 
-  document.getElementById('btn-share').addEventListener('click', async () => {
+  document.getElementById('btn-share').addEventListener('click', () => {
     try {
-      const url = shareUrl();
-      await navigator.clipboard.writeText(url);
-      setStatus('Share link copied (' + url.length + ' chars)');
+      const v = validateHole(hole);
+      if (!v.ok) throw Object.assign(new Error(v.error), { detail: v });
+      const lvl = encodeHole(v.hole);
+      if (window.ShareLevel && typeof ShareLevel.openShareMenu === 'function') {
+        ShareLevel.openShareMenu(lvl);
+        setStatus('Choose short or long share link');
+      } else {
+        // Fallback if share-level.js failed to load
+        navigator.clipboard.writeText(shareUrl()).then(() => {
+          setStatus('Share link copied');
+        });
+      }
     } catch (e) {
       setStatus('Share failed: ' + (e.message || e), true);
     }

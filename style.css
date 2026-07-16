@@ -651,3 +651,114 @@ a.btn-small:visited {
 #lobby-custom-label {
   margin-top: 8px;
 }
+
+/* In-play custom-level share control (corner of stage) */
+#btn-share-level {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  z-index: 25;
+  pointer-events: auto;
+  min-width: 0;
+  padding: 6px 11px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+  border-radius: 999px;
+  background: rgba(12, 18, 14, 0.78);
+  color: #eef7ee;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+}
+#btn-share-level:hover {
+  background: rgba(20, 32, 24, 0.92);
+  transform: translateY(-1px);
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.4);
+}
+#btn-share-level:active {
+  transform: translateY(0) scale(0.97);
+}
+
+/* Short/long share picker */
+#share-level-menu {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: rgba(6, 12, 8, 0.55);
+  backdrop-filter: blur(3px);
+}
+#share-level-menu.hidden {
+  display: none !important;
+}
+.share-level-card {
+  width: min(360px, 100%);
+  padding: 18px 18px 14px;
+  border-radius: 14px;
+  background: #1e2f24;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.55);
+  text-align: center;
+}
+.share-level-card h3 {
+  margin: 0 0 6px;
+  font-size: 18px;
+}
+.share-level-lead {
+  margin: 0 0 14px;
+  font-size: 13px;
+  opacity: 0.8;
+}
+.share-choice-btn {
+  width: 100%;
+  margin: 0 0 4px;
+  padding: 10px 16px;
+  font-size: 15px;
+  border-radius: 24px;
+}
+.share-choice-secondary {
+  background: #3d6b4a;
+  color: #eef7ee;
+}
+.share-choice-secondary:hover {
+  background: #478456;
+}
+.share-choice-desc {
+  margin: 0 0 12px;
+  font-size: 12px;
+  line-height: 1.45;
+  opacity: 0.7;
+  text-align: left;
+  padding: 0 4px;
+}
+.share-cancel-btn {
+  margin-top: 2px;
+  min-width: 120px;
+  padding: 8px 14px !important;
+  font-size: 13px !important;
+}
+.share-level-status {
+  min-height: 1.2em;
+  margin: 10px 0 0;
+  font-size: 12px;
+  opacity: 0.9;
+}
+.share-level-status.is-error {
+  color: #f8a8a0;
+  opacity: 1;
+}
+.lvl-short-resolving {
+  position: fixed;
+  inset: 0;
+  z-index: 300;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #1b2a1f;
+  color: #eef7ee;
+  font-size: 16px;
+  font-weight: 600;
+}

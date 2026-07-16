@@ -26,23 +26,34 @@ function main() {
 
   // HTML loads draw.js after shared.js, before game/editor
   assert.ok(/shared\.js[^"']*["']/.test(indexHtml) || /shared\.js\?/.test(indexHtml), 'index.html loads shared.js');
+  assert.ok(/share-level\.js(\?[^"']*)?["']/.test(indexHtml), 'index.html loads share-level.js');
   assert.ok(/draw\.js(\?[^"']*)?["']/.test(indexHtml), 'index.html loads draw.js');
   assert.ok(/game\.js(\?[^"']*)?["']/.test(indexHtml), 'index.html loads game.js');
   const idxShared = indexHtml.indexOf('shared.js');
+  const idxShareLevel = indexHtml.indexOf('share-level.js');
   const idxDraw = indexHtml.indexOf('draw.js');
   const idxGame = indexHtml.indexOf('game.js');
-  assert.ok(idxShared >= 0 && idxDraw > idxShared && idxGame > idxDraw, 'index.html script order: shared → draw → game');
+  assert.ok(
+    idxShared >= 0 && idxShareLevel > idxShared && idxDraw > idxShareLevel && idxGame > idxDraw,
+    'index.html script order: shared → share-level → draw → game'
+  );
 
   assert.ok(/draw\.js(\?[^"']*)?["']/.test(editorHtml), 'editor.html loads draw.js');
+  assert.ok(/share-level\.js(\?[^"']*)?["']/.test(editorHtml), 'editor.html loads share-level.js');
   const edShared = editorHtml.indexOf('shared.js');
+  const edShare = editorHtml.indexOf('share-level.js');
   const edDraw = editorHtml.indexOf('draw.js');
   const edEditor = editorHtml.indexOf('editor.js');
-  assert.ok(edShared >= 0 && edDraw > edShared && edEditor > edDraw, 'editor.html script order: shared → draw → editor');
+  assert.ok(
+    edShared >= 0 && edShare > edShared && edDraw > edShare && edEditor > edDraw,
+    'editor.html script order: shared → share-level → draw → editor'
+  );
 
   // Relay allowlist
   const m = relaySrc.match(/const STATIC_FILES = \[([\s\S]*?)\];/);
   assert.ok(m, 'STATIC_FILES in relay.js');
   assert.ok(/['"]draw\.js['"]/.test(m[1]), 'relay STATIC_FILES includes draw.js');
+  assert.ok(/['"]share-level\.js['"]/.test(m[1]), 'relay STATIC_FILES includes share-level.js');
 
   // Wall thickness: primary stroke uses 10 or WALL_DRAW_WIDTH = 10
   assert.ok(

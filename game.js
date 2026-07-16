@@ -802,7 +802,11 @@ function drawWorld() {
 // ---- Screens / HUD ----
 const SCREEN_IDS = ['screen-start', 'screen-lobby', 'screen-hole-complete', 'screen-hazard', 'screen-scorecard', 'screen-hole-results', 'screen-final-results'];
 function hideAllScreens() { SCREEN_IDS.forEach((id) => document.getElementById(id).classList.add('hidden')); }
-function showScreen(id) { hideAllScreens(); document.getElementById(id).classList.remove('hidden'); }
+function showScreen(id) {
+  hideAllScreens();
+  document.getElementById(id).classList.remove('hidden');
+  updateShareLevelButton();
+}
 function updateHUD() {
   const hole = currentHoles()[Game.currentHoleIndex];
   hudHole.textContent = `Hole ${Game.currentHoleIndex + 1}/${currentHoles().length} — ${hole.name}`;
@@ -860,6 +864,7 @@ function loadHole(i) {
   resetSpeedAvgTracker(Game.speedTracker);
   resetUnsettledTimer();
   updateHUD();
+  updateShareLevelButton();
 }
 function startGame() {
   Game.scorecard = [];
@@ -884,6 +889,7 @@ function onHoleComplete() {
   Game.state = 'HOLE_COMPLETE';
   resetUnsettledTimer();
   showScreen('screen-hole-complete');
+  updateShareLevelButton();
 }
 function showRoundComplete() {
   const tbody = document.getElementById('scorecard-body');
@@ -905,6 +911,7 @@ function showRoundComplete() {
   hud.classList.add('hidden');
   Game.state = 'ROUND_COMPLETE';
   showScreen('screen-scorecard');
+  updateShareLevelButton();
 }
 
 // ---- Input ----
@@ -1571,6 +1578,8 @@ function mpBeginHole(msg) {
   setHudText(hudTotal, `Time: 0.0s`);
   setHudText(hudHole, `Hole ${msg.holeIndex + 1}/${currentHoles().length} — ${hole.name}`);
   setHudText(hudPar, `Par ${hole.par}`);
+  // MP round does not go through loadHole — surface share control for custom holes.
+  updateShareLevelButton();
 }
 
 function mpNoteHostTick(tick) {
@@ -2275,6 +2284,42 @@ document.getElementById('btn-play-again').addEventListener('click', () => {
 });
 
 // ---- Custom level URL (?lvl= independent of ?room=) ----
+/** Encoded payload for share links (pending URL, live custom hole, or MP host attach). */
+function getCustomLevelPayload() {
+  if (Game.pendingCustomLvl) return Game.pendingCustomLvl;
+  if (Game.customHole) {
+    try {
+      return encodeHole(Game.customHole);
+    } catch (e) {
+      return null;
+    }
+  }
+  const fromUrl = (MP_PARAMS.get('lvl') || '').trim();
+  return fromUrl || null;
+}
+
+function openCustomLevelShare() {
+  const lvl = getCustomLevelPayload();
+  if (!lvl) return;
+  if (window.ShareLevel && typeof ShareLevel.openShareMenu === 'function') {
+    ShareLevel.openShareMenu(lvl);
+  }
+}
+
+/** Corner Share while a custom hole is active (hidden on start menu; start panel has its own). */
+function updateShareLevelButton() {
+  const btn = document.getElementById('btn-share-level');
+  if (!btn) return;
+  const startEl = document.getElementById('screen-start');
+  const onStart = startEl && !startEl.classList.contains('hidden');
+  const lobbyEl = document.getElementById('screen-lobby');
+  const onLobby = lobbyEl && !lobbyEl.classList.contains('hidden');
+  const hasPayload = !!getCustomLevelPayload();
+  // Show during play / hole-complete / scorecard for custom levels only.
+  const show = !!Game.customHole && hasPayload && !onStart && !onLobby;
+  btn.classList.toggle('hidden', !show);
+}
+
 function refreshCustomLevelPanel() {
   const panel = document.getElementById('custom-level-panel');
   const label = document.getElementById('custom-level-label');
@@ -2283,6 +2328,7 @@ function refreshCustomLevelPanel() {
   const lvl = Game.pendingCustomLvl || MP_PARAMS.get('lvl');
   if (!lvl) {
     panel.classList.add('hidden');
+    updateShareLevelButton();
     return;
   }
   const d = decodeHole(lvl);
@@ -2293,12 +2339,14 @@ function refreshCustomLevelPanel() {
       errEl.textContent = 'Could not load level: ' + d.error;
       errEl.classList.remove('hidden');
     }
+    updateShareLevelButton();
     return;
   }
   if (errEl) errEl.classList.add('hidden');
   Game.pendingCustomLvl = lvl;
   // Do not force customHole until user chooses Play (keeps menu course select working).
   if (label) label.textContent = `Custom level: ${d.hole.name} (par ${d.hole.par})`;
+  updateShareLevelButton();
 }
 
 /**
@@ -2341,8 +2389,28 @@ const btnCreateWithLevel = document.getElementById('btn-create-with-level');
 if (btnCreateWithLevel) {
   btnCreateWithLevel.addEventListener('click', playCustomInRoom);
 }
+const btnShareCustom = document.getElementById('btn-share-custom');
+if (btnShareCustom) {
+  btnShareCustom.addEventListener('click', () => {
+    soundClick();
+    openCustomLevelShare();
+  });
+}
+const btnShareLevel = document.getElementById('btn-share-level');
+if (btnShareLevel) {
+  btnShareLevel.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    soundClick();
+    openCustomLevelShare();
+  });
+}
 
 // ---- Init ----
+// ?lvl_short=alias → TinyURL redirect → comes back with permanent ?lvl=
+if (window.ShareLevel && ShareLevel.resolveLvlShortFromLocation(MP_PARAMS)) {
+  // Navigation in progress; skip rest of boot.
+} else {
 setupCanvasDPR();
 fitStage();
 window.addEventListener('resize', fitStage);
@@ -2397,4 +2465,6 @@ if (MULTIPLAYER) {
 } else {
   showScreen('screen-start');
 }
+updateShareLevelButton();
 requestAnimationFrame(loop);
+} // end init (skipped when resolving ?lvl_short=)
