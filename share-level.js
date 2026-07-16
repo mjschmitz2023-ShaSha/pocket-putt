@@ -449,6 +449,38 @@
     }
   }
 
+  function showResolveSplash(text) {
+    try {
+      let splash = document.getElementById('lvl-short-resolving');
+      if (!splash) {
+        splash = document.createElement('div');
+        splash.id = 'lvl-short-resolving';
+        splash.className = 'lvl-short-resolving';
+        document.body.appendChild(splash);
+      }
+      splash.textContent = text || 'Opening shared level…';
+      return splash;
+    } catch {
+      return null;
+    }
+  }
+
+  function hasLvlShortParam(searchParams) {
+    const params = searchParams || new URLSearchParams(location.search);
+    if ((params.get(S.LVL_PARAM) || '').trim()) return false;
+    const alias = (params.get(S.LVL_SHORT_PARAM) || '').trim();
+    return !!(alias && S.isValidTinyAlias(alias));
+  }
+
+  /**
+   * Resolve ?lvl_short=alias to the permanent ?lvl= URL.
+   *
+   * Prefer same-origin /api/expand-lvl-short (server follows TinyURL, including
+   * preview/deprecated interstitials that break browser location.replace).
+   * Fall back to navigating to tinyurl.com/alias only if the API is unavailable.
+   *
+   * @returns {boolean} true if a short-link resolve was started (caller should skip boot)
+   */
   function resolveLvlShortFromLocation(searchParams) {
     const params = searchParams || new URLSearchParams(location.search);
     if ((params.get(S.LVL_PARAM) || '').trim()) return false;
@@ -458,16 +490,53 @@
       console.warn('Invalid lvl_short alias');
       return false;
     }
-    try {
-      const splash = document.createElement('div');
-      splash.id = 'lvl-short-resolving';
-      splash.className = 'lvl-short-resolving';
-      splash.textContent = 'Opening shared level…';
-      document.body.appendChild(splash);
-    } catch {
-      /* ignore */
-    }
-    location.replace(S.tinyurlExpandUrl(alias));
+
+    showResolveSplash('Opening shared level…');
+
+    const apiUrl = '/api/expand-lvl-short?alias=' + encodeURIComponent(alias);
+    // Async resolve — return true immediately so game.js does not finish boot
+    // with an empty custom level.
+    void (async () => {
+      try {
+        const res = await fetch(apiUrl, {
+          method: 'GET',
+          credentials: 'same-origin',
+          cache: 'no-store',
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data && data.ok && data.lvl) {
+            const longUrl = S.buildLongLevelUrl(data.lvl, pageBaseHref());
+            showResolveSplash('Loading level…');
+            location.replace(longUrl);
+            return;
+          }
+          if (data && data.ok && data.url && S.extractLvlFromUrl(data.url)) {
+            location.replace(data.url);
+            return;
+          }
+        }
+        // API present but expand failed — surface error instead of silent TinyURL hop
+        // when we know the alias is bad.
+        if (res.status === 422) {
+          const data = await res.json().catch(() => null);
+          showResolveSplash(
+            'Could not open short link' +
+              (data && data.error ? ' (' + data.error + ')' : '') +
+              '. Try the permanent link instead.'
+          );
+          return;
+        }
+      } catch {
+        /* API unreachable (static host / offline) — fall through */
+      }
+
+      // Last resort: browser hop through TinyURL (works for short targets; long
+      // levels often hit preview pages and may fail — API is preferred).
+      showResolveSplash('Opening short link…');
+      location.replace(S.tinyurlExpandUrl(alias));
+    })();
+
     return true;
   }
 
@@ -489,6 +558,7 @@
     closeShareMenu,
     createShortShareUrl,
     resolveLvlShortFromLocation,
+    hasLvlShortParam,
     isOpen,
     buildLongLevelUrl: (lvl) => S.buildLongLevelUrl(lvl, pageBaseHref()),
     buildShortLevelUrl: (alias) => S.buildShortLevelUrl(alias, pageBaseHref()),

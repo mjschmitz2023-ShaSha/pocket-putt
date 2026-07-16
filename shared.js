@@ -2000,10 +2000,54 @@ function buildShortLevelUrl(alias, baseHref) {
   return u.toString();
 }
 
-/** Browser navigates here; TinyURL 301s to the long ?lvl= URL. */
+/** Browser navigates here; TinyURL 301s to the long ?lvl= URL (may hit preview pages). */
 function tinyurlExpandUrl(alias) {
   if (!isValidTinyAlias(alias)) throw new Error('invalid short alias');
   return TINYURL_OPEN_BASE + alias;
+}
+
+/** Pull `lvl` query value from an absolute or relative URL string. */
+function extractLvlFromUrl(urlStr) {
+  if (typeof urlStr !== 'string' || !urlStr) return null;
+  try {
+    const u = new URL(urlStr, 'https://pocketputt.net/');
+    const lvl = (u.searchParams.get(LVL_PARAM) || '').trim();
+    return lvl || null;
+  } catch {
+    // last-ditch: raw query parse
+    const m = urlStr.match(/[?&]lvl=([^&]+)/i);
+    if (!m) return null;
+    try {
+      return decodeURIComponent(m[1].replace(/\+/g, ' '));
+    } catch {
+      return m[1] || null;
+    }
+  }
+}
+
+/**
+ * Parse HTML for meta-refresh or common redirect targets (TinyURL preview pages).
+ * Returns an absolute URL string or null.
+ */
+function extractRedirectFromHtml(html, baseUrl) {
+  if (typeof html !== 'string' || !html) return null;
+  const patterns = [
+    /http-equiv\s*=\s*["']refresh["'][^>]*content\s*=\s*["'][^"']*url\s*=\s*['"]?([^"'>\s]+)/i,
+    /content\s*=\s*["']\s*\d+\s*;\s*url\s*=\s*['"]?([^"'>]+)["'][^>]*http-equiv\s*=\s*["']refresh["']/i,
+    /content\s*=\s*["']\s*\d+\s*;\s*url\s*=\s*['"]?([^"'>]+)["']/i,
+  ];
+  for (const re of patterns) {
+    const m = html.match(re);
+    if (!m) continue;
+    let next = m[1].replace(/^['"]|['"]$/g, '').replace(/&amp;/g, '&').trim();
+    if (!next) continue;
+    try {
+      return new URL(next, baseUrl || 'https://tinyurl.com/').href;
+    } catch {
+      /* try next */
+    }
+  }
+  return null;
 }
 
 function blankHole(overrides) {
@@ -2939,6 +2983,7 @@ return {
   LEVEL_CODEC_VERSION, LEVEL_MAX_B64_LEN, LEVEL_MAX_KIND_COUNT, LEVEL_CAPS, LEVEL_MAX_NAME_LEN,
   LVL_PARAM, LVL_SHORT_PARAM, TINYURL_CREATE_API, TINYURL_OPEN_BASE,
   isValidTinyAlias, extractTinyAlias, gameEntryUrl, buildLongLevelUrl, buildShortLevelUrl, tinyurlExpandUrl,
+  extractLvlFromUrl, extractRedirectFromHtml,
   CODEC_I16_MAX, CODEC_I16_MIN, CODEC_QCOORD_STEP, CODEC_QCOORD_MAX, CODEC_QCOORD_MIN,
   CODEC_QF10_STEP, CODEC_QF10_MAX, CODEC_QF10_MIN, CODEC_QF100_STEP, CODEC_QF100_MAX, CODEC_QF100_MIN,
   clampCodecQCoord, clampCodecQF10, clampCodecQF100, clampEditorProp, clampObjectForCodec,

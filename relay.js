@@ -137,11 +137,97 @@ function serveStatic(req, res) {
   });
 }
 
+const Shared = require('./shared.js');
+
+/**
+ * Expand a TinyURL alias to the permanent pocketputt ?lvl= URL.
+ * TinyURL often serves long targets via a "preview/deprecated" interstitial
+ * instead of a direct 301 — browsers can fail or truncate. We walk redirects
+ * (and meta-refresh HTML) server-side to recover the full payload.
+ */
+async function expandLvlShortAlias(alias) {
+  if (!Shared.isValidTinyAlias(alias)) {
+    return { ok: false, error: 'invalid_alias' };
+  }
+  let url = Shared.tinyurlExpandUrl(alias);
+  for (let hop = 0; hop < 8; hop++) {
+    let res;
+    try {
+      res = await fetch(url, {
+        method: 'GET',
+        redirect: 'manual',
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (compatible; PocketPuttExpand/1.0)',
+          Accept: 'text/html,*/*',
+        },
+      });
+    } catch (e) {
+      return { ok: false, error: 'fetch_failed', detail: String(e && e.message ? e.message : e) };
+    }
+
+    const xtarget = res.headers.get('x-tinyurl-target');
+    if (xtarget) {
+      const lvl = Shared.extractLvlFromUrl(xtarget);
+      if (lvl) return { ok: true, alias, url: xtarget, lvl, via: 'x-tinyurl-target', hops: hop + 1 };
+    }
+
+    if (res.status >= 300 && res.status < 400) {
+      const loc = res.headers.get('location');
+      if (!loc) return { ok: false, error: 'redirect_missing_location', status: res.status };
+      url = new URL(loc, url).href;
+      const lvl = Shared.extractLvlFromUrl(url);
+      if (lvl) return { ok: true, alias, url, lvl, via: 'location', hops: hop + 1 };
+      continue;
+    }
+
+    if (res.status === 200) {
+      const text = await res.text();
+      const next = Shared.extractRedirectFromHtml(text, url);
+      if (next) {
+        const lvl = Shared.extractLvlFromUrl(next);
+        if (lvl) return { ok: true, alias, url: next, lvl, via: 'meta-refresh', hops: hop + 1 };
+        url = next;
+        continue;
+      }
+      // Landed on a final page without a further redirect.
+      const lvl = Shared.extractLvlFromUrl(url);
+      if (lvl) return { ok: true, alias, url, lvl, via: 'final-url', hops: hop + 1 };
+      return { ok: false, error: 'no_lvl_in_target', status: res.status };
+    }
+
+    return { ok: false, error: 'unexpected_status', status: res.status };
+  }
+  return { ok: false, error: 'too_many_hops' };
+}
+
+function sendJson(res, status, obj) {
+  const body = JSON.stringify(obj);
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store',
+  });
+  res.end(body);
+}
+
 const httpServer = http.createServer((req, res) => {
-  const urlPath = (req.url || '/').split('?')[0];
+  const rawUrl = req.url || '/';
+  const urlPath = rawUrl.split('?')[0];
   if (urlPath === '/health') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.end('OK\n');
+    return;
+  }
+  // Short-link expand: TinyURL is the store; we resolve so browsers skip preview traps.
+  if (urlPath === '/api/expand-lvl-short' && (req.method === 'GET' || req.method === 'HEAD')) {
+    const q = new URL(rawUrl, 'http://localhost').searchParams;
+    const alias = (q.get('alias') || q.get('a') || '').trim();
+    expandLvlShortAlias(alias)
+      .then((result) => {
+        sendJson(res, result.ok ? 200 : 422, result);
+      })
+      .catch((e) => {
+        sendJson(res, 500, { ok: false, error: 'server_error', detail: String(e && e.message ? e.message : e) });
+      });
     return;
   }
   serveStatic(req, res);
