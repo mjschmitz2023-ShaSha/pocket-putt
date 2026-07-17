@@ -322,6 +322,30 @@ function drawHole(ctx, hole, s) {
     ctx.beginPath(); ctx.moveTo(g.x1*s,g.y1*s); ctx.lineTo(g.x2*s,g.y2*s); ctx.stroke();
   }
 
+  // portal pairs — colored aperture strokes + a soft glow on the enterable side
+  // (same runtime colors as the game; apertures resolved at the host's rest pose)
+  {
+    const pairs = hole.portalPairs || [];
+    const colors = window.Shared.portalPairColors(pairs.length);
+    pairs.forEach((pp, pi) => {
+      for (const [endKey, color] of [['a', colors[pi].a], ['b', colors[pi].b]]) {
+        const ap = window.Shared.resolvePortalAperture(hole, pp[endKey], pp.width);
+        if (!ap) continue;
+        const ax1 = ap.x1 + ap.t0 * (ap.x2 - ap.x1), ay1 = ap.y1 + ap.t0 * (ap.y2 - ap.y1);
+        const ax2 = ap.x1 + ap.t1 * (ap.x2 - ap.x1), ay2 = ap.y1 + ap.t1 * (ap.y2 - ap.y1);
+        ctx.save();
+        ctx.strokeStyle = color; ctx.globalAlpha = 0.35; ctx.lineWidth = 9*s; ctx.lineCap = 'round';
+        ctx.beginPath();
+        ctx.moveTo((ax1 + ap.nx*4)*s, (ay1 + ap.ny*4)*s);
+        ctx.lineTo((ax2 + ap.nx*4)*s, (ay2 + ap.ny*4)*s);
+        ctx.stroke();
+        ctx.globalAlpha = 1; ctx.lineWidth = 4*s;
+        ctx.beginPath(); ctx.moveTo(ax1*s, ay1*s); ctx.lineTo(ax2*s, ay2*s); ctx.stroke();
+        ctx.restore();
+      }
+    });
+  }
+
   // tee marker
   ctx.fillStyle = 'rgba(255,255,255,0.9)';
   ctx.beginPath(); ctx.arc(hole.tee.x*s, hole.tee.y*s, 6*s, 0, Math.PI*2); ctx.fill();
@@ -380,6 +404,7 @@ COURSES.forEach((course, ci) => {
       hole.water.length ? `<span class="tag">${hole.water.length} water</span>` : '',
       (hole.gravityBodies || []).some((b) => b.kind === 'planet') ? '<span class="tag">Planet</span>' : '',
       (hole.gravityBodies || []).some((b) => b.kind === 'blackHole') ? '<span class="tag">Black hole</span>' : '',
+      (hole.portalPairs || []).length ? `<span class="tag">${hole.portalPairs.length > 1 ? '2 portal pairs' : 'Portal pair'}</span>` : '',
       (hole.gravityBodies || []).some((b) => b.kind === 'moon') ? '<span class="tag">Moon</span>' : '',
     ].join('');
     card.innerHTML = `

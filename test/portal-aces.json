@@ -1,0 +1,274 @@
+{
+  "microcloud": {
+    "dAng": 0.004,
+    "dPow": 0.01
+  },
+  "seeds": [
+    {
+      "holeIndex": 0,
+      "name": "First Contact",
+      "drag": {
+        "x": -100,
+        "y": 0
+      },
+      "startTick": 0,
+      "strip": false,
+      "timing": false,
+      "bothPairs": false,
+      "maxBlindRate": null,
+      "ace": "Putt straight ahead at ~2/3 power into the 44px portal aperture centered on the tee line in the mid wall; the ball exits the paired aperture at x=600 perfectly aligned with the cup and rolls in. The power window is wide (drag ~85-120), so a careful new player who aims at the visible aperture aces reliably."
+    },
+    {
+      "holeIndex": 1,
+      "name": "Threading the Veil",
+      "drag": {
+        "x": -120,
+        "y": 0
+      },
+      "startTick": 0,
+      "strip": true,
+      "timing": false,
+      "bothPairs": false,
+      "maxBlindRate": 0.12,
+      "ace": "From the tee, a dead-straight medium-power putt (drag -120,0 at any tick) threads the 44px portal centered on the sealing divider wall; it re-emerges from the pedestal wall at x=520 aimed straight down the lane and rolls 140px into the cup, with sand behind the cup forgiving slight over-hits."
+    },
+    {
+      "holeIndex": 2,
+      "name": "Corner Office",
+      "drag": {
+        "x": -120,
+        "y": 0
+      },
+      "startTick": 0,
+      "strip": true,
+      "timing": false,
+      "bothPairs": false,
+      "maxBlindRate": 0.08,
+      "ace": "From the tee, drag straight back (drag -120,0) to send the ball flat along the bottom fairway corridor into the portal aperture on the corner wall at x=580; it re-emerges from the paired aperture above the green rotated 90 degrees, rolling straight up into the cup at (700,90). Stripping the portal leaves the ball dead against the corner wall, 395px from the cup."
+    },
+    {
+      "holeIndex": 3,
+      "name": "Pinch Point Passage",
+      "drag": {
+        "x": -49.71,
+        "y": -16.88
+      },
+      "startTick": 0,
+      "strip": true,
+      "timing": false,
+      "bothPairs": false,
+      "maxBlindRate": 0.08,
+      "ace": "A soft diagonal putt down-right from the tee slips into the portal aperture low on the mid-field wall (off the direct tee-cup line), teleports to the overhead wall above the cup, and drops straight down into the cup — skipping the water pond and sand pinch entirely. Verified 9/9 in the microcloud; without the portal the same shot stops 572 px short."
+    },
+    {
+      "holeIndex": 4,
+      "name": "Off-Center of Attention",
+      "drag": {
+        "x": -125.93,
+        "y": 19.95
+      },
+      "startTick": 0,
+      "strip": true,
+      "timing": false,
+      "bothPairs": false,
+      "maxBlindRate": 0.06,
+      "ace": "A full-height divider hosts both ends of one wide (110 px) portal pair; the tee is aligned with aperture A's center, but a dead-center entry exits B's center straight into a sand pocket behind a blocker wall. The ace deliberately enters ~45 px above A's center so the preserved along-aperture offset exits at the top edge of B, skimming through the narrow lane above the blocker and drifting up into the cup at (700,264)."
+    },
+    {
+      "holeIndex": 5,
+      "name": "Carom Conduit",
+      "drag": {
+        "x": -145,
+        "y": 0
+      },
+      "startTick": 0,
+      "strip": true,
+      "timing": false,
+      "bothPairs": false,
+      "maxBlindRate": 0.06,
+      "ace": "Full-power putt straight right along the bottom lane; the ball caroms off the 45-degree bumper wall, shoots straight up into portal A on the overhead static wall, exits portal B on the cup-chamber wall, and rolls left into the cup."
+    },
+    {
+      "holeIndex": 6,
+      "name": "Double Slipstream",
+      "drag": {
+        "x": -140,
+        "y": 0
+      },
+      "startTick": 0,
+      "strip": true,
+      "timing": false,
+      "bothPairs": true,
+      "maxBlindRate": 0.05,
+      "ace": "A flat full-ish putt due east from the tee bay threads pair-0's aperture in the chamber wall, re-emerges in the top corridor still rolling east, crosses 420 px into pair-1's aperture, and is delivered westward out of the cup chamber's east wall to die into the cup 80 px away; the vertical entry offset is preserved through both teleports, so only a shot within ~10 px of the aperture center lines up with the cup."
+    },
+    {
+      "holeIndex": 7,
+      "name": "Slipstream Gate",
+      "drag": {
+        "x": -97,
+        "y": -13
+      },
+      "startTick": 12,
+      "strip": true,
+      "timing": false,
+      "bothPairs": false,
+      "maxBlindRate": 0.05,
+      "ace": "Wait ~0.2 s (startTick 12), then putt at ~7.5 degrees below horizontal at ~65% power into the portal riding the sliding gate as it crosses mid-gap; the exit portal in the cup-pocket wall fires the ball straight into the cup 80 px away. Without the portal the same shot just bounces off the solid gate."
+    },
+    {
+      "holeIndex": 8,
+      "name": "Double Cross",
+      "drag": {
+        "x": -85,
+        "y": 24
+      },
+      "startTick": 0,
+      "strip": true,
+      "timing": false,
+      "bothPairs": false,
+      "maxBlindRate": 0.04,
+      "ace": "From the tee, putt up-right at ~60% power into the upper (narrower) portal door on the divider at (400,160) — the real pair. It teleports to the exit pad at (560,150) and rolls 100 px straight into the cup. The wider, more inviting lower door is the decoy: it dumps the ball into a walled sand pocket in the dead bottom-right corner."
+    },
+    {
+      "holeIndex": 9,
+      "name": "Foucault's Flingshot",
+      "drag": {
+        "x": -100,
+        "y": 0
+      },
+      "startTick": 57,
+      "strip": true,
+      "timing": false,
+      "bothPairs": false,
+      "maxBlindRate": 0.04,
+      "ace": "From the tee, putt straight right (drag -100,0) into the portal set in the short wall 120 px ahead. Launched at tick 57, the ball enters the portal just as the pendulum arm sweeps through the bottom of its swing moving right, so the exit near the arm tip adds the arm's full surface velocity and slings the ball through the divider gap straight into the cup at (700,205), with sand behind the cup as a backstop."
+    },
+    {
+      "holeIndex": 10,
+      "name": "Wrong Way Round",
+      "drag": {
+        "x": 40,
+        "y": 0
+      },
+      "startTick": 0,
+      "strip": true,
+      "timing": false,
+      "bothPairs": false,
+      "maxBlindRate": 0.04,
+      "ace": "Ignore the wide decoy portal sitting dead on the tee-to-cup sightline (it dumps into a sand pit) and instead putt gently BACKWARDS, away from the cup, into a narrow portal on the short wall behind the tee; it exits from the wall at the back of the cup alcove and rolls straight into the cup."
+    },
+    {
+      "holeIndex": 11,
+      "name": "Sluicegate Sprint",
+      "drag": {
+        "x": -82.5,
+        "y": 0
+      },
+      "startTick": 62,
+      "strip": true,
+      "timing": true,
+      "bothPairs": false,
+      "maxBlindRate": 0.03,
+      "ace": "Putt straight at the cup at 55% power the instant the sliding sluice gate reaches the top of its travel: the ball flies through the gate-mounted portal exactly as the gate hangs momentarily stationary on the center line, teleports to the receiver wall past the water gauntlet, and rolls 100px dead-center into the cup. Mistime it by a sixth of a second and the gate is either solid where you aimed or slings the ball sideways into the sand-trimmed green walls."
+    },
+    {
+      "holeIndex": 12,
+      "name": "Chimney Sweep",
+      "drag": {
+        "x": -134.93,
+        "y": 4.42
+      },
+      "startTick": 0,
+      "strip": true,
+      "timing": false,
+      "bothPairs": true,
+      "maxBlindRate": 0.03,
+      "ace": "From the tee, a firm putt aimed a hair above dead-right (angle ~358 degrees) threads the sand-flanked bottom fairway into portal A at the lane's end wall, pops out at the base of the sealed chimney shaft heading straight up, rides the shaft into portal B at its ceiling, and emerges on the green chamber floor rolling straight up into the cup 90 px away. Sand strips along both fairway edges kill any banked near-miss, and bumper chamber walls plus a portal-back-door punish overshoots."
+    },
+    {
+      "holeIndex": 13,
+      "name": "Grandfather Clause",
+      "drag": {
+        "x": -135,
+        "y": 0
+      },
+      "startTick": 30,
+      "strip": true,
+      "timing": true,
+      "bothPairs": false,
+      "maxBlindRate": 0.03,
+      "ace": "Full-power-ish straight putt due east from the tee at tick 30, through the portal in the dividing wall at y=250; the ball re-emerges from the aperture on the swinging pendulum arm exactly as the arm whips east, and the arm's surface velocity slings it southeast through the pocket mouth, banking once into the cup. Mistimed entries are flung northeast toward the water pocket or dumped into open midfield."
+    },
+    {
+      "holeIndex": 14,
+      "name": "Slingshot Circuit",
+      "drag": {
+        "x": -150,
+        "y": 0
+      },
+      "startTick": 0,
+      "strip": true,
+      "timing": false,
+      "bothPairs": true,
+      "maxBlindRate": 0.02,
+      "ace": "Full-power straight-east slam from the tee: the lower-lane boost pad rams the ball through portal A on the bottom-right wall, it reappears at the top-left wall streaking east, the top-lane boost recharges it across the field into pair 2 on the top-right wall, and the exit by the guarded mid-field pocket rolls it 100 px into the cup — two portals, two boosts, zero bounces."
+    },
+    {
+      "holeIndex": 15,
+      "name": "Shutter Speed",
+      "drag": {
+        "x": -105,
+        "y": 0
+      },
+      "startTick": 8,
+      "strip": true,
+      "timing": true,
+      "bothPairs": false,
+      "maxBlindRate": 0.02,
+      "ace": "From the tee, putt dead-level right at 70% power exactly 8 ticks into the gate cycle: the fast sliding gate's 22 px portal aperture sweeps across the tee line (y=320) just as the ball reaches x=260, teleporting it to the wall stub at (560,250) where it rolls straight down the water-flanked corridor into the cup in 33 ticks. Any +/-10-tick mistiming meets solid gate steel or the flanking hazards."
+    },
+    {
+      "holeIndex": 16,
+      "name": "Hindsight Bay",
+      "drag": {
+        "x": 105,
+        "y": 0
+      },
+      "startTick": 0,
+      "strip": true,
+      "timing": false,
+      "bothPairs": false,
+      "maxBlindRate": 0.02,
+      "ace": "Backwards-entry deception: instead of taking the inviting center portal on the big blocking wall (which dumps you in sand), the ace fires straight LEFT from the tee into a small portal on the wall behind the tee; it exits from a ceiling segment directly above the cup's walled bay and the ball drops straight down into the cup (strip does not hole; cloud 9/9)."
+    },
+    {
+      "holeIndex": 17,
+      "name": "Gallows Swing",
+      "drag": {
+        "x": -130.4,
+        "y": -34.94
+      },
+      "startTick": 70,
+      "strip": true,
+      "timing": true,
+      "bothPairs": false,
+      "maxBlindRate": 0.02,
+      "ace": "Timed at tick 70, a firm up-right putt (drag -130.4,-34.94) dives into the portal on the short wall just past the tee and re-emerges at the fast-moving tip of the middle of three phased pendulums, which slings the ball violently right and down into the cup in under half a second; the same shot with portals stripped bounces into the water, and shifting the putt by even 10 ticks misses every time."
+    },
+    {
+      "holeIndex": 18,
+      "name": "The Double Slit",
+      "drag": {
+        "x": -112,
+        "y": 0
+      },
+      "startTick": 60,
+      "strip": true,
+      "timing": true,
+      "bothPairs": true,
+      "maxBlindRate": 0.01,
+      "ace": "At exactly tick 60 the player fires flat right from the tee into a portal cut in the first wall at tee height; the ball emerges at the tip of the swinging pendulum, which slings it across mid-field into the portal riding the sliding gate — only aligned at this phase — and it exits through the cup-alcove wall, rolling dead into the cup at (750,78) in 50 ticks with zero bounces."
+    }
+  ]
+}
