@@ -801,12 +801,11 @@ class GameSession {
     }
   }
 
-  forceSyncPlayer(player) {
+  forceSyncPlayer(player, rejectReason) {
     if (!player || !player.ws) return;
-    this.send(
-      player.ws,
-      this.buildCorrection([], { reason: 'resync', includeObstacles: true, hard: true })
-    );
+    const msg = this.buildCorrection([], { reason: 'resync', includeObstacles: true, hard: true });
+    if (rejectReason) msg.rejectReason = rejectReason;
+    this.send(player.ws, msg);
   }
 
   /**
@@ -972,24 +971,24 @@ class GameSession {
    */
   handlePutt(player, msg) {
     if (this.state !== 'PLAYING' || !player.ball || player.holedOut || player.floating) {
-      this.forceSyncPlayer(player);
+      this.forceSyncPlayer(player, 'not_puttable_now');
       return;
     }
     const v = msg.dragVector;
     if (!v || typeof v.x !== 'number' || typeof v.y !== 'number') {
-      this.forceSyncPlayer(player);
+      this.forceSyncPlayer(player, 'bad_drag');
       return;
     }
     const clamped = Shared.clampDragVector(v);
     if (!clamped) {
-      this.forceSyncPlayer(player);
+      this.forceSyncPlayer(player, 'drag_clamped_out');
       return;
     }
 
     const clientTickRaw = msg.clientTick;
     const check = this.validateClientTick(player, clientTickRaw);
     if (!check.ok) {
-      this.forceSyncPlayer(player);
+      this.forceSyncPlayer(player, check.reason || 'bad_tick');
       return;
     }
     const T = check.tick;
@@ -1017,13 +1016,13 @@ class GameSession {
     const snap = this.getSnapshot(T);
     const snapP = snap && snap.players[player.id];
     if (!snapP || !snapP.ball || snapP.holedOut || snapP.floating) {
-      this.forceSyncPlayer(player);
+      this.forceSyncPlayer(player, 'no_ball_at_tick');
       return;
     }
     const ballAtT = cloneBallState(snapP.ball);
     const trackerAtT = cloneSpeedTracker(snapP.speedTracker);
     if (!Shared.mayPuttBall(ballAtT, hole, trackerAtT)) {
-      this.forceSyncPlayer(player);
+      this.forceSyncPlayer(player, 'not_resting_at_tick');
       return;
     }
 
@@ -1064,7 +1063,7 @@ class GameSession {
       // Already accepted into queue at receive time (shared T preserved).
       // Do not re-apply keepalive floor — later keepalives can have tick > T.
       if (T < this.simTick - TRUST_WINDOW_TICKS || !this.getSnapshot(T)) {
-        this.forceSyncPlayer(player);
+        this.forceSyncPlayer(player, 'queued_putt_expired');
         continue;
       }
       this.commitPuttAtTick(player, T, rec.dragVector);

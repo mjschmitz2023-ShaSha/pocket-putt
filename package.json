@@ -32,7 +32,8 @@
     "test:orbit": "node test/orbit-hio.js",
     "test:rubberband": "node test/rubberband-harness.js --all",
     "test:lockstep": "node test/rubberband-harness.js lockstep_coast",
-    "test:solo-lag": "node test/rubberband-harness.js solo_1p_ideal solo_1p_bidirectional_lag"
+    "test:solo-lag": "node test/rubberband-harness.js solo_1p_ideal solo_1p_bidirectional_lag",
+    "test:live-lag": "node test/live-lag-putt-residual.js"
   },
   "engines": {
     "node": ">=18"

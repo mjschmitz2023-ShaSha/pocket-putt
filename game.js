@@ -1357,6 +1357,7 @@ const RbDiag = {
       reason,
       applied: meta.applied !== false,
       matched: !!meta.matched,
+      rejectReason: meta.rejectReason || null,
     };
     if (moving && dPos >= 0.5 && meta.applied !== false) {
       this.hardMoving++;
@@ -2295,9 +2296,6 @@ function mpApplyCorrection(msg) {
       const dPos = Math.hypot(p.x - before.x, p.y - before.y);
       const dV = Math.hypot((p.vx || 0) - (before.vx || 0), (p.vy || 0) - (before.vy || 0));
       const matched = dPos < MATCH_PX && dV < MATCH_V;
-      const moving =
-        Math.hypot(before.vx || 0, before.vy || 0) >= STOP_THRESHOLD ||
-        Math.hypot(p.vx || 0, p.vy || 0) >= STOP_THRESHOLD;
       if (matched) {
         // Shared path — host sample confirms client; leave present untouched.
         p.x = before.x;
@@ -2318,6 +2316,7 @@ function mpApplyCorrection(msg) {
           applied: true,
           matched: true,
           residualAfterResim: dPos,
+          rejectReason: msg.rejectReason,
         });
       } else {
         // True disagreement at present tick after host@sample + resim.
@@ -2331,10 +2330,20 @@ function mpApplyCorrection(msg) {
           applied: true,
           matched: false,
           residualAfterResim: dPos,
+          rejectReason: msg.rejectReason,
         });
       }
-      void moving;
     }
+  } else if (hard && (msg.rejectReason || reason === 'resync')) {
+    // Force-sync / reject path (not sample→present confirm). Loud for dogfood.
+    try {
+      console.info('[RB] force_sync_or_resync', {
+        rejectReason: msg.rejectReason || null,
+        tick,
+        reason,
+        clientTick: clientTickBefore,
+      });
+    } catch (_) {}
   }
 
   for (const ev of msg.events || []) mpHandleEvent(ev, hole);
