@@ -506,16 +506,16 @@ function runScenarioFixed(scenario) {
       maybeSendKeepalive(frame);
       // Immediate putts in lockstep (no lag)
       deliverUp();
-      // Apply puttApplied before any further sim (matches production "reliable event")
-      deliverImmediate(['roundState', 'clockSync', 'puttApplied', 'welcome', 'lobbyState']);
+      // Deliver puttApplied + post-rewind hard replay snapshot BEFORE host steps further.
+      // (If replay snap is deferred until after host steps, client force-adopts an
+      // older tick while host is already ahead → false residual.)
+      deliverImmediate(null);
 
       if (session.state === 'PLAYING') session.stepSimulation();
 
-      // Client coasts to the host tick BEFORE consuming hard corrections
+      // Client coasts to the host tick; then any new corrections from this step.
       while (client.simTick < session.simTick) client.stepOneTick();
       client.noteHostTick(session.simTick, wallMs);
-
-      // Snapshots should now nearly match — any hard_snap is a real physics fork
       deliverImmediate(null);
 
       const decay = Math.exp(-(FRAME_MS / 1000) / 0.12);

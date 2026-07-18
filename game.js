@@ -2162,8 +2162,12 @@ function mpApplyCorrection(msg) {
   // Do NOT set mpPlaying here — only roundState / mpBeginHole starts a hole. Snapshots
   // during holeEnding celebration stay in the active hole; after holeResults we ignore them.
 
-  // Stale hard snap while already coasting past its tick — ignore (don't yank to putt pose).
-  if (hard && typeof tick === 'number' && tick < mpSimTick) {
+  // Post-rewind replay / explicit resync must ALWAYS hard-adopt — even if the client
+  // free-ran past host tick under lag. Ignoring those is how 1p residual survives.
+  // Other hard snaps that are older than local coast can still be ignored mid-flight
+  // (e.g. delayed idle) so we don't yank to a worse-than-prediction pose.
+  const forceAuthority = reason === 'resync' || reason === 'replay';
+  if (hard && !forceAuthority && typeof tick === 'number' && tick < mpSimTick) {
     const anyMoving = [...Game.players.values()].some(
       (p) => !p.holedOut && Math.hypot(p.vx || 0, p.vy || 0) >= STOP_THRESHOLD
     );
@@ -2180,9 +2184,10 @@ function mpApplyCorrection(msg) {
     setHoleObstaclesAtTick(hole, tick);
   }
 
-  // Hard snap ahead of local clock: catch up sim first so adopt is residual error, not
-  // trajectory distance between different ticks (lagged post-replay authority).
-  if (hard && typeof tick === 'number' && tick > mpSimTick) {
+  // Hard authority from the future: for replay/resync, jump the clock — do NOT
+  // free-run catch-up (that would integrate without the host impulse/path).
+  // For other hard snaps, catch-up first so dPos is residual at the same tick.
+  if (hard && typeof tick === 'number' && tick > mpSimTick && !forceAuthority) {
     let guard = 0;
     while (mpSimTick < tick && guard++ < 96) mpStepOneTick();
   }

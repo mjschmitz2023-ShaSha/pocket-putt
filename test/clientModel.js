@@ -331,9 +331,10 @@ class ClientModel {
     const hard = reason === 'resync' || reason === 'replay' ? true : !!msg.hard;
     this.playing = true;
 
-    // Stale hard snap from the past while already coasting ahead — do not yank back to
-    // putt-tick pose (lockstep harness / reordered packets). Optimistic coast is correct.
-    if (hard && typeof tick === 'number' && tick < this.simTick) {
+    // replay/resync must always hard-adopt (post-rewind authority under lag).
+    // Other hard snaps older than local coast may be ignored mid-flight.
+    const forceAuthority = reason === 'resync' || reason === 'replay';
+    if (hard && !forceAuthority && typeof tick === 'number' && tick < this.simTick) {
       const anyMoving = [...this.players.values()].some(
         (p) => !p.holedOut && Math.hypot(p.vx, p.vy) >= STOP
       );
@@ -358,9 +359,8 @@ class ClientModel {
       Shared.setHoleObstaclesAtTick(hole, tick);
     }
 
-    // Hard snap from the future: catch up local sim first so dPos is residual error,
-    // not trajectory distance between different ticks (lagged post-replay snaps).
-    if (hard && typeof tick === 'number' && tick > this.simTick) {
+    // Hard from the future: free-run catch-up only for non-replay/resync (see game.js).
+    if (hard && typeof tick === 'number' && tick > this.simTick && !forceAuthority) {
       let guard = 0;
       while (this.simTick < tick && guard++ < 96) this.stepOneTick();
     }
