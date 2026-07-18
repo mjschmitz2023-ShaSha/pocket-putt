@@ -810,11 +810,7 @@ class GameSession {
   }
 
   /**
-   * Validate clientTick against trust window + keepalive monotonic floor.
-   * Slightly-future ticks (client 1 ahead from wall/FP skew) clamp to hostNow.
-   * @returns {{ ok: boolean, tick?: number, reason?: string }}
-   */
-  /**
+   * Validate clientTick against trust window + keepalive floor.
    * @returns {{ ok: boolean, tick?: number, queue?: boolean, reason?: string }}
    * queue=true → clientTick is in the host's future; hold until host reaches T (do NOT clamp).
    */
