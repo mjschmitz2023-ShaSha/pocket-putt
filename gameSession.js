@@ -30,8 +30,9 @@ const TRUST_WINDOW_TICKS = HISTORY_TICKS;
 const KEEPALIVE_MISS_THRESHOLD = 3;
 const KEEPALIVE_EXPECT_MS = 400;
 const KEEPALIVE_STALE_MS = KEEPALIVE_MISS_THRESHOLD * KEEPALIVE_EXPECT_MS;
-// Allow one tick of future skew (client slightly ahead of host sample).
-const CLIENT_TICK_FUTURE_SKEW = 1;
+// Max ticks a putt may be stamped in the host's future (queued until host reaches T).
+// Never clamp T down to hostNow — that guarantees a path fork / hard snap.
+const CLIENT_TICK_FUTURE_QUEUE = HISTORY_TICKS;
 
 function makeId() {
   return crypto.randomUUID();
@@ -120,6 +121,12 @@ class GameSession {
     this._replaying = false;
     /** @type {number|null} coalesce concurrent late inputs to earliest tick */
     this.pendingReplayFrom = null;
+    /**
+     * Putts stamped in the host's future (clientTick > simTick).
+     * Applied when host reaches that tick — never rewritten to hostNow.
+     * @type {{ playerId: string, clientTick: number, dragVector: {x:number,y:number} }[]}
+     */
+    this.pendingPutts = [];
   }
 
   touch() {
@@ -291,6 +298,7 @@ class GameSession {
     this.snapshotRing = [];
     this.inputLog = [];
     this.pendingReplayFrom = null;
+    this.pendingPutts = [];
     this._replaying = false;
     this.state = 'PLAYING';
     this.touch();
@@ -461,6 +469,8 @@ class GameSession {
       tick: this.simTick,
       tickHz: TICK_HZ,
       elapsedMs: this.holeElapsedMs(),
+      hostTimeMs: Date.now(),
+      holeEpochMs: this.holeEpochMs || this.holeStartedAtMs,
       reason,
       hard,
       events: events || [],
@@ -778,8 +788,11 @@ class GameSession {
     const silent = !!(opts && opts.silent);
     this.stepPhysicsOneTick();
     this.pushSnapshot();
-    if (!silent) this.emitTickCorrections();
-    else {
+    if (!silent) {
+      // Future-stamped putts become due when host reaches their clientTick.
+      this.processPendingPutts();
+      this.emitTickCorrections();
+    } else {
       // Still track idle flag so post-replay hard snap / later idle is correct.
       const active = [...this.players.values()].filter((p) => p.connected && p.ball && !p.holedOut);
       const anyMoving = active.some((p) => Math.hypot(p.ball.vx, p.ball.vy) >= Shared.STOP_THRESHOLD);
@@ -801,12 +814,16 @@ class GameSession {
    * Slightly-future ticks (client 1 ahead from wall/FP skew) clamp to hostNow.
    * @returns {{ ok: boolean, tick?: number, reason?: string }}
    */
+  /**
+   * @returns {{ ok: boolean, tick?: number, queue?: boolean, reason?: string }}
+   * queue=true → clientTick is in the host's future; hold until host reaches T (do NOT clamp).
+   */
   validateClientTick(player, clientTick) {
     const hostNow = this.simTick;
     if (typeof clientTick !== 'number' || !Number.isFinite(clientTick)) {
       return { ok: false, reason: 'missing_tick' };
     }
-    let T = Math.round(clientTick);
+    const T = Math.round(clientTick);
     if (Math.abs(T - clientTick) > 1e-3) {
       return { ok: false, reason: 'non_integer_tick' };
     }
@@ -821,19 +838,24 @@ class GameSession {
     if (player.lastKeepaliveTick != null && T < player.lastKeepaliveTick) {
       return { ok: false, reason: 'before_keepalive' };
     }
-    if (T > hostNow + CLIENT_TICK_FUTURE_SKEW) {
-      return { ok: false, reason: 'future' };
-    }
-    // Client slightly ahead of host (predict/FP): apply at hostNow — same rest pose.
-    if (T > hostNow) T = hostNow;
+    if (T < 0) return { ok: false, reason: 'negative' };
+    // Too far in the past for history ring.
     if (T < hostNow - TRUST_WINDOW_TICKS) {
       return { ok: false, reason: 'too_old' };
     }
-    if (T < 0) return { ok: false, reason: 'negative' };
+    // Too far in the future (bad clock / cheat) — reject, never clamp.
+    if (T > hostNow + CLIENT_TICK_FUTURE_QUEUE) {
+      return { ok: false, reason: 'too_far_future' };
+    }
+    // Future of host: queue until host sim reaches T (shared input tick preserved).
+    if (T > hostNow) {
+      return { ok: true, tick: T, queue: true };
+    }
+    // Past or now: need a snapshot to restore.
     if (!this.getSnapshot(T)) {
       return { ok: false, reason: 'no_snapshot' };
     }
-    return { ok: true, tick: T };
+    return { ok: true, tick: T, queue: false };
   }
 
   handleClientClock(player, msg) {
@@ -904,6 +926,8 @@ class GameSession {
           type: 'puttApplied',
           playerId: rec.playerId,
           tick: rec.tick,
+          hostTimeMs: Date.now(),
+          holeEpochMs: this.holeEpochMs || this.holeStartedAtMs,
           dragVector: rec.dragVector,
           strokes: rec.strokes,
           x: rec.x,
@@ -947,8 +971,8 @@ class GameSession {
   }
 
   /**
-   * Accept tick-stamped putt: validate → log → whole-hole rewind/replay → hard snap.
-   * Reject → silent force-sync (hard resync) for that player.
+   * Accept tick-stamped putt: validate → (queue if future) → log → rewind/replay → hard snap.
+   * Reject → silent force-sync. Never rewrite clientTick to hostNow.
    */
   handlePutt(player, msg) {
     if (this.state !== 'PLAYING' || !player.ball || player.holedOut || player.floating) {
@@ -966,7 +990,6 @@ class GameSession {
       return;
     }
 
-    // Require clientTick (legacy putts without stamp are rejected + force-synced).
     const clientTickRaw = msg.clientTick;
     const check = this.validateClientTick(player, clientTickRaw);
     if (!check.ok) {
@@ -974,6 +997,26 @@ class GameSession {
       return;
     }
     const T = check.tick;
+
+    // Client stamp is still in the host's future — hold until host reaches T.
+    if (check.queue) {
+      this.pendingPutts = this.pendingPutts.filter((p) => p.playerId !== player.id);
+      this.pendingPutts.push({
+        playerId: player.id,
+        clientTick: T,
+        dragVector: { x: clamped.x, y: clamped.y },
+      });
+      return;
+    }
+
+    this.commitPuttAtTick(player, T, clamped);
+  }
+
+  /**
+   * Commit a putt at the exact client tick T (must be ≤ hostNow with snapshot).
+   */
+  commitPuttAtTick(player, T, clamped) {
+    if (!player || this.state !== 'PLAYING') return;
     const hole = this.currentHoles()[this.currentHoleIndex];
     const snap = this.getSnapshot(T);
     const snapP = snap && snap.players[player.id];
@@ -981,7 +1024,6 @@ class GameSession {
       this.forceSyncPlayer(player);
       return;
     }
-    // Legality at historical T (not host-now coast pose).
     const ballAtT = cloneBallState(snapP.ball);
     const trackerAtT = cloneSpeedTracker(snapP.speedTracker);
     if (!Shared.mayPuttBall(ballAtT, hole, trackerAtT)) {
@@ -989,7 +1031,6 @@ class GameSession {
       return;
     }
 
-    // Replace same-player same-tick putt in log (last wins).
     this.inputLog = this.inputLog.filter(
       (r) => !(r.tick === T && r.playerId === player.id && r.kind === 'putt')
     );
@@ -999,11 +1040,39 @@ class GameSession {
       kind: 'putt',
       dragVector: { x: clamped.x, y: clamped.y },
     });
-    // Drop log entries older than history window.
     const minLog = this.simTick - HISTORY_TICKS - 1;
     this.inputLog = this.inputLog.filter((r) => r.tick >= minLog);
 
     this.scheduleReplayFrom(T);
+  }
+
+  /**
+   * Apply any queued putts whose clientTick is now ≤ host simTick.
+   * Call after live steps so future-stamped inputs hit the exact shared tick.
+   */
+  processPendingPutts() {
+    if (!this.pendingPutts.length || this.state !== 'PLAYING' || this._replaying) return;
+    const ready = [];
+    const keep = [];
+    for (const rec of this.pendingPutts) {
+      if (rec.clientTick <= this.simTick) ready.push(rec);
+      else keep.push(rec);
+    }
+    this.pendingPutts = keep;
+    // Earliest tick first so one replay covers all.
+    ready.sort((a, b) => a.clientTick - b.clientTick || (a.playerId < b.playerId ? -1 : 1));
+    for (const rec of ready) {
+      const player = this.players.get(rec.playerId);
+      if (!player || !player.connected) continue;
+      const T = rec.clientTick;
+      // Already accepted into queue at receive time (shared T preserved).
+      // Do not re-apply keepalive floor — later keepalives can have tick > T.
+      if (T < this.simTick - TRUST_WINDOW_TICKS || !this.getSnapshot(T)) {
+        this.forceSyncPlayer(player);
+        continue;
+      }
+      this.commitPuttAtTick(player, T, rec.dragVector);
+    }
   }
 
   maybeEndHoleAfterPause() {
@@ -1030,13 +1099,17 @@ class GameSession {
         }
       }
     }
-    const wallTarget = Math.floor((Date.now() - this.holeStartedAtMs) / TICK_MS);
+    // Shared calendar: tick index from hole epoch W0 (same formula as clients).
+    const epoch = this.holeEpochMs || this.holeStartedAtMs;
+    const wallTarget = Math.floor((Date.now() - epoch) / TICK_MS);
     let steps = 0;
     while (this.simTick < wallTarget && steps < MAX_CATCH_UP_TICKS) {
       this.stepSimulation();
       steps++;
       if (this.state !== 'PLAYING') break;
     }
+    // Drain putts that became due even if we took 0 physics steps this frame.
+    this.processPendingPutts();
   }
 
   sendWelcome(player) {

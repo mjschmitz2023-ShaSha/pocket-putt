@@ -2,7 +2,7 @@
 // Physics/course-data now live in shared.js (loaded before this file) so the same code
 // can run authoritatively on the multiplayer host — see MULTIPLAYER below.
 const {
-  TICK_HZ, TICK_DT, tickToElapsedMs, elapsedMsToTick,
+  TICK_HZ, TICK_DT, TICK_MS, tickToElapsedMs, elapsedMsToTick,
   LOGICAL_W, LOGICAL_H, BALL_RADIUS, FRICTION_GRASS, FRICTION_SAND, STOP_THRESHOLD,
   CUP_GRAVITY_RADIUS, cupHasGravity,
   WALL_RESTITUTION, BUMPER_RESTITUTION, PENDULUM_RESTITUTION, GATE_RESTITUTION,
@@ -1675,10 +1675,13 @@ function mpBeginHole(msg) {
   resetHoleObstacles(hole);
   const startTick = typeof msg.tick === 'number' ? msg.tick : 0;
   mpSimTick = startTick;
-  mpNoteHostTick(startTick);
+  if (typeof msg.holeEpochMs === 'number' && Number.isFinite(msg.holeEpochMs)) {
+    mpHoleEpochMs = msg.holeEpochMs;
+  } else if (typeof msg.hostTimeMs === 'number' && Number.isFinite(msg.hostTimeMs)) {
+    mpHoleEpochMs = msg.hostTimeMs - startTick * TICK_MS;
+  }
+  mpNoteHostTick(startTick, msg.hostTimeMs);
   mpLastHostTick = startTick;
-  if (typeof msg.holeEpochMs === 'number') mpHoleEpochMs = msg.holeEpochMs;
-  else if (typeof msg.hostTimeMs === 'number' && startTick === 0) mpHoleEpochMs = msg.hostTimeMs;
   setHoleObstaclesAtTick(hole, startTick);
   // Seed balls from reliable roundState so a dropped resync snapshot can't leave an
   // empty roster (ball "disappears" until the next idle correction).
@@ -1721,26 +1724,51 @@ function mpBeginHole(msg) {
   updateShareLevelButton();
 }
 
-function mpNoteHostTick(tick) {
-  // Monotonic: puttApplied is stamped at putt tick (past), not host-now. Rewinding the
-  // free-run base freezes / forks local coast under lag.
+function mpNoteHostTick(tick, hostTimeMs) {
+  // Monotonic host sample (puttApplied may be stamped at putt tick in the past).
   if (typeof tick !== 'number') return;
   if (tick < mpHostTick) return;
   mpHostTick = tick;
   mpHostTickAt = performance.now();
   mpLastHostTick = tick;
+  // Re-anchor shared epoch so ideal tick matches host's sample at receipt.
+  // Host is authority for "what tick the world is on"; W0 maps wall→tick.
+  // At receive time we treat sample tick as "about now" (one-way lag makes us
+  // slightly behind real host — correct for putts landing as past ticks).
+  if (typeof hostTimeMs === 'number' && Number.isFinite(hostTimeMs)) {
+    mpHoleEpochMs = hostTimeMs - tick * TICK_MS;
+  } else if (mpHoleEpochMs > 0) {
+    // No host wall stamp: gently re-anchor using local wall so we don't race ahead.
+    const ideal = Math.floor((Date.now() - mpHoleEpochMs) / TICK_MS);
+    if (ideal > tick + 2) {
+      mpHoleEpochMs = Date.now() - tick * TICK_MS;
+    }
+  }
 }
 
+/**
+ * Shared hole calendar: same formula as host tickDriver
+ *   wallTarget = floor((Date.now() - holeEpochMs) / TICK_MS)
+ * Not "last snapshot + blind extrapolation" (that races the host under lag).
+ */
 function mpHostTargetTick() {
+  if (mpHoleEpochMs > 0) {
+    return Math.max(0, Math.floor((Date.now() - mpHoleEpochMs) / TICK_MS));
+  }
+  // Fallback before first clockSync
   return Math.floor(mpHostTick + ((performance.now() - mpHostTickAt) / 1000) * TICK_HZ);
 }
 
 function mpOnClockSync(msg) {
   if (!msg) return;
   const tick = typeof msg.tick === 'number' ? msg.tick : 0;
-  mpNoteHostTick(tick);
-  if (typeof msg.holeEpochMs === 'number') mpHoleEpochMs = msg.holeEpochMs;
-  else if (typeof msg.hostTimeMs === 'number' && tick === 0) mpHoleEpochMs = msg.hostTimeMs;
+  if (typeof msg.holeEpochMs === 'number' && Number.isFinite(msg.holeEpochMs)) {
+    mpHoleEpochMs = msg.holeEpochMs;
+  } else if (typeof msg.hostTimeMs === 'number' && Number.isFinite(msg.hostTimeMs)) {
+    // Derive W0: at hostTimeMs, sim was `tick`
+    mpHoleEpochMs = msg.hostTimeMs - tick * TICK_MS;
+  }
+  mpNoteHostTick(tick, msg.hostTimeMs);
   // Mid-hole join / resync: adopt host tick + obstacle clock when playing.
   if (mpPlaying && typeof msg.tick === 'number') {
     mpSimTick = msg.tick;
@@ -1953,7 +1981,7 @@ function mpApplyPuttLocal(playerId, dragVector, fromServer, playSound) {
 function mpOnPuttApplied(msg) {
   if (!mpPlaying) return;
   if (typeof msg.tick === 'number') {
-    mpNoteHostTick(msg.tick);
+    mpNoteHostTick(msg.tick, msg.hostTimeMs);
     // Never rewind simTick for a late puttApplied — that yanks a coasting ball backward.
     if (msg.tick >= mpSimTick) {
       mpSimTick = msg.tick;
@@ -2127,10 +2155,7 @@ function mpUpdateLocalSim(dt) {
     setHudText(hudTotal, `Time: ${(mpFrozenTimerMs / 1000).toFixed(1)}s`);
     return;
   }
-  // Advance toward estimated host clock (free-run from last host sample).
-  // Do NOT hard-cap at lastHostTick+N: coast netcode has no mid-flight snaps, so a
-  // putt can last hundreds of ticks — that cap freezes the ball mid-air. Trust window
-  // sizes putt acceptance on the host; clientTick future skew is clamped there.
+  // Shared epoch calendar (same as host): floor((now - W0) / TICK_MS).
   const targetTick = mpHostTargetTick();
   let steps = 0;
   while (mpSimTick < targetTick && steps < MP_MAX_CATCH_UP) {
@@ -2207,7 +2232,7 @@ function mpApplyCorrection(msg) {
     }
   }
 
-  mpNoteHostTick(tick);
+  mpNoteHostTick(tick, msg.hostTimeMs);
 
   if (msg.obstacles) {
     msg.obstacles.windmillAngles.forEach((a, i) => { if (hole.windmills[i]) hole.windmills[i].angle = a; });
