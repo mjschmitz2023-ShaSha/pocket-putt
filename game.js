@@ -1329,7 +1329,11 @@ const RbDiag = {
     const clientMoving = Math.hypot(before.vx || 0, before.vy || 0) >= STOP_THRESHOLD;
     const hostMoving = Math.hypot(b.vx || 0, b.vy || 0) >= STOP_THRESHOLD;
     const moving = clientMoving || hostMoving;
-    const dPos = Math.hypot((before.x - b.x), (before.y - b.y));
+    // Prefer same-tick residual after sample→present resim when provided.
+    const dPos =
+      meta.residualAfterResim != null
+        ? meta.residualAfterResim
+        : Math.hypot((before.x - b.x), (before.y - b.y));
     const isSelf = p && p.id === mpPlayerId;
     const reason = meta.reason || '';
     if (!hard) {
@@ -1338,6 +1342,8 @@ const RbDiag = {
       }
       return;
     }
+    // Path match after apply-at-sample + resim: confirmed no-op, not a rubber band.
+    if (meta.matched) return;
     this.hardSnaps++;
     const ev = {
       t: performance.now(),
@@ -1350,6 +1356,7 @@ const RbDiag = {
       dVy: Math.round(((b.vy || 0) - (before.vy || 0)) * 10) / 10,
       reason,
       applied: meta.applied !== false,
+      matched: !!meta.matched,
     };
     if (moving && dPos >= 0.5 && meta.applied !== false) {
       this.hardMoving++;
@@ -1845,7 +1852,9 @@ function mpApplyAuthorityPose(p, b, hard, applyOpts) {
     return;
   }
 
-  RbDiag.noteAuthority(p, b, hard, before, { reason, applied: true });
+  if (!applyOpts.skipDiag) {
+    RbDiag.noteAuthority(p, b, hard, before, { reason, applied: true });
+  }
 
   // Hard authority, settled soft, or hole-out: adopt host sim state.
   p.strokes = b.strokes;
@@ -1864,6 +1873,14 @@ function mpApplyAuthorityPose(p, b, hard, applyOpts) {
   // firedBoosts while still on a pad — clearing on rest snaps re-fires and can loop.
   if (Array.isArray(b.firedBoosts)) {
     p.firedBoosts = new Set(b.firedBoosts.filter((i) => typeof i === 'number'));
+  }
+
+  // deferVisual: seed sim at sample tick only; caller will resim to present and fix rx/ry.
+  if (applyOpts.deferVisual) {
+    p.rx = visX;
+    p.ry = visY;
+    p.rz = p.z || 0;
+    return;
   }
 
   const visGap = Math.hypot(visX - p.x, visY - p.y);
@@ -2162,16 +2179,32 @@ function mpApplyCorrection(msg) {
   // Do NOT set mpPlaying here — only roundState / mpBeginHole starts a hole. Snapshots
   // during holeEnding celebration stay in the active hole; after holeResults we ignore them.
 
-  // Post-rewind replay / explicit resync must ALWAYS hard-adopt — even if the client
-  // free-ran past host tick under lag. Ignoring those is how 1p residual survives.
-  // Other hard snaps that are older than local coast can still be ignored mid-flight
-  // (e.g. delayed idle) so we don't yank to a worse-than-prediction pose.
+  // Host wire state is as-of `tick` (sample time), NOT "now". Under lag the client is often
+  // already at clientTick > tick. Applying sample pose as present yanks the ball backward
+  // along the path even when prediction matches. Correct path:
+  //   seed host@tick → resim to clientTick → if matches prior present, true no-op.
   const forceAuthority = reason === 'resync' || reason === 'replay';
-  if (hard && !forceAuthority && typeof tick === 'number' && tick < mpSimTick) {
+  const clientTickBefore = mpSimTick;
+  const sampleInPast = hard && typeof tick === 'number' && tick < clientTickBefore;
+
+  // Non-authority hard snaps that are older than local coast: ignore mid-flight.
+  if (hard && !forceAuthority && sampleInPast) {
     const anyMoving = [...Game.players.values()].some(
       (p) => !p.holedOut && Math.hypot(p.vx || 0, p.vy || 0) >= STOP_THRESHOLD
     );
     if (anyMoving) return;
+  }
+
+  // Snapshot present for same-tick residual after resim (path match ⇒ no visual change).
+  const presentById = new Map();
+  if (sampleInPast) {
+    for (const p of Game.players.values()) {
+      presentById.set(p.id, {
+        x: p.x, y: p.y, vx: p.vx, vy: p.vy, z: p.z || 0, vz: p.vz || 0,
+        rx: p.rx, ry: p.ry, errX: p.errX || 0, errY: p.errY || 0,
+        strokes: p.strokes, holedOut: !!p.holedOut,
+      });
+    }
   }
 
   mpNoteHostTick(tick);
@@ -2184,28 +2217,31 @@ function mpApplyCorrection(msg) {
     setHoleObstaclesAtTick(hole, tick);
   }
 
-  // Hard authority from the future: for replay/resync, jump the clock — do NOT
-  // free-run catch-up (that would integrate without the host impulse/path).
-  // For other hard snaps, catch-up first so dPos is residual at the same tick.
+  // Hard authority from the future (sample ahead of us): jump clock — do NOT free-run
+  // catch-up without host path (forceAuthority). Other hard: catch up first.
   if (hard && typeof tick === 'number' && tick > mpSimTick && !forceAuthority) {
     let guard = 0;
     while (mpSimTick < tick && guard++ < 96) mpStepOneTick();
   }
 
-  // Only rewind the local tick clock on hard authority or if we're badly ahead.
-  // Soft keepalives must not yank simTick backward mid-coast.
+  // Seed sim clock at sample tick for pose write + optional resim.
   if (hard || mpSimTick > tick + 2) {
     mpSimTick = tick;
     if (!msg.obstacles) setHoleObstaclesAtTick(hole, tick);
   }
 
+  const deferVisual = sampleInPast; // resim then decide visual / no-op
   const seen = new Set();
   for (const b of msg.balls || []) {
     seen.add(b.id);
     const existed = Game.players.has(b.id);
     const p = mpUpsertPlayer(b);
     // First sighting is always hard seed (need a starting pose).
-    mpApplyAuthorityPose(p, b, hard || !existed, { reason });
+    mpApplyAuthorityPose(p, b, hard || !existed, {
+      reason,
+      skipDiag: deferVisual,
+      deferVisual,
+    });
   }
   // Never evaporate balls from soft/partial snapshots. Soft event packets can race;
   // deleting missing ids made the local ball vanish mid-hole. Only prune on hard
@@ -2215,6 +2251,64 @@ function mpApplyCorrection(msg) {
       if (seen.has(id)) continue;
       if (id === mpPlayerId) continue;
       Game.players.delete(id);
+    }
+  }
+
+  // Authority was in the past: integrate sample→present with the same stepper.
+  // If result matches what we already had, restore present (visual no-op).
+  // If not, keep resimmed state (real desync correction).
+  if (deferVisual) {
+    const MATCH_PX = 0.75;
+    const MATCH_V = 3;
+    let guard = 0;
+    while (mpSimTick < clientTickBefore && guard++ < 96) {
+      mpStepOneTick();
+    }
+    for (const [id, before] of presentById) {
+      const p = Game.players.get(id);
+      if (!p) continue;
+      const dPos = Math.hypot(p.x - before.x, p.y - before.y);
+      const dV = Math.hypot((p.vx || 0) - (before.vx || 0), (p.vy || 0) - (before.vy || 0));
+      const matched = dPos < MATCH_PX && dV < MATCH_V;
+      const moving =
+        Math.hypot(before.vx || 0, before.vy || 0) >= STOP_THRESHOLD ||
+        Math.hypot(p.vx || 0, p.vy || 0) >= STOP_THRESHOLD;
+      if (matched) {
+        // Shared path — host sample confirms client; leave present untouched.
+        p.x = before.x;
+        p.y = before.y;
+        p.vx = before.vx;
+        p.vy = before.vy;
+        p.z = before.z;
+        p.vz = before.vz;
+        p.errX = before.errX;
+        p.errY = before.errY;
+        p.rx = before.rx;
+        p.ry = before.ry;
+        p.rz = before.z;
+        if (typeof before.strokes === 'number') p.strokes = before.strokes;
+        p.holedOut = before.holedOut;
+        RbDiag.noteAuthority(p, before, true, before, {
+          reason,
+          applied: true,
+          matched: true,
+          residualAfterResim: dPos,
+        });
+      } else {
+        // True disagreement at present tick after host@sample + resim.
+        p.errX = 0;
+        p.errY = 0;
+        p.rx = p.x;
+        p.ry = p.y;
+        p.rz = p.z || 0;
+        RbDiag.noteAuthority(p, { x: p.x, y: p.y, vx: p.vx, vy: p.vy }, true, before, {
+          reason,
+          applied: true,
+          matched: false,
+          residualAfterResim: dPos,
+        });
+      }
+      void moving;
     }
   }
 

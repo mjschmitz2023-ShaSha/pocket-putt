@@ -331,15 +331,27 @@ class ClientModel {
     const hard = reason === 'resync' || reason === 'replay' ? true : !!msg.hard;
     this.playing = true;
 
-    // replay/resync must always hard-adopt (post-rewind authority under lag).
-    // Other hard snaps older than local coast may be ignored mid-flight.
+    // Host sample is as-of `tick`. If client is already ahead, seed@tick then resim
+    // to present (same as game.js) — do not apply past pose as "now".
     const forceAuthority = reason === 'resync' || reason === 'replay';
-    if (hard && !forceAuthority && typeof tick === 'number' && tick < this.simTick) {
+    const clientTickBefore = this.simTick;
+    const sampleInPast = hard && typeof tick === 'number' && tick < clientTickBefore;
+    if (hard && !forceAuthority && sampleInPast) {
       const anyMoving = [...this.players.values()].some(
         (p) => !p.holedOut && Math.hypot(p.vx, p.vy) >= STOP
       );
       if (anyMoving) {
         return;
+      }
+    }
+
+    const presentById = new Map();
+    if (sampleInPast) {
+      for (const p of this.players.values()) {
+        presentById.set(p.id, {
+          x: p.x, y: p.y, vx: p.vx, vy: p.vy, z: p.z || 0, vz: p.vz || 0,
+          rx: p.rx, ry: p.ry, errX: p.errX || 0, errY: p.errY || 0,
+        });
       }
     }
 
@@ -359,7 +371,6 @@ class ClientModel {
       Shared.setHoleObstaclesAtTick(hole, tick);
     }
 
-    // Hard from the future: free-run catch-up only for non-replay/resync (see game.js).
     if (hard && typeof tick === 'number' && tick > this.simTick && !forceAuthority) {
       let guard = 0;
       while (this.simTick < tick && guard++ < 96) this.stepOneTick();
@@ -375,7 +386,45 @@ class ClientModel {
       seen.add(b.id);
       const existed = this.players.has(b.id);
       const p = this.upsert(b);
+      // Seed sim at sample tick; visual fixed after optional resim.
       this.applyAuthorityPose(p, b, hard || !existed);
+      if (sampleInPast) {
+        const prev = presentById.get(b.id);
+        if (prev) {
+          p.rx = prev.rx;
+          p.ry = prev.ry;
+        }
+      }
+    }
+
+    if (sampleInPast) {
+      let guard = 0;
+      while (this.simTick < clientTickBefore && guard++ < 96) this.stepOneTick();
+      const MATCH_PX = 0.75;
+      const MATCH_V = 3;
+      for (const [id, before] of presentById) {
+        const p = this.players.get(id);
+        if (!p) continue;
+        const dPos = Math.hypot(p.x - before.x, p.y - before.y);
+        const dV = Math.hypot((p.vx || 0) - (before.vx || 0), (p.vy || 0) - (before.vy || 0));
+        if (dPos < MATCH_PX && dV < MATCH_V) {
+          p.x = before.x;
+          p.y = before.y;
+          p.vx = before.vx;
+          p.vy = before.vy;
+          p.z = before.z;
+          p.vz = before.vz;
+          p.errX = before.errX;
+          p.errY = before.errY;
+          p.rx = before.rx;
+          p.ry = before.ry;
+        } else {
+          p.errX = 0;
+          p.errY = 0;
+          p.rx = p.x;
+          p.ry = p.y;
+        }
+      }
     }
     // Only prune on hard full roster — soft/partial must not evaporate balls.
     if (hard && (msg.balls || []).length > 0) {
