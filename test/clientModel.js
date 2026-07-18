@@ -8,6 +8,8 @@ const TICK_HZ = Shared.TICK_HZ;
 const TICK_DT = Shared.TICK_DT;
 const PHYSICS_SUBTICKS = 4;
 const MAX_CATCH_UP = 8;
+/** Match host HISTORY_TICKS / client MP_PREDICT_CAP_TICKS. */
+const PREDICT_CAP_TICKS = 30;
 const SOFT_ERR_PX = 10;
 const HARD_ERR_PX = 80;
 const ERR_DECAY_TAU = 0.12;
@@ -29,6 +31,8 @@ class ClientModel {
     this.simTick = 0;
     this.hostTick = 0;
     this.hostTickAtMs = 0; // harness wall clock when hostTick was observed
+    this.lastHostTick = 0;
+    this.holeEpochMs = 0;
     this.players = new Map();
     this.metrics = this._emptyMetrics();
   }
@@ -61,12 +65,38 @@ class ClientModel {
   }
 
   noteHostTick(tick, wallMs) {
+    // Monotonic: puttApplied carries the putt tick (past), not host-now — never rewind
+    // the free-run base or the client freezes / forks mid-coast.
+    if (typeof tick !== 'number') return;
+    if (tick < this.hostTick) return;
     this.hostTick = tick;
     this.hostTickAtMs = wallMs;
+    this.lastHostTick = tick;
   }
 
   hostTargetTick(wallMs) {
     return Math.floor(this.hostTick + ((wallMs - this.hostTickAtMs) / 1000) * TICK_HZ);
+  }
+
+  onClockSync(msg, wallMs) {
+    if (!msg) return;
+    const tick = typeof msg.tick === 'number' ? msg.tick : 0;
+    this.noteHostTick(tick, wallMs != null ? wallMs : this.hostTickAtMs);
+    if (typeof msg.holeEpochMs === 'number') this.holeEpochMs = msg.holeEpochMs;
+    if (this.playing && typeof msg.tick === 'number') {
+      this.simTick = msg.tick;
+      Shared.setHoleObstaclesAtTick(this.hole(), this.simTick);
+    }
+  }
+
+  /** Keepalive payload for harness / host clientClock handler. */
+  makeClientClock() {
+    return {
+      type: 'clientClock',
+      tick: this.simTick,
+      clientTimeMs: Date.now(),
+      lastHostTick: this.lastHostTick,
+    };
   }
 
   onRoundState(msg) {
@@ -78,6 +108,7 @@ class ClientModel {
     const startTick = typeof msg.tick === 'number' ? msg.tick : 0;
     this.simTick = startTick;
     this.noteHostTick(startTick, 0);
+    if (typeof msg.holeEpochMs === 'number') this.holeEpochMs = msg.holeEpochMs;
     Shared.setHoleObstaclesAtTick(hole, startTick);
     this.playing = true;
     for (const b of msg.balls || []) {
@@ -297,8 +328,20 @@ class ClientModel {
     const hole = this.currentHoles()[msg.holeIndex];
     const tick = typeof msg.tick === 'number' ? msg.tick : Shared.elapsedMsToTick(msg.elapsedMs || 0);
     const reason = msg.reason || 'heartbeat';
-    const hard = reason === 'resync' ? true : !!msg.hard;
+    const hard = reason === 'resync' || reason === 'replay' ? true : !!msg.hard;
     this.playing = true;
+
+    // Stale hard snap from the past while already coasting ahead — do not yank back to
+    // putt-tick pose (lockstep harness / reordered packets). Optimistic coast is correct.
+    if (hard && typeof tick === 'number' && tick < this.simTick) {
+      const anyMoving = [...this.players.values()].some(
+        (p) => !p.holedOut && Math.hypot(p.vx, p.vy) >= STOP
+      );
+      if (anyMoving) {
+        return;
+      }
+    }
+
     this.noteHostTick(tick, wallMs);
 
     if (msg.obstacles) {
@@ -313,6 +356,13 @@ class ClientModel {
       });
     } else {
       Shared.setHoleObstaclesAtTick(hole, tick);
+    }
+
+    // Hard snap from the future: catch up local sim first so dPos is residual error,
+    // not trajectory distance between different ticks (lagged post-replay snaps).
+    if (hard && typeof tick === 'number' && tick > this.simTick) {
+      let guard = 0;
+      while (this.simTick < tick && guard++ < 96) this.stepOneTick();
     }
 
     if (hard || this.simTick > tick + 2) {
@@ -439,6 +489,8 @@ class ClientModel {
    */
   update(wallMs, dt) {
     if (!this.playing) return;
+    // Free-run from last host sample (coast model has no mid-flight snaps).
+    // Trust window is enforced on host putt acceptance, not by freezing local coast.
     const target = this.hostTargetTick(wallMs);
     let steps = 0;
     while (this.simTick < target && steps < MAX_CATCH_UP) {
@@ -507,5 +559,6 @@ module.exports = {
   SOFT_ERR_PX,
   HARD_ERR_PX,
   PHYSICS_SUBTICKS,
+  PREDICT_CAP_TICKS,
   TICK_HZ,
 };

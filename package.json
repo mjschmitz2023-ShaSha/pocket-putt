@@ -7,6 +7,8 @@
     "start": "node relay.js",
     "lan": "node relay.js",
     "relay": "node relay.js",
+    "lag-proxy": "node lag-proxy.js",
+    "lag-proxy:heavy": "LAG_MS=120 JITTER_MS=60 node lag-proxy.js",
     "lan-legacy": "node server.js",
     "test": "node test/level-codec.js && node test/share-level.js && node test/expand-lvl-short.js && node test/draw-shared.js && node test/editor-phase.js && node test/editor-snap.js && node test/editor-gizmos.js && node test/editor-test-physics.js && node test/editor-fidelity-structural.js && node test/editor-codec-limits.js && node test/ramp-oriented.js && node test/boost-latch.js && node test/custom-mp-hole.js && node test/relay-static-files.js && node test/sticky-latch.js && node test/wall-surface-collision.js && node test/quasi-rest.js && node test/crawl-putt.js && node test/respawn-offer.js && node test/orbit-hio.js && node test/portals.js && node test/portal-hio.js && node test/rubberband-harness.js --all",
     "test:portals": "node test/portals.js",
@@ -29,7 +31,8 @@
     "test:sticky": "node test/sticky-latch.js",
     "test:orbit": "node test/orbit-hio.js",
     "test:rubberband": "node test/rubberband-harness.js --all",
-    "test:lockstep": "node test/rubberband-harness.js lockstep_coast"
+    "test:lockstep": "node test/rubberband-harness.js lockstep_coast",
+    "test:solo-lag": "node test/rubberband-harness.js solo_1p_ideal solo_1p_bidirectional_lag"
   },
   "engines": {
     "node": ">=18"

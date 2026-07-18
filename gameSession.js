@@ -23,9 +23,67 @@ const CORRECTION_IDLE_EVERY = 120; // 2s idle keepalives while aiming
 // (Inner shared.js also uses 4 microsteps — host and client must use the same N.)
 const PHYSICS_SUBTICKS = 4;
 const MAX_PLAYERS = Number(process.env.RELAY_MAX_PLAYERS) || 8;
+// Tick-stamped putts: whole-hole history ring + input log (docs/mp-tick-stamped-inputs.md).
+// Snapshot = end-of-tick state. Putt at clientTick T applies on restore(T), then physics T→T+1.
+const HISTORY_TICKS = 30;
+const TRUST_WINDOW_TICKS = HISTORY_TICKS;
+const KEEPALIVE_MISS_THRESHOLD = 3;
+const KEEPALIVE_EXPECT_MS = 400;
+const KEEPALIVE_STALE_MS = KEEPALIVE_MISS_THRESHOLD * KEEPALIVE_EXPECT_MS;
+// Allow one tick of future skew (client slightly ahead of host sample).
+const CLIENT_TICK_FUTURE_SKEW = 1;
 
 function makeId() {
   return crypto.randomUUID();
+}
+
+function cloneBallState(ball) {
+  if (!ball) return null;
+  return {
+    x: ball.x,
+    y: ball.y,
+    vx: ball.vx,
+    vy: ball.vy,
+    z: ball.z || 0,
+    vz: ball.vz || 0,
+    squash: ball.squash || 0,
+    spin: ball.spin || 0,
+    angleDir: ball.angleDir || 0,
+    firedBoosts: new Set(ball.firedBoosts instanceof Set ? ball.firedBoosts : []),
+    stuckStickyIndex: typeof ball.stuckStickyIndex === 'number' ? ball.stuckStickyIndex : -1,
+    wet: !!ball.wet,
+    wetStroke: !!ball.wetStroke,
+  };
+}
+
+function cloneFloating(fl) {
+  if (!fl) return null;
+  return {
+    zone: fl.zone,
+    ticks: fl.ticks,
+    vx: fl.vx || 0,
+    vy: fl.vy || 0,
+  };
+}
+
+function cloneSpeedTracker(tr) {
+  if (!tr) return Shared.createSpeedAvgTracker();
+  return {
+    sumSpDt: tr.sumSpDt || 0,
+    sumDt: tr.sumDt || 0,
+    q: Array.isArray(tr.q) ? tr.q.slice() : [],
+  };
+}
+
+function clonePerHoleScores(scores) {
+  if (!Array.isArray(scores)) return [];
+  return scores.map((s) => ({
+    holeIndex: s.holeIndex,
+    strokes: s.strokes,
+    finishSeconds: s.finishSeconds,
+    holeScore: s.holeScore,
+    timedOut: !!s.timedOut,
+  }));
 }
 
 class GameSession {
@@ -44,6 +102,8 @@ class GameSession {
     this.customHole = null;
     this.currentHoleIndex = 0;
     this.holeStartedAtMs = 0;
+    /** Wall time W0 when hole tick 0 began (same as holeStartedAtMs at beginHole). */
+    this.holeEpochMs = 0;
     this.simTick = 0;
     this.holeEnding = false;
     this.holeEndingAtMs = 0;
@@ -53,6 +113,13 @@ class GameSession {
     this.lastActivity = Date.now();
     this._holeAdvanceTimer = null; // legacy; progression is wall-clock in tickDriver
     this._destroyed = false;
+    /** @type {{ tick: number, state: object }[]} end-of-tick whole-hole snapshots */
+    this.snapshotRing = [];
+    /** @type {{ tick: number, playerId: string, kind: string, dragVector: {x:number,y:number} }[]} */
+    this.inputLog = [];
+    this._replaying = false;
+    /** @type {number|null} coalesce concurrent late inputs to earliest tick */
+    this.pendingReplayFrom = null;
   }
 
   touch() {
@@ -107,12 +174,25 @@ class GameSession {
       par: hole.par,
       tick: this.simTick,
       tickHz: TICK_HZ,
+      hostTimeMs: Date.now(),
+      holeEpochMs: this.holeEpochMs || this.holeStartedAtMs,
       ...this.customHoleLobbyFields(),
       // Reliable tee seed — clients must not depend solely on an unreliable resync
       // snapshot to populate Game.players (dropped resync → empty roster / vanished ball).
       balls: [...this.players.values()]
         .filter((p) => p.connected && p.ball)
         .map((p) => this.ballWire(p)),
+    };
+  }
+
+  clockSyncPayload() {
+    return {
+      type: 'clockSync',
+      holeIndex: this.currentHoleIndex,
+      tick: this.simTick,
+      hostTimeMs: Date.now(),
+      tickHz: TICK_HZ,
+      holeEpochMs: this.holeEpochMs || this.holeStartedAtMs,
     };
   }
 
@@ -190,20 +270,36 @@ class GameSession {
       p.ball = Shared.createBallState(Shared.teePositionFor(slot, roster.length, hole));
       p.strokes = 0;
       p.holedOut = false;
+      p.dunks = 0;
       p.floating = null; // never carry a hazard float across holes
       p.speedTracker = Shared.createSpeedAvgTracker();
+      // Fresh clock trust for the hole (keepalives re-establish).
+      p.lastKeepaliveTick = null;
+      p.lastKeepaliveWall = 0;
+      p.lastHostTickSeen = 0;
+      p.clockTrusted = true;
     });
-    this.holeStartedAtMs = Date.now();
+    const now = Date.now();
+    this.holeStartedAtMs = now;
+    this.holeEpochMs = now;
     this.simTick = 0;
     this.holeEnding = false;
     this.holeEndingAtMs = 0;
     this.holeResultsAtMs = 0;
     this.pendingEvents = [];
     this.wasIdle = false;
+    this.snapshotRing = [];
+    this.inputLog = [];
+    this.pendingReplayFrom = null;
+    this._replaying = false;
     this.state = 'PLAYING';
     this.touch();
+    Shared.setHoleObstaclesAtTick(hole, 0);
+    // Seed end-of-tick-0 snapshot (tee setup) so putts at T=0 can restore.
+    this.pushSnapshot();
     // Reliable roundState now carries tee balls; also push a hard resync for obstacles.
     this.broadcastReliable(this.roundStatePayload());
+    this.broadcastReliable(this.clockSyncPayload());
     this.broadcastReliable(
       this.buildCorrection([], { reason: 'resync', includeObstacles: true, hard: true })
     );
@@ -342,11 +438,12 @@ class GameSession {
   buildCorrection(events, opts) {
     opts = opts || {};
     const reason = opts.reason || 'idle';
-    const includeObstacles = !!opts.includeObstacles || reason === 'resync' || reason === 'idle';
+    const includeObstacles =
+      !!opts.includeObstacles || reason === 'resync' || reason === 'replay' || reason === 'idle';
     let hard;
     if (opts.hard !== undefined) {
       hard = !!opts.hard;
-    } else if (reason === 'resync') {
+    } else if (reason === 'resync' || reason === 'replay') {
       hard = true;
     } else if (reason === 'event') {
       hard = this.eventsNeedHardSnap(events);
@@ -384,13 +481,137 @@ class GameSession {
     this.pendingEvents = [];
   }
 
-  stepSimulation() {
-    if (this.state !== 'PLAYING' || this._destroyed) return;
+  // ---- Whole-hole snapshot ring (end-of-tick authority) ----
+
+  cloneHoleState() {
+    const players = {};
+    for (const p of this.players.values()) {
+      players[p.id] = {
+        strokes: p.strokes,
+        holedOut: !!p.holedOut,
+        dunks: p.dunks || 0,
+        floating: cloneFloating(p.floating),
+        ball: cloneBallState(p.ball),
+        speedTracker: cloneSpeedTracker(p.speedTracker),
+        perHoleScores: clonePerHoleScores(p.perHoleScores),
+        totalScore: p.totalScore || 0,
+      };
+    }
+    return {
+      tick: this.simTick,
+      wasIdle: this.wasIdle,
+      holeEnding: this.holeEnding,
+      holeEndingAtMs: this.holeEndingAtMs,
+      players,
+    };
+  }
+
+  restoreHoleState(state) {
+    if (!state) return false;
+    for (const p of this.players.values()) {
+      const snap = state.players[p.id];
+      if (!snap) {
+        // Player joined mid-hole after this snapshot — leave their current state.
+        continue;
+      }
+      p.strokes = snap.strokes;
+      p.holedOut = !!snap.holedOut;
+      p.dunks = snap.dunks || 0;
+      p.floating = cloneFloating(snap.floating);
+      p.ball = cloneBallState(snap.ball);
+      p.speedTracker = cloneSpeedTracker(snap.speedTracker);
+      p.perHoleScores = clonePerHoleScores(snap.perHoleScores);
+      p.totalScore = snap.totalScore || 0;
+    }
+    this.simTick = state.tick;
+    this.wasIdle = !!state.wasIdle;
+    this.holeEnding = !!state.holeEnding;
+    this.holeEndingAtMs = state.holeEndingAtMs || 0;
+    this.pendingEvents = [];
+    const hole = this.currentHoles()[this.currentHoleIndex];
+    Shared.setHoleObstaclesAtTick(hole, this.simTick);
+    return true;
+  }
+
+  pushSnapshot() {
+    const state = this.cloneHoleState();
+    // Replace existing entry for this tick (replay rewrites history).
+    const existing = this.snapshotRing.findIndex((e) => e.tick === this.simTick);
+    if (existing >= 0) this.snapshotRing[existing] = { tick: this.simTick, state };
+    else this.snapshotRing.push({ tick: this.simTick, state });
+    this.snapshotRing.sort((a, b) => a.tick - b.tick);
+    const minTick = this.simTick - HISTORY_TICKS;
+    while (this.snapshotRing.length && this.snapshotRing[0].tick < minTick) {
+      this.snapshotRing.shift();
+    }
+  }
+
+  getSnapshot(tick) {
+    for (let i = this.snapshotRing.length - 1; i >= 0; i--) {
+      if (this.snapshotRing[i].tick === tick) return this.snapshotRing[i].state;
+    }
+    return null;
+  }
+
+  /**
+   * Apply all logged putts stamped at `tick` (impulses only, simultaneous).
+   * Same-player same-tick: last log entry wins.
+   * @returns {object[]} applied putt records (for puttApplied juice)
+   */
+  applyInputsForTick(tick) {
+    const hole = this.currentHoles()[this.currentHoleIndex];
+    const byPlayer = new Map();
+    for (const rec of this.inputLog) {
+      if (rec.tick !== tick || rec.kind !== 'putt') continue;
+      byPlayer.set(rec.playerId, rec);
+    }
+    const applied = [];
+    for (const rec of byPlayer.values()) {
+      const player = this.players.get(rec.playerId);
+      if (!player || !player.connected || !player.ball || player.holedOut || player.floating) continue;
+      if (!player.speedTracker) player.speedTracker = Shared.createSpeedAvgTracker();
+      if (!Shared.mayPuttBall(player.ball, hole, player.speedTracker)) continue;
+      const clamped = Shared.clampDragVector(rec.dragVector);
+      if (!clamped) continue;
+      const launch = Shared.computeLaunchVelocity(clamped);
+      const factor = Shared.stickyLaunchFactor(player.ball, hole);
+      player.ball.firedBoosts = new Set();
+      Shared.latchStickyAfterPutt(player.ball, hole);
+      Shared.noteWetPutt(player.ball);
+      player.ball.vx = launch.vx * factor;
+      player.ball.vy = launch.vy * factor;
+      player.ball.z = 0;
+      player.ball.vz = 0;
+      player.strokes++;
+      Shared.resetSpeedAvgTracker(player.speedTracker);
+      applied.push({
+        playerId: player.id,
+        tick,
+        dragVector: { x: clamped.x, y: clamped.y },
+        strokes: player.strokes,
+        x: player.ball.x,
+        y: player.ball.y,
+        vx: player.ball.vx,
+        vy: player.ball.vy,
+        z: player.ball.z,
+        vz: player.ball.vz,
+        stuckStickyIndex: player.ball.stuckStickyIndex,
+        wet: player.ball.wet,
+        wetStroke: player.ball.wetStroke,
+      });
+    }
+    return applied;
+  }
+
+  /**
+   * Physics body for one tick: increments simTick, obstacles, floats, subticks, clashes.
+   * Collects events into this.pendingEvents. Does not emit network traffic.
+   */
+  stepPhysicsOneTick() {
     this.simTick += 1;
     this.touch();
 
     const hole = this.currentHoles()[this.currentHoleIndex];
-    // Absolute obstacle pose from tick — same formula clients use.
     Shared.setHoleObstaclesAtTick(hole, this.simTick);
 
     const tickEvents = this.pendingEvents;
@@ -398,11 +619,7 @@ class GameSession {
     const sandedThisTick = new Set();
     const clashedPairs = new Set();
 
-    // Physics subticks must match client mpStepOneTick (same dt schedule → sticky latch agrees).
-    // Ball-ball interleaved each subtick so fast rams still connect.
-    // Hazard floats first: penalized balls bob and drift with the (deterministic)
-    // waves instead of stepping physics; at the end of the float they take their
-    // slot-indexed spot in the drop zone.
+    // Hazard floats first (deterministic waves + slot-indexed drop).
     for (const p of this.players.values()) {
       if (!p.connected || p.holedOut || !p.ball || !p.floating) continue;
       const fl = p.floating;
@@ -418,7 +635,6 @@ class GameSession {
         p.ball.vy = 0;
         Shared.markWetFromWater(p.ball);
         p.floating = null;
-        // Hard event so every client snaps to the authoritative drop spot.
         tickEvents.push({ id: p.id, kind: 'water', x: drop.x, y: drop.y });
       }
     }
@@ -451,7 +667,6 @@ class GameSession {
           });
         }
         if (events.water) {
-          // Penalty now; the reset comes after a 1.5s float (see the float pass above).
           p.strokes++;
           p.dunks = (p.dunks || 0) + 1;
           tickEvents.push({ id: p.id, kind: 'water', x: p.ball.x, y: p.ball.y });
@@ -469,9 +684,7 @@ class GameSession {
         }
         if (events.blackHole) {
           p.strokes++;
-          const hole = this.currentHoles()[this.currentHoleIndex];
           tickEvents.push({ id: p.id, kind: 'blackHole', x: p.ball.x, y: p.ball.y });
-          // Spec: +1 stroke, reset to hole tee (not a custom drop pad); no wet.
           p.ball.x = hole.tee.x;
           p.ball.y = hole.tee.y;
           p.ball.vx = 0;
@@ -502,7 +715,6 @@ class GameSession {
             const key = pa.id + '|' + pb.id;
             if (!clashedPairs.has(key)) {
               clashedPairs.add(key);
-              // Full post-clash poses so clients never fork on multi-ball (coast model).
               tickEvents.push({
                 kind: 'clash',
                 a: pa.id,
@@ -519,30 +731,31 @@ class GameSession {
         }
       }
     }
+  }
 
+  /**
+   * Emit sparse corrections / hole-end for a completed live tick (not during silent replay).
+   */
+  emitTickCorrections() {
+    const tickEvents = this.pendingEvents;
     const active = [...this.players.values()].filter((p) => p.connected && p.ball && !p.holedOut);
     const connected = [...this.players.values()].filter((p) => p.connected);
 
-    // Pure coast while rolling: NO pose heartbeats mid-flight.
     const anyMoving = active.some((p) => Math.hypot(p.ball.vx, p.ball.vy) >= Shared.STOP_THRESHOLD);
     const idle = !anyMoving && tickEvents.length === 0;
     const becameIdle = idle && !this.wasIdle;
     this.wasIdle = idle;
     if (tickEvents.length > 0) {
-      // hard decided by event kinds (clash/water/holed hard; bounce/sand/boost soft)
       this.sendCorrectionNow(tickEvents, { reason: 'event' });
     } else if (becameIdle) {
-      // Everyone just stopped — hard snap so aim poses match before next putt.
+      // Safety net: hard idle so aim poses match (should be ~no-op when tick-stamps work).
       this.sendCorrectionNow([], { reason: 'idle', includeObstacles: true, hard: true });
     } else if (idle && this.simTick % CORRECTION_IDLE_EVERY === 0) {
-      // Periodic keepalive: soft — corrects drift without rubber-banding.
       this.sendCorrectionNow([], { reason: 'idle', includeObstacles: true, hard: false });
     }
 
-    // Treat ball-less connected players as done so a glitched join can't block forever.
     const allHoledOut =
-      connected.length > 0 &&
-      connected.every((p) => p.holedOut || !p.ball);
+      connected.length > 0 && connected.every((p) => p.holedOut || !p.ball);
     const timedOut = this.simTick >= HOLE_TIMEOUT_TICKS;
     if ((allHoledOut || timedOut) && !this.holeEnding) {
       this.holeEnding = true;
@@ -554,7 +767,243 @@ class GameSession {
       }
       this.sendCorrectionNow(this.pendingEvents, { reason: 'resync', includeObstacles: true, hard: true });
     }
-    // Celebration pause then results — wall-clock in tickDriver (see maybeEndHoleAfterPause).
+  }
+
+  /**
+   * Live step: physics + corrections + ring push.
+   * @param {{ silent?: boolean }} [opts] silent=true during rewind replay (no mid-history sends)
+   */
+  stepSimulation(opts) {
+    if (this.state !== 'PLAYING' || this._destroyed) return;
+    const silent = !!(opts && opts.silent);
+    this.stepPhysicsOneTick();
+    this.pushSnapshot();
+    if (!silent) this.emitTickCorrections();
+    else {
+      // Still track idle flag so post-replay hard snap / later idle is correct.
+      const active = [...this.players.values()].filter((p) => p.connected && p.ball && !p.holedOut);
+      const anyMoving = active.some((p) => Math.hypot(p.ball.vx, p.ball.vy) >= Shared.STOP_THRESHOLD);
+      this.wasIdle = !anyMoving && this.pendingEvents.length === 0;
+      this.pendingEvents = [];
+    }
+  }
+
+  forceSyncPlayer(player) {
+    if (!player || !player.ws) return;
+    this.send(
+      player.ws,
+      this.buildCorrection([], { reason: 'resync', includeObstacles: true, hard: true })
+    );
+  }
+
+  /**
+   * Validate clientTick against trust window + keepalive monotonic floor.
+   * Slightly-future ticks (client 1 ahead from wall/FP skew) clamp to hostNow.
+   * @returns {{ ok: boolean, tick?: number, reason?: string }}
+   */
+  validateClientTick(player, clientTick) {
+    const hostNow = this.simTick;
+    if (typeof clientTick !== 'number' || !Number.isFinite(clientTick)) {
+      return { ok: false, reason: 'missing_tick' };
+    }
+    let T = Math.round(clientTick);
+    if (Math.abs(T - clientTick) > 1e-3) {
+      return { ok: false, reason: 'non_integer_tick' };
+    }
+    // Stale keepalives revoke trust (except bootstrap before first keepalive).
+    if (player.lastKeepaliveWall > 0 && Date.now() - player.lastKeepaliveWall > KEEPALIVE_STALE_MS) {
+      player.clockTrusted = false;
+      return { ok: false, reason: 'keepalive_stale' };
+    }
+    if (player.clockTrusted === false) {
+      return { ok: false, reason: 'untrusted' };
+    }
+    if (player.lastKeepaliveTick != null && T < player.lastKeepaliveTick) {
+      return { ok: false, reason: 'before_keepalive' };
+    }
+    if (T > hostNow + CLIENT_TICK_FUTURE_SKEW) {
+      return { ok: false, reason: 'future' };
+    }
+    // Client slightly ahead of host (predict/FP): apply at hostNow — same rest pose.
+    if (T > hostNow) T = hostNow;
+    if (T < hostNow - TRUST_WINDOW_TICKS) {
+      return { ok: false, reason: 'too_old' };
+    }
+    if (T < 0) return { ok: false, reason: 'negative' };
+    if (!this.getSnapshot(T)) {
+      return { ok: false, reason: 'no_snapshot' };
+    }
+    return { ok: true, tick: T };
+  }
+
+  handleClientClock(player, msg) {
+    if (!player || this.state !== 'PLAYING') return;
+    const tick = typeof msg.tick === 'number' ? Math.round(msg.tick) : null;
+    if (tick == null || !Number.isFinite(tick)) return;
+    player.lastKeepaliveTick = tick;
+    player.lastKeepaliveWall = Date.now();
+    if (typeof msg.lastHostTick === 'number') player.lastHostTickSeen = msg.lastHostTick;
+    player.clockTrusted = true;
+  }
+
+  /**
+   * Whole-hole rewind + replay from earliest affected putt tick to hostNow.
+   * Convention: snapshot(T) = end of tick T. Putt stamped T applies on that pose;
+   * next stepPhysics advances to T+1.
+   */
+  scheduleReplayFrom(fromTick) {
+    if (this._replaying) {
+      this.pendingReplayFrom =
+        this.pendingReplayFrom == null ? fromTick : Math.min(this.pendingReplayFrom, fromTick);
+      return;
+    }
+    this.runReplay(fromTick);
+  }
+
+  runReplay(fromTick) {
+    this._replaying = true;
+    let Tstar = fromTick;
+    const targetTick = this.simTick;
+    let lastAppliedJuice = [];
+    try {
+      while (Tstar != null) {
+        this.pendingReplayFrom = null;
+        const snap = this.getSnapshot(Tstar);
+        if (!snap) {
+          // History gap — force-sync everyone and abort.
+          this.broadcastReliable(
+            this.buildCorrection([], { reason: 'resync', includeObstacles: true, hard: true })
+          );
+          return;
+        }
+        this.restoreHoleState(snap);
+        // Drop ring entries after Tstar — they will be rebuilt by silent steps.
+        this.snapshotRing = this.snapshotRing.filter((e) => e.tick <= Tstar);
+        this.pendingEvents = [];
+
+        // Juice only for putts at the rewind origin (new late inputs); later ticks re-apply silently.
+        lastAppliedJuice = this.applyInputsForTick(Tstar);
+        let t = Tstar;
+        while (t < targetTick) {
+          this.stepSimulation({ silent: true });
+          t = this.simTick;
+          // After arriving at t, apply putts stamped t before further steps.
+          this.applyInputsForTick(t);
+        }
+
+        if (this.pendingReplayFrom != null) {
+          Tstar = this.pendingReplayFrom;
+          continue;
+        }
+        break;
+      }
+
+      // Juice: puttApplied for SFX (state truth is the hard snapshot below).
+      for (const rec of lastAppliedJuice) {
+        const puttMsg = {
+          type: 'puttApplied',
+          playerId: rec.playerId,
+          tick: rec.tick,
+          dragVector: rec.dragVector,
+          strokes: rec.strokes,
+          x: rec.x,
+          y: rec.y,
+          vx: rec.vx,
+          vy: rec.vy,
+          z: rec.z,
+          vz: rec.vz,
+          stuckStickyIndex: rec.stuckStickyIndex,
+        };
+        if (rec.wet) {
+          puttMsg.wet = true;
+          if (rec.wetStroke) puttMsg.wetStroke = true;
+        }
+        this.broadcastReliable(puttMsg);
+      }
+
+      // Hard full-hole snapshot after rewind/replay (reliable — state truth).
+      this.broadcastReliable(
+        this.buildCorrection([], { reason: 'replay', includeObstacles: true, hard: true })
+      );
+      this.pendingEvents = [];
+
+      // Hole-end if everyone finished during replay.
+      const connected = [...this.players.values()].filter((p) => p.connected);
+      const allHoledOut =
+        connected.length > 0 && connected.every((p) => p.holedOut || !p.ball);
+      const timedOut = this.simTick >= HOLE_TIMEOUT_TICKS;
+      if ((allHoledOut || timedOut) && !this.holeEnding) {
+        this.holeEnding = true;
+        this.holeEndingAtMs = Date.now();
+        if (timedOut) {
+          for (const p of connected) {
+            if (!p.holedOut) this.finishPlayerHole(p, true);
+          }
+        }
+      }
+    } finally {
+      this._replaying = false;
+    }
+  }
+
+  /**
+   * Accept tick-stamped putt: validate → log → whole-hole rewind/replay → hard snap.
+   * Reject → silent force-sync (hard resync) for that player.
+   */
+  handlePutt(player, msg) {
+    if (this.state !== 'PLAYING' || !player.ball || player.holedOut || player.floating) {
+      this.forceSyncPlayer(player);
+      return;
+    }
+    const v = msg.dragVector;
+    if (!v || typeof v.x !== 'number' || typeof v.y !== 'number') {
+      this.forceSyncPlayer(player);
+      return;
+    }
+    const clamped = Shared.clampDragVector(v);
+    if (!clamped) {
+      this.forceSyncPlayer(player);
+      return;
+    }
+
+    // Require clientTick (legacy putts without stamp are rejected + force-synced).
+    const clientTickRaw = msg.clientTick;
+    const check = this.validateClientTick(player, clientTickRaw);
+    if (!check.ok) {
+      this.forceSyncPlayer(player);
+      return;
+    }
+    const T = check.tick;
+    const hole = this.currentHoles()[this.currentHoleIndex];
+    const snap = this.getSnapshot(T);
+    const snapP = snap && snap.players[player.id];
+    if (!snapP || !snapP.ball || snapP.holedOut || snapP.floating) {
+      this.forceSyncPlayer(player);
+      return;
+    }
+    // Legality at historical T (not host-now coast pose).
+    const ballAtT = cloneBallState(snapP.ball);
+    const trackerAtT = cloneSpeedTracker(snapP.speedTracker);
+    if (!Shared.mayPuttBall(ballAtT, hole, trackerAtT)) {
+      this.forceSyncPlayer(player);
+      return;
+    }
+
+    // Replace same-player same-tick putt in log (last wins).
+    this.inputLog = this.inputLog.filter(
+      (r) => !(r.tick === T && r.playerId === player.id && r.kind === 'putt')
+    );
+    this.inputLog.push({
+      tick: T,
+      playerId: player.id,
+      kind: 'putt',
+      dragVector: { x: clamped.x, y: clamped.y },
+    });
+    // Drop log entries older than history window.
+    const minLog = this.simTick - HISTORY_TICKS - 1;
+    this.inputLog = this.inputLog.filter((r) => r.tick >= minLog);
+
+    this.scheduleReplayFrom(T);
   }
 
   maybeEndHoleAfterPause() {
@@ -570,6 +1019,17 @@ class GameSession {
     this.maybeEndHoleAfterPause();
     this.maybeAdvanceFromResults();
     if (this.state !== 'PLAYING') return;
+    // Keepalive starvation → untrusted + force-sync (silent).
+    const now = Date.now();
+    for (const p of this.players.values()) {
+      if (!p.connected) continue;
+      if (p.lastKeepaliveWall > 0 && now - p.lastKeepaliveWall > KEEPALIVE_STALE_MS) {
+        if (p.clockTrusted !== false) {
+          p.clockTrusted = false;
+          this.forceSyncPlayer(p);
+        }
+      }
+    }
     const wallTarget = Math.floor((Date.now() - this.holeStartedAtMs) / TICK_MS);
     let steps = 0;
     while (this.simTick < wallTarget && steps < MAX_CATCH_UP_TICKS) {
@@ -597,6 +1057,7 @@ class GameSession {
         );
       }
       this.send(player.ws, this.roundStatePayload());
+      this.send(player.ws, this.clockSyncPayload());
       this.send(player.ws, this.buildCorrection([], { reason: 'resync', includeObstacles: true, hard: true }));
     }
   }
@@ -762,48 +1223,10 @@ class GameSession {
       this.broadcastReliable(
         this.buildCorrection([], { reason: 'resync', includeObstacles: true, hard: true })
       );
+    } else if (msg.type === 'clientClock') {
+      this.handleClientClock(player, msg);
     } else if (msg.type === 'putt') {
-      if (this.state !== 'PLAYING' || !player.ball || player.holedOut || player.floating) return;
-      const hole = this.currentHoles()[this.currentHoleIndex];
-      if (!player.speedTracker) player.speedTracker = Shared.createSpeedAvgTracker();
-      // Clean rest, or quasi-rest (avg |v| near 0 for ~5s) e.g. bumper chatter in gravity.
-      if (!Shared.mayPuttBall(player.ball, hole, player.speedTracker)) return;
-      const v = msg.dragVector;
-      if (!v || typeof v.x !== 'number' || typeof v.y !== 'number') return;
-      const clamped = Shared.clampDragVector(v);
-      if (!clamped) return;
-      const launch = Shared.computeLaunchVelocity(clamped);
-      const factor = Shared.stickyLaunchFactor(player.ball, hole);
-      player.ball.firedBoosts = new Set();
-      // Goo stays sticky while inside the patch (no grass escape latch).
-      Shared.latchStickyAfterPutt(player.ball, hole);
-      Shared.noteWetPutt(player.ball);
-      player.ball.vx = launch.vx * factor;
-      player.ball.vy = launch.vy * factor;
-      player.ball.z = 0;
-      player.ball.vz = 0;
-      player.strokes++;
-      Shared.resetSpeedAvgTracker(player.speedTracker);
-      // One reliable event — no pose stream while the ball is rolling.
-      const puttMsg = {
-        type: 'puttApplied',
-        playerId: player.id,
-        tick: this.simTick,
-        dragVector: { x: clamped.x, y: clamped.y },
-        strokes: player.strokes,
-        x: player.ball.x,
-        y: player.ball.y,
-        vx: player.ball.vx,
-        vy: player.ball.vy,
-        z: player.ball.z,
-        vz: player.ball.vz,
-        stuckStickyIndex: player.ball.stuckStickyIndex,
-      };
-      if (player.ball.wet) {
-        puttMsg.wet = true;
-        if (player.ball.wetStroke) puttMsg.wetStroke = true;
-      }
-      this.broadcastReliable(puttMsg);
+      this.handlePutt(player, msg);
     }
   }
 
@@ -836,4 +1259,7 @@ module.exports = {
   GameSession,
   TICK_MS,
   MAX_PLAYERS,
+  HISTORY_TICKS,
+  TRUST_WINDOW_TICKS,
+  KEEPALIVE_STALE_MS,
 };

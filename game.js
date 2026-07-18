@@ -975,10 +975,12 @@ function handlePointerUp(x, y) {
   const len = Math.hypot(v.x, v.y);
   if (len < MIN_DRAG_DIST) return;
   if (MULTIPLAYER) {
-    // Optimistic local putt; host validates and broadcasts puttApplied so everyone
-    // coasts from the same input (no mid-flight pose stream).
+    // Stamp clientTick at release (mpSimTick before optimistic apply) so host can
+    // rewind/replay to the same absolute tick the client launched on.
+    const clientTick = mpSimTick;
+    // Optimistic local putt; host validates and broadcasts puttApplied / hard replay snap.
     mpApplyPuttLocal(mpPlayerId, v, null, true);
-    mpSocket.send(JSON.stringify({ type: 'putt', dragVector: v }));
+    mpSocket.send(JSON.stringify({ type: 'putt', dragVector: v, clientTick }));
     mpCanPutt = false;
   } else {
     launchBall(len, v);
@@ -1270,10 +1272,122 @@ let mpFrozenTimerMs = 0;
 let mpSimTick = 0;
 let mpHostTick = 0;
 let mpHostTickAt = 0;
+/** Hole epoch W0 (host wall time at tick 0) — keepalives / diagnostics. */
+let mpHoleEpochMs = 0;
+/** lastHostTick reported on keepalives (last adopted host tick). */
+let mpLastHostTick = 0;
+let mpKeepaliveTimer = null;
 const MP_MAX_CATCH_UP = 8;
+/** Predict cap: do not free-run more than lastHostTick + N (matches host HISTORY_TICKS). */
+const MP_PREDICT_CAP_TICKS = 30;
+const MP_KEEPALIVE_MS = 333;
 const MP_SOFT_ERR_PX = 10;
 const MP_HARD_ERR_PX = 80;
 const MP_ERR_DECAY_TAU = 0.12;
+
+// ---- Rubber-band detector (observe only — never changes physics) ----
+// Enable: ?rbdebug=1  or  localStorage.ppRbDebug = '1'
+// Live RTT lag for realism must come from lag-proxy.js (bidirectional), not here.
+function mpRbDebugEnabled() {
+  const q = MP_PARAMS.get('rbdebug');
+  if (q === '0' || q === 'false') return false;
+  if (q === '1' || q === 'true') return true;
+  try { if (localStorage.getItem('ppRbDebug') === '1') return true; } catch (_) {}
+  return false;
+}
+const RbDiag = {
+  enabled: false,
+  hardSnaps: 0,
+  hardMoving: 0, // hard pose apply while client or host ball speed >= STOP
+  softIgnoredMoving: 0,
+  puttResyncs: 0, // self puttApplied re-applied pose after already coasting
+  events: [],
+  init() {
+    this.enabled = mpRbDebugEnabled();
+    if (!this.enabled) return;
+    try { window.RbDiag = this; } catch (_) {}
+    console.info(
+      '[RB] rubber-band detector ON — hard snaps while moving are the signal. ' +
+      'For realistic lag use lag-proxy (npm run lag-proxy), not one-way client delay. ' +
+      'Dump: RbDiag.summary()'
+    );
+  },
+  _push(ev) {
+    this.events.push(ev);
+    if (this.events.length > 200) this.events.shift();
+  },
+  /**
+   * @param {object} p client player (before or after — pass before snap for dist)
+   * @param {object} b host pose
+   * @param {boolean} hard
+   * @param {{ x:number, y:number, vx:number, vy:number }} before
+   * @param {{ reason?: string, applied?: boolean }} meta
+   */
+  noteAuthority(p, b, hard, before, meta) {
+    if (!this.enabled) return;
+    meta = meta || {};
+    const clientMoving = Math.hypot(before.vx || 0, before.vy || 0) >= STOP_THRESHOLD;
+    const hostMoving = Math.hypot(b.vx || 0, b.vy || 0) >= STOP_THRESHOLD;
+    const moving = clientMoving || hostMoving;
+    const dPos = Math.hypot((before.x - b.x), (before.y - b.y));
+    const isSelf = p && p.id === mpPlayerId;
+    const reason = meta.reason || '';
+    if (!hard) {
+      if (moving && meta.applied === false) {
+        this.softIgnoredMoving++;
+      }
+      return;
+    }
+    this.hardSnaps++;
+    const ev = {
+      t: performance.now(),
+      tick: typeof mpSimTick === 'number' ? mpSimTick : null,
+      hard: true,
+      moving,
+      isSelf: !!isSelf,
+      dPos: Math.round(dPos * 10) / 10,
+      dVx: Math.round(((b.vx || 0) - (before.vx || 0)) * 10) / 10,
+      dVy: Math.round(((b.vy || 0) - (before.vy || 0)) * 10) / 10,
+      reason,
+      applied: meta.applied !== false,
+    };
+    if (moving && dPos >= 0.5 && meta.applied !== false) {
+      this.hardMoving++;
+      this._push(ev);
+      console.info('[RB] hard_snap_while_moving', ev);
+    } else if (dPos >= 2) {
+      this._push(ev);
+      console.info('[RB] hard_snap', ev);
+    }
+  },
+  notePuttResync(info) {
+    if (!this.enabled) return;
+    this.puttResyncs++;
+    const ev = { t: performance.now(), kind: 'putt_resync', ...info };
+    this._push(ev);
+    console.info('[RB] putt_resync (re-applied puttApplied pose)', ev);
+  },
+  summary() {
+    const out = {
+      hardSnaps: this.hardSnaps,
+      hardMoving: this.hardMoving,
+      softIgnoredMoving: this.softIgnoredMoving,
+      puttResyncs: this.puttResyncs,
+      recent: this.events.slice(-20),
+    };
+    console.info('[RB] summary', out);
+    return out;
+  },
+  reset() {
+    this.hardSnaps = 0;
+    this.hardMoving = 0;
+    this.softIgnoredMoving = 0;
+    this.puttResyncs = 0;
+    this.events = [];
+    console.info('[RB] counters reset');
+  },
+};
+RbDiag.init();
 
 function mpSetRelayStatus(text) {
   const el = document.getElementById('lobby-relay-status');
@@ -1499,6 +1613,7 @@ function mpConnect(opts = {}) {
       if (msg.state === 'WAITING_FOR_PLAYERS' && mpInRound) {
         mpInRound = false;
         mpPlaying = false;
+        mpStopKeepalives();
         mpFrozenTimerMs = 0;
         gameMenuEl.classList.add('hidden');
         hud.classList.add('hidden');
@@ -1508,6 +1623,8 @@ function mpConnect(opts = {}) {
       }
     } else if (msg.type === 'roundState') {
       mpBeginHole(msg);
+    } else if (msg.type === 'clockSync') {
+      mpOnClockSync(msg);
     } else if (msg.type === 'puttApplied') {
       if (!mpPlaying) return; // ignore late putts while on results/lobby
       mpOnPuttApplied(msg);
@@ -1518,10 +1635,12 @@ function mpConnect(opts = {}) {
       mpApplyCorrection(msg);
     } else if (msg.type === 'holeResults') {
       mpPlaying = false;
+      mpStopKeepalives();
       mpFrozenTimerMs = mpEstimatedElapsedMs();
       mpRenderHoleResults(msg);
     } else if (msg.type === 'finalResults') {
       mpPlaying = false;
+      mpStopKeepalives();
       mpFrozenTimerMs = mpEstimatedElapsedMs();
       mpRenderFinalResults(msg);
     }
@@ -1550,6 +1669,9 @@ function mpBeginHole(msg) {
   const startTick = typeof msg.tick === 'number' ? msg.tick : 0;
   mpSimTick = startTick;
   mpNoteHostTick(startTick);
+  mpLastHostTick = startTick;
+  if (typeof msg.holeEpochMs === 'number') mpHoleEpochMs = msg.holeEpochMs;
+  else if (typeof msg.hostTimeMs === 'number' && startTick === 0) mpHoleEpochMs = msg.hostTimeMs;
   setHoleObstaclesAtTick(hole, startTick);
   // Seed balls from reliable roundState so a dropped resync snapshot can't leave an
   // empty roster (ball "disappears" until the next idle correction).
@@ -1575,6 +1697,7 @@ function mpBeginHole(msg) {
   if (me) mpSyncSelfFromPlayer(me);
   mpCanPutt = false;
   mpPlaying = true;
+  mpStartKeepalives();
   mpFrozenTimerMs = 0;
   resetUnsettledTimer();
   resetAchvHoleCounters();
@@ -1592,12 +1715,54 @@ function mpBeginHole(msg) {
 }
 
 function mpNoteHostTick(tick) {
+  // Monotonic: puttApplied is stamped at putt tick (past), not host-now. Rewinding the
+  // free-run base freezes / forks local coast under lag.
+  if (typeof tick !== 'number') return;
+  if (tick < mpHostTick) return;
   mpHostTick = tick;
   mpHostTickAt = performance.now();
+  mpLastHostTick = tick;
 }
 
 function mpHostTargetTick() {
   return Math.floor(mpHostTick + ((performance.now() - mpHostTickAt) / 1000) * TICK_HZ);
+}
+
+function mpOnClockSync(msg) {
+  if (!msg) return;
+  const tick = typeof msg.tick === 'number' ? msg.tick : 0;
+  mpNoteHostTick(tick);
+  if (typeof msg.holeEpochMs === 'number') mpHoleEpochMs = msg.holeEpochMs;
+  else if (typeof msg.hostTimeMs === 'number' && tick === 0) mpHoleEpochMs = msg.hostTimeMs;
+  // Mid-hole join / resync: adopt host tick + obstacle clock when playing.
+  if (mpPlaying && typeof msg.tick === 'number') {
+    mpSimTick = msg.tick;
+    const hole = currentHoles()[Game.currentHoleIndex];
+    if (hole) setHoleObstaclesAtTick(hole, mpSimTick);
+  }
+}
+
+function mpStartKeepalives() {
+  mpStopKeepalives();
+  if (!MULTIPLAYER) return;
+  mpKeepaliveTimer = setInterval(() => {
+    if (!mpPlaying || !mpSocketOpen()) return;
+    mpSocket.send(
+      JSON.stringify({
+        type: 'clientClock',
+        tick: mpSimTick,
+        clientTimeMs: Date.now(),
+        lastHostTick: mpLastHostTick,
+      })
+    );
+  }, MP_KEEPALIVE_MS);
+}
+
+function mpStopKeepalives() {
+  if (mpKeepaliveTimer) {
+    clearInterval(mpKeepaliveTimer);
+    mpKeepaliveTimer = null;
+  }
 }
 
 function mpEstimatedElapsedMs() {
@@ -1649,12 +1814,15 @@ function mpSyncSelfFromPlayer(p) {
   setHudText(hudStrokes, `Strokes: ${p.strokes}`);
 }
 
-function mpApplyAuthorityPose(p, b, hard) {
+function mpApplyAuthorityPose(p, b, hard, applyOpts) {
+  applyOpts = applyOpts || {};
   const visX = p.rx, visY = p.ry;
+  const before = { x: p.x, y: p.y, vx: p.vx, vy: p.vy };
   const clientMoving = Math.hypot(p.vx, p.vy) >= STOP_THRESHOLD;
   const hostMoving = Math.hypot(b.vx || 0, b.vy || 0) >= STOP_THRESHOLD;
   const moving = clientMoving || hostMoving;
   const distBefore = Math.hypot((p.x - b.x), (p.y - b.y));
+  const reason = applyOpts.reason || '';
 
   // Soft + in-flight: never touch sim pose or velocity.
   // Instant Δv (or mid-coast x/y snap) rewrites the integration path under the ball —
@@ -1665,6 +1833,7 @@ function mpApplyAuthorityPose(p, b, hard) {
     p.id === mpPlayerId && performance.now() < respawnSoftGraceUntil;
   if (!hard && selfRespawnGrace) {
     if (typeof b.strokes === 'number' && b.strokes > p.strokes) p.strokes = b.strokes;
+    RbDiag.noteAuthority(p, b, false, before, { reason, applied: false });
     return;
   }
   if (!hard && moving && !b.holedOut) {
@@ -1672,8 +1841,11 @@ function mpApplyAuthorityPose(p, b, hard) {
     p.rx = p.x + p.errX;
     p.ry = p.y + p.errY;
     p.rz = p.z || 0;
+    RbDiag.noteAuthority(p, b, false, before, { reason, applied: false });
     return;
   }
+
+  RbDiag.noteAuthority(p, b, hard, before, { reason, applied: true });
 
   // Hard authority, settled soft, or hole-out: adopt host sim state.
   p.strokes = b.strokes;
@@ -1938,6 +2110,10 @@ function mpUpdateLocalSim(dt) {
     setHudText(hudTotal, `Time: ${(mpFrozenTimerMs / 1000).toFixed(1)}s`);
     return;
   }
+  // Advance toward estimated host clock (free-run from last host sample).
+  // Do NOT hard-cap at lastHostTick+N: coast netcode has no mid-flight snaps, so a
+  // putt can last hundreds of ticks — that cap freezes the ball mid-air. Trust window
+  // sizes putt acceptance on the host; clientTick future skew is clamped there.
   const targetTick = mpHostTargetTick();
   let steps = 0;
   while (mpSimTick < targetTick && steps < MP_MAX_CATCH_UP) {
@@ -1980,10 +2156,20 @@ function mpApplyCorrection(msg) {
   const hole = currentHoles()[msg.holeIndex];
   const tick = typeof msg.tick === 'number' ? msg.tick : elapsedMsToTick(msg.elapsedMs || 0);
   const reason = msg.reason || 'heartbeat';
-  // Trust host hard flag (idle keepalives / juice events are soft). Always hard on resync.
-  const hard = reason === 'resync' ? true : !!msg.hard;
+  // Trust host hard flag (idle keepalives / juice events are soft).
+  // Always hard on resync / post-rewind replay (full authority adopt, undoes bad optimistic putt).
+  const hard = reason === 'resync' || reason === 'replay' ? true : !!msg.hard;
   // Do NOT set mpPlaying here — only roundState / mpBeginHole starts a hole. Snapshots
   // during holeEnding celebration stay in the active hole; after holeResults we ignore them.
+
+  // Stale hard snap while already coasting past its tick — ignore (don't yank to putt pose).
+  if (hard && typeof tick === 'number' && tick < mpSimTick) {
+    const anyMoving = [...Game.players.values()].some(
+      (p) => !p.holedOut && Math.hypot(p.vx || 0, p.vy || 0) >= STOP_THRESHOLD
+    );
+    if (anyMoving) return;
+  }
+
   mpNoteHostTick(tick);
 
   if (msg.obstacles) {
@@ -1992,6 +2178,13 @@ function mpApplyCorrection(msg) {
     msg.obstacles.gatePhases.forEach((ph, i) => { if (hole.gates[i]) hole.gates[i].phase = ph; });
   } else {
     setHoleObstaclesAtTick(hole, tick);
+  }
+
+  // Hard snap ahead of local clock: catch up sim first so adopt is residual error, not
+  // trajectory distance between different ticks (lagged post-replay authority).
+  if (hard && typeof tick === 'number' && tick > mpSimTick) {
+    let guard = 0;
+    while (mpSimTick < tick && guard++ < 96) mpStepOneTick();
   }
 
   // Only rewind the local tick clock on hard authority or if we're badly ahead.
@@ -2007,7 +2200,7 @@ function mpApplyCorrection(msg) {
     const existed = Game.players.has(b.id);
     const p = mpUpsertPlayer(b);
     // First sighting is always hard seed (need a starting pose).
-    mpApplyAuthorityPose(p, b, hard || !existed);
+    mpApplyAuthorityPose(p, b, hard || !existed, { reason });
   }
   // Never evaporate balls from soft/partial snapshots. Soft event packets can race;
   // deleting missing ids made the local ball vanish mid-hole. Only prune on hard
@@ -2117,7 +2310,7 @@ function mpHandleEvent(ev, hole) {
           mpApplyAuthorityPose(p, {
             x: b.x, y: b.y, vx: b.vx, vy: b.vy,
             strokes: p.strokes, holedOut: p.holedOut,
-          }, true);
+          }, true, { reason: 'clash' });
         }
       }
       playSfx('bounce', 0.7);
