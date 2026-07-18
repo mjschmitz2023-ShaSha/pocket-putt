@@ -2003,8 +2003,11 @@ function mpOnPuttApplied(msg) {
   if (isSelf && p) {
     const alreadyLaunched =
       Math.hypot(p.vx, p.vy) >= STOP_THRESHOLD || p.strokes >= (msg.strokes || 0);
-    if (alreadyLaunched) {
-      // Confirm only. Optimistic coast is truth until a real hard correction.
+    // Late puttApplied while we already free-ran past putt tick: never re-impulse.
+    const lateWhileCoasting =
+      typeof msg.tick === 'number' && msg.tick < mpSimTick && alreadyLaunched;
+    if (alreadyLaunched || lateWhileCoasting) {
+      // Confirm only. Optimistic coast is truth until hard replay/resync snapshot.
       p.strokes = Math.max(p.strokes, msg.strokes || 0);
       if (typeof msg.stuckStickyIndex === 'number') p.stuckStickyIndex = msg.stuckStickyIndex;
       if (msg.wet !== undefined) p.wet = !!msg.wet;
@@ -2286,16 +2289,19 @@ function mpApplyCorrection(msg) {
   if (deferVisual) {
     const MATCH_PX = 0.75;
     const MATCH_V = 3;
+    const stepsGoal = clientTickBefore - mpSimTick;
     let guard = 0;
-    while (mpSimTick < clientTickBefore && guard++ < 96) {
+    while (mpSimTick < clientTickBefore && guard++ < 256) {
       mpStepOneTick();
     }
+    const stepsRun = guard;
+    const hitCap = mpSimTick < clientTickBefore;
     for (const [id, before] of presentById) {
       const p = Game.players.get(id);
       if (!p) continue;
       const dPos = Math.hypot(p.x - before.x, p.y - before.y);
       const dV = Math.hypot((p.vx || 0) - (before.vx || 0), (p.vy || 0) - (before.vy || 0));
-      const matched = dPos < MATCH_PX && dV < MATCH_V;
+      const matched = dPos < MATCH_PX && dV < MATCH_V && !hitCap;
       if (matched) {
         // Shared path — host sample confirms client; leave present untouched.
         p.x = before.x;
@@ -2332,6 +2338,20 @@ function mpApplyCorrection(msg) {
           residualAfterResim: dPos,
           rejectReason: msg.rejectReason,
         });
+        try {
+          console.info('[RB] path_mismatch_after_resim', {
+            reason,
+            sampleTick: tick,
+            clientTickBefore,
+            stepsGoal,
+            stepsRun,
+            hitCap,
+            dPos: Math.round(dPos * 10) / 10,
+            dV: Math.round(dV * 10) / 10,
+            beforeV: Math.round(Math.hypot(before.vx, before.vy) * 10) / 10,
+            afterV: Math.round(Math.hypot(p.vx || 0, p.vy || 0) * 10) / 10,
+          });
+        } catch (_) {}
       }
     }
   } else if (hard && (msg.rejectReason || reason === 'resync')) {

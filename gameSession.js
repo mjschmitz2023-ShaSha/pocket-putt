@@ -578,9 +578,12 @@ class GameSession {
     const applied = [];
     for (const rec of byPlayer.values()) {
       const player = this.players.get(rec.playerId);
-      if (!player || !player.connected || !player.ball || player.holedOut || player.floating) continue;
+      if (!player || !player.connected || !player.ball || player.holedOut) continue;
+      // Logged putts were already validated at commit time. Do NOT re-check mayPuttBall
+      // here: a stale speedTracker / residual crawl after restore can skip the impulse
+      // while the client already launched — guaranteed path fork + hard snap.
+      if (player.floating) continue;
       if (!player.speedTracker) player.speedTracker = Shared.createSpeedAvgTracker();
-      if (!Shared.mayPuttBall(player.ball, hole, player.speedTracker)) continue;
       const clamped = Shared.clampDragVector(rec.dragVector);
       if (!clamped) continue;
       const launch = Shared.computeLaunchVelocity(clamped);

@@ -386,20 +386,30 @@ class ClientModel {
       seen.add(b.id);
       const existed = this.players.has(b.id);
       const p = this.upsert(b);
-      // Seed sim at sample tick; visual fixed after optional resim.
-      this.applyAuthorityPose(p, b, hard || !existed);
+      // Seed sim at sample tick. When sampleInPast, skip rubber-band metrics here —
+      // measure residual AFTER resim to present (matches live game.js).
       if (sampleInPast) {
+        p.strokes = b.strokes;
+        p.holedOut = !!b.holedOut;
+        p.x = b.x;
+        p.y = b.y;
+        p.vx = b.vx || 0;
+        p.vy = b.vy || 0;
+        p.z = b.z || 0;
+        p.vz = b.vz || 0;
         const prev = presentById.get(b.id);
         if (prev) {
           p.rx = prev.rx;
           p.ry = prev.ry;
         }
+      } else {
+        this.applyAuthorityPose(p, b, hard || !existed);
       }
     }
 
     if (sampleInPast) {
       let guard = 0;
-      while (this.simTick < clientTickBefore && guard++ < 96) this.stepOneTick();
+      while (this.simTick < clientTickBefore && guard++ < 256) this.stepOneTick();
       const MATCH_PX = 0.75;
       const MATCH_V = 3;
       for (const [id, before] of presentById) {
@@ -407,6 +417,9 @@ class ClientModel {
         if (!p) continue;
         const dPos = Math.hypot(p.x - before.x, p.y - before.y);
         const dV = Math.hypot((p.vx || 0) - (before.vx || 0), (p.vy || 0) - (before.vy || 0));
+        const moving =
+          Math.hypot(before.vx || 0, before.vy || 0) >= STOP ||
+          Math.hypot(p.vx || 0, p.vy || 0) >= STOP;
         if (dPos < MATCH_PX && dV < MATCH_V) {
           p.x = before.x;
           p.y = before.y;
@@ -423,6 +436,17 @@ class ClientModel {
           p.errY = 0;
           p.rx = p.x;
           p.ry = p.y;
+          this.metrics.hardSnaps++;
+          if (moving && dPos >= SOFT_ERR_PX) {
+            this.metrics.hardSnapsWhileMoving++;
+            this.metrics.rubberBands.push({
+              tick: this.simTick,
+              kind: 'hard_snap',
+              dist: dPos,
+              moving: true,
+              reason: reason,
+            });
+          }
         }
       }
     }
