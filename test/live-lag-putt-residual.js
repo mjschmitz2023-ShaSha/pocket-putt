@@ -1,19 +1,12 @@
 #!/usr/bin/env node
 /**
- * Live-like regression: solo player + bidirectional lag + shared wall calendar.
+ * Solo + bidirectional lag: ClientModel hard-truth path; residual after seed@H→resim
+ * must not produce hardSnapsWhileMoving (same gate as honest browser dogfood).
  *
- * Asserts what the browser should see after tick-stamped putts:
- *   after host replay/resync hard snapshot is applied the way game.js does
- *   (seed @ sampleTick → resim to client present), residual must be ~0.
+ * Multi-trial random lag/jitter, FIFO (no reorder).
  *
- * Why older harness missed this:
- *   - solo_1p_bidirectional_lag gates hardSnapsWhileMoving from ClientModel's
- *     applyAuthorityPose, which measures dPos at seed time (client@C vs host@H)
- *     inconsistently and often while client is NOT ahead of host (same wallMs drive).
- *   - It never asserts residual AFTER sample→present resim (the live visual path).
- *   - maxSim peaks during free-run are allowed up to 500px.
- *
- * Usage: node test/live-lag-putt-residual.js
+ *   npm run test:live-lag
+ *   LIVE_LAG_TRIALS=5 LIVE_LAG_SEED=42 npm run test:live-lag
  */
 'use strict';
 
@@ -23,10 +16,18 @@ const { ClientModel } = require('./clientModel.js');
 
 const STOP = Shared.STOP_THRESHOLD;
 const FRAME_MS = 1000 / 60;
-const DELAY = 80;
-const JITTER = 40;
-const MATCH_PX = 0.75;
-const MATCH_V = 3;
+const TRIALS = Math.max(3, Number(process.env.LIVE_LAG_TRIALS) || 4);
+
+function makeRng(seed) {
+  let a = seed >>> 0;
+  return function rand() {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
 
 class FakeSocket {
   constructor() {
@@ -47,23 +48,21 @@ class FakeSocket {
   }
 }
 
-class NetPipe {
-  constructor(delayMs, jitterMs, seed) {
+/** FIFO delayed pipe (TCP-like). */
+class FifoNetPipe {
+  constructor(delayMs, jitterMs, rng) {
     this.delayMs = delayMs;
     this.jitterMs = jitterMs;
+    this.rng = rng;
     this.q = [];
-    let a = seed;
-    this.rng = () => {
-      a = (a + 0x6d2b79f5) | 0;
-      let t = Math.imul(a ^ (a >>> 15), 1 | a);
-      t ^= t + Math.imul(t ^ (t >>> 7), 61 | t);
-      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-    };
+    this.lastAt = 0;
   }
   push(msg, now) {
     const j = this.jitterMs ? (this.rng() * 2 - 1) * this.jitterMs : 0;
-    this.q.push({ at: now + this.delayMs + j, msg });
-    this.q.sort((a, b) => a.at - b.at);
+    const raw = now + this.delayMs + j;
+    const at = Math.max(raw, this.lastAt + 0.001);
+    this.lastAt = at;
+    this.q.push({ at, msg });
   }
   pop(now) {
     const out = [];
@@ -72,89 +71,19 @@ class NetPipe {
   }
 }
 
-/** Same residual metric as game.js after sample→present resim. */
-function residualAfterSampleResim(client, msg) {
-  const tick = msg.tick;
-  const reason = msg.reason || '';
-  const hard = reason === 'resync' || reason === 'replay' ? true : !!msg.hard;
-  if (!hard) return null;
-
-  const clientTickBefore = client.simTick;
-  const sampleInPast = typeof tick === 'number' && tick < clientTickBefore;
-  const p = client.players.get(client.playerId);
-  if (!p) return null;
-
-  const before = {
-    x: p.x,
-    y: p.y,
-    vx: p.vx,
-    vy: p.vy,
-    z: p.z || 0,
-    vz: p.vz || 0,
-    tick: client.simTick,
-  };
-
-  // Seed host@tick
-  client.simTick = tick;
-  Shared.setHoleObstaclesAtTick(client.hole(), tick);
-  for (const b of msg.balls || []) {
-    if (b.id !== client.playerId) continue;
-    p.x = b.x;
-    p.y = b.y;
-    p.vx = b.vx || 0;
-    p.vy = b.vy || 0;
-    p.z = b.z || 0;
-    p.vz = b.vz || 0;
-    if (typeof b.strokes === 'number') p.strokes = b.strokes;
-  }
-
-  if (sampleInPast) {
-    let g = 0;
-    while (client.simTick < clientTickBefore && g++ < 96) client.stepOneTick();
-  }
-
-  const dPos = Math.hypot(p.x - before.x, p.y - before.y);
-  const dV = Math.hypot(p.vx - before.vx, p.vy - before.vy);
-  const matched = dPos < MATCH_PX && dV < MATCH_V;
-  const moving =
-    Math.hypot(before.vx, before.vy) >= STOP || Math.hypot(p.vx, p.vy) >= STOP;
-
-  // Match game.js: restore present on match (no-op)
-  if (matched) {
-    p.x = before.x;
-    p.y = before.y;
-    p.vx = before.vx;
-    p.vy = before.vy;
-    p.z = before.z;
-    p.vz = before.vz;
-  }
-
-  return {
-    reason,
-    rejectReason: msg.rejectReason || null,
-    sampleTick: tick,
-    clientBefore: before.tick,
-    clientAfter: client.simTick,
-    sampleInPast,
-    dPos,
-    dV,
-    matched,
-    moving,
-  };
-}
-
-function run() {
+function runOnce(delayMs, jitterMs, seed) {
+  const rngDown = makeRng(seed);
+  const rngUp = makeRng(seed ^ 0x9e3779b9);
   const sock = new FakeSocket();
   const session = new GameSession({ code: 'LAG', joinUrl: 'LAG', joinUrlFallback: 'LAG' });
   const player = session.addPlayer(sock, { name: 'Solo', isLocal: true }).player;
   const client = new ClientModel({ playerId: player.id, courseIndex: 0 });
-  const down = new NetPipe(DELAY, JITTER, 21);
-  const up = new NetPipe(DELAY, JITTER, 22);
+  const down = new FifoNetPipe(delayMs, jitterMs, rngDown);
+  const up = new FifoNetPipe(delayMs, jitterMs, rngUp);
 
   session.handleMessage(player, { type: 'startRound', courseIndex: 0 });
   if (session.state !== 'PLAYING') session.startNewRound();
 
-  // Synthetic shared wall calendar (both sides step toward floor(wallMs/TICK_MS)).
   let wallMs = 0;
   for (const m of sock.drain()) {
     if (m.type === 'roundState') client.onRoundState(m);
@@ -162,17 +91,21 @@ function run() {
     else if (m.type === 'snapshot') client.onSnapshot(m, 0);
   }
 
-  const failures = [];
-  const puttFrames = [40, 200, 360];
+  // Shared synthetic wall — both sides step toward floor(wallMs / TICK_MS).
+  const puttFrames = [40, 200, 360].map((f, i) => f + Math.floor(rngDown() * 12) + i);
+  const puttSet = new Set(puttFrames);
 
-  for (let frame = 0; frame < 450; frame++) {
+  for (let frame = 0; frame < 480; frame++) {
     wallMs = frame * FRAME_MS;
     const target = Math.floor(wallMs / TICK_MS);
 
-    if (puttFrames.includes(frame)) {
+    if (puttSet.has(frame)) {
       const cp = client.players.get(player.id);
       if (cp && Math.hypot(cp.vx, cp.vy) < STOP) {
-        const drag = { x: 100, y: 8 };
+        const drag = {
+          x: 90 + Math.floor(rngUp() * 30),
+          y: -20 + Math.floor(rngUp() * 40),
+        };
         const ct = client.simTick;
         client.applyPuttLocal(player.id, drag, null);
         up.push({ type: 'putt', dragVector: drag, clientTick: ct }, wallMs);
@@ -183,7 +116,7 @@ function run() {
         {
           type: 'clientClock',
           tick: client.simTick,
-          clientTimeMs: Date.now(),
+          clientTimeMs: wallMs,
           lastHostTick: client.simTick,
         },
         wallMs
@@ -205,43 +138,67 @@ function run() {
       if (m.type === 'roundState') client.onRoundState(m);
       else if (m.type === 'clockSync') client.onClockSync(m);
       else if (m.type === 'puttApplied') client.onPuttApplied(m);
-      else if (m.type === 'snapshot') {
-        const r = residualAfterSampleResim(client, m);
-        if (
-          r &&
-          r.moving &&
-          (r.reason === 'replay' || r.reason === 'resync') &&
-          !r.matched
-        ) {
-          failures.push(r);
-        }
-      }
+      else if (m.type === 'snapshot') client.onSnapshot(m, wallMs);
     }
 
     let c = 0;
     while (client.simTick < target && c++ < 8) client.stepOneTick();
   }
 
-  if (failures.length) {
-    console.error('live-lag-putt-residual: FAILED %d correction residual(s)', failures.length);
-    for (const f of failures.slice(0, 8)) {
+  const m = client.metrics;
+  return {
+    delayMs,
+    jitterMs,
+    seed,
+    hardMoving: m.hardSnapsWhileMoving,
+    hardSnaps: m.hardSnaps,
+    rubberBands: (m.rubberBands || []).slice(-5),
+  };
+}
+
+function run() {
+  const baseSeed =
+    (Number(process.env.LIVE_LAG_SEED) || (Date.now() ^ (process.pid * 2654435761))) >>> 0;
+  console.log('live-lag-putt-residual: seed', baseSeed, 'trials', TRIALS);
+
+  let anyFail = false;
+  for (let i = 0; i < TRIALS; i++) {
+    const rng = makeRng((baseSeed + i * 9973) >>> 0);
+    const delayMs = 20 + Math.floor(rng() * 140);
+    const jitterMs = Math.floor(rng() * 80);
+    const seed = (baseSeed + i * 7919) >>> 0;
+    const r = runOnce(delayMs, jitterMs, seed);
+    if (r.hardMoving > 0) {
+      anyFail = true;
       console.error(
-        '  reason=%s reject=%s sampleTick=%s clientBefore=%s dPos=%.1f dV=%.1f',
-        f.reason,
-        f.rejectReason,
-        f.sampleTick,
-        f.clientBefore,
-        f.dPos,
-        f.dV
+        '  FAIL trial',
+        i,
+        'lag',
+        delayMs + '±' + jitterMs,
+        'hardMoving=' + r.hardMoving,
+        'hardSnaps=' + r.hardSnaps
+      );
+      for (const e of r.rubberBands) console.error('   ', e);
+    } else {
+      console.log(
+        '  PASS trial',
+        i,
+        'lag',
+        delayMs + '±' + jitterMs,
+        'hardSnaps=' + r.hardSnaps,
+        'hardMoving=0'
       );
     }
+  }
+
+  if (anyFail) {
+    console.error('live-lag-putt-residual: FAILED under random lag trials');
     process.exitCode = 1;
     return;
   }
   console.log(
-    'live-lag-putt-residual: ok (bidirectional %dms±%dms, post-resim residual ~0 on replay)',
-    DELAY,
-    JITTER
+    'live-lag-putt-residual: ok (%d trials, random bi-lag, hardMoving=0 / residual match)',
+    TRIALS
   );
 }
 

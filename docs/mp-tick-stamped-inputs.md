@@ -136,10 +136,13 @@ Host tracks per player:
 
 ### 5.3 Monotonic floor
 
-Reject any client gameplay message whose `tick < lastKeepaliveTick` for that player  
-(client already advertised “I’m at least at K”).
+**Do not** reject putts solely because `tick < lastKeepaliveTick`.
 
-**Note:** packet reorder under jitter may false-reject; if seen in dogfood, add small grace or sequence numbers. Default rule stands.
+Under bidirectional lag a putt stamped at `T` routinely arrives **after** a keepalive
+stamped at `K > T` (client free-ran and sent `clientClock` while the putt was still in
+flight). Treating that as `before_keepalive` force-syncs host rest over an optimistic
+coast — a hard rubber band. The history ring (`too_old`) already bounds how far back a
+putt may claim. Keepalive still gates **trust** (missed keepalives → untrusted → force-sync).
 
 ### 5.4 Putt acceptance
 

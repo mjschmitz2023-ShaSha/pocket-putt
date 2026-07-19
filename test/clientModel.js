@@ -33,6 +33,8 @@ class ClientModel {
     this.hostTickAtMs = 0; // harness wall clock when hostTick was observed
     this.lastHostTick = 0;
     this.holeEpochMs = 0;
+    /** @type {number|null} sim tick stamped on latest optimistic self putt */
+    this.lastPuttClientTick = null;
     this.players = new Map();
     this.metrics = this._emptyMetrics();
   }
@@ -75,6 +77,13 @@ class ClientModel {
   }
 
   hostTargetTick(wallMs) {
+    // Shared hole epoch (game.js / host tickDriver). holeEpochMs === 0 is valid
+    // synthetic origin used by the rubberband harness.
+    if (typeof this.holeEpochMs === 'number' && Number.isFinite(this.holeEpochMs)) {
+      if (this.holeEpochMs === 0 || wallMs >= this.holeEpochMs - 5000) {
+        return Math.max(0, Math.floor((wallMs - this.holeEpochMs) / (1000 / TICK_HZ)));
+      }
+    }
     return Math.floor(this.hostTick + ((wallMs - this.hostTickAtMs) / 1000) * TICK_HZ);
   }
 
@@ -239,6 +248,10 @@ class ClientModel {
     const hole = this.hole();
     const clamped = Shared.clampDragVector(dragVector);
     if (!clamped && !fromServer) return;
+    // Optimistic self putt: stamp tick for stale-hard ignore (matches game.js).
+    if (!fromServer && playerId === this.playerId) {
+      this.lastPuttClientTick = this.simTick;
+    }
     p.firedBoosts = new Set();
     p.errX = 0;
     p.errY = 0;
@@ -274,13 +287,6 @@ class ClientModel {
 
   onPuttApplied(msg) {
     if (!this.playing) return;
-    if (typeof msg.tick === 'number') {
-      this.noteHostTick(msg.tick, this.hostTickAtMs); // wall updated by harness
-      if (msg.tick >= this.simTick) {
-        this.simTick = msg.tick;
-        Shared.setHoleObstaclesAtTick(this.hole(), this.simTick);
-      }
-    }
     if (!this.players.has(msg.playerId)) {
       this.upsert({
         id: msg.playerId,
@@ -307,7 +313,9 @@ class ClientModel {
       z: msg.z,
       vz: msg.vz,
     };
+    const puttTick = typeof msg.tick === 'number' ? msg.tick : null;
     // puttApplied is an impulse at putt-tick, not a live pose. Never re-fire Δv after coast.
+    // No single-ball aging — free-run only via update()/stepOneTick for the whole world.
     if (isSelf && p) {
       const alreadyLaunched =
         Math.hypot(p.vx, p.vy) >= STOP || p.strokes >= (msg.strokes || 0);
@@ -319,8 +327,12 @@ class ClientModel {
       } else {
         this.applyPuttLocal(msg.playerId, msg.dragVector, hostPose);
       }
-    } else {
-      this.applyPuttLocal(msg.playerId, msg.dragVector, hostPose);
+      return;
+    }
+    this.applyPuttLocal(msg.playerId, msg.dragVector, hostPose);
+    if (puttTick != null && puttTick > this.simTick) {
+      this.simTick = puttTick;
+      Shared.setHoleObstaclesAtTick(this.hole(), this.simTick);
     }
   }
 
@@ -336,13 +348,33 @@ class ClientModel {
     const forceAuthority = reason === 'resync' || reason === 'replay';
     const clientTickBefore = this.simTick;
     const sampleInPast = hard && typeof tick === 'number' && tick < clientTickBefore;
-    if (hard && !forceAuthority && sampleInPast) {
-      const anyMoving = [...this.players.values()].some(
-        (p) => !p.holedOut && Math.hypot(p.vx, p.vy) >= STOP
-      );
-      if (anyMoving) {
-        return;
-      }
+    const me = this.playerId ? this.players.get(this.playerId) : null;
+    const selfMoving =
+      me && !me.holedOut && Math.hypot(me.vx || 0, me.vy || 0) >= STOP;
+    // Soft = juice only (docs/mp-hard-truth-sync.md).
+    if (!hard) return;
+    // Causality (mirror game.js): hard that cannot include our unconfirmed putt.
+    const hostMe = (msg.balls || []).find((b) => b.id === this.playerId);
+    const idleHostBehindPutt =
+      reason === 'idle' &&
+      me &&
+      hostMe &&
+      typeof hostMe.strokes === 'number' &&
+      me.strokes > hostMe.strokes;
+    const idleAtOrBeforePutt =
+      reason === 'idle' &&
+      this.lastPuttClientTick != null &&
+      typeof tick === 'number' &&
+      tick <= this.lastPuttClientTick;
+    const hardBeforePutt =
+      typeof tick === 'number' &&
+      this.lastPuttClientTick != null &&
+      tick < this.lastPuttClientTick;
+    if (
+      !msg.rejectReason &&
+      (hardBeforePutt || idleAtOrBeforePutt || idleHostBehindPutt)
+    ) {
+      return;
     }
 
     const presentById = new Map();
@@ -355,7 +387,7 @@ class ClientModel {
       }
     }
 
-    this.noteHostTick(tick, wallMs);
+    if (hard) this.noteHostTick(tick, wallMs);
 
     if (msg.obstacles) {
       msg.obstacles.windmillAngles.forEach((a, i) => {
@@ -367,16 +399,12 @@ class ClientModel {
       msg.obstacles.gatePhases.forEach((ph, i) => {
         if (hole.gates[i]) hole.gates[i].phase = ph;
       });
-    } else {
+    } else if (hard) {
       Shared.setHoleObstaclesAtTick(hole, tick);
     }
 
-    if (hard && typeof tick === 'number' && tick > this.simTick && !forceAuthority) {
-      let guard = 0;
-      while (this.simTick < tick && guard++ < 96) this.stepOneTick();
-    }
-
-    if (hard || this.simTick > tick + 2) {
+    // Law: seed sim at H immediately — never free-run catch-up without host path.
+    if (hard && typeof tick === 'number') {
       this.simTick = tick;
       if (!msg.obstacles) Shared.setHoleObstaclesAtTick(hole, tick);
     }
@@ -410,8 +438,9 @@ class ClientModel {
     if (sampleInPast) {
       let guard = 0;
       while (this.simTick < clientTickBefore && guard++ < 256) this.stepOneTick();
-      const MATCH_PX = 0.75;
-      const MATCH_V = 3;
+      // Match game.js residual no-op band.
+      const MATCH_PX = 3;
+      const MATCH_V = 12;
       for (const [id, before] of presentById) {
         const p = this.players.get(id);
         if (!p) continue;
@@ -507,12 +536,16 @@ class ClientModel {
       p.rx = p.x;
       p.ry = p.y;
       if (p.floatTicks <= 0) {
-        const slot = Math.max(0, [...this.players.keys()].indexOf(p.id));
+        const roster = [...this.players.keys()].sort();
+        const slot = Math.max(0, roster.indexOf(p.id));
         const drop = Shared.waterDropPointFor(p.floatZone, Shared.waterDropIndexFor(slot, p.dunks || 1), hole);
         p.x = drop.x;
         p.y = drop.y;
         p.vx = 0;
         p.vy = 0;
+        p.floatTicks = 0;
+        p.floatZone = null;
+        p.floatCarry = null;
         Shared.markWetFromWater(p);
         p.errX = 0;
         p.errY = 0;
@@ -550,6 +583,16 @@ class ClientModel {
           p.errY = 0;
           p.rx = p.x;
           p.ry = p.y;
+        }
+      }
+
+      // Match host + game.js: ball–ball after each subtick.
+      const activeNow = active
+        .filter((p) => !p.holedOut && !(p.floatTicks && p.floatTicks > 0))
+        .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+      for (let i = 0; i < activeNow.length; i++) {
+        for (let j = i + 1; j < activeNow.length; j++) {
+          Shared.resolveBallBallCollision(activeNow[i], activeNow[j]);
         }
       }
     }

@@ -13,7 +13,7 @@ const {
   markWetFromWater, noteWetPutt, ballMayRestForAim, zoneBounds, waterDropPointFor,
   waterDropIndexFor, waterWaveFrontAt, stepWaterFloat, WATER_FLOAT_TICKS, WATER_FLOAT_CARRY,
   createSpeedAvgTracker, resetSpeedAvgTracker, noteSpeedSample, isQuasiRest, mayPuttBall,
-  teePositionFor,
+  teePositionFor, resolveBallBallCollision,
   decodeHole, encodeHole, normalizeHole, blankHole,
 } = window.Shared;
 // Must match gameSession PHYSICS_SUBTICKS — same dt schedule keeps sticky latch deterministic.
@@ -978,6 +978,7 @@ function handlePointerUp(x, y) {
     // Stamp clientTick at release (mpSimTick before optimistic apply) so host can
     // rewind/replay to the same absolute tick the client launched on.
     const clientTick = mpSimTick;
+    mpLastPuttClientTick = clientTick;
     // Optimistic local putt; host validates and broadcasts puttApplied / hard replay snap.
     mpApplyPuttLocal(mpPlayerId, v, null, true);
     mpSocket.send(JSON.stringify({ type: 'putt', dragVector: v, clientTick }));
@@ -1276,6 +1277,8 @@ let mpHostTickAt = 0;
 let mpHoleEpochMs = 0;
 /** lastHostTick reported on keepalives (last adopted host tick). */
 let mpLastHostTick = 0;
+/** Client tick of the latest optimistic putt (ignore older hard snaps for self). */
+let mpLastPuttClientTick = null;
 let mpKeepaliveTimer = null;
 const MP_MAX_CATCH_UP = 8;
 /** Predict cap: do not free-run more than lastHostTick + N (matches host HISTORY_TICKS). */
@@ -1676,13 +1679,18 @@ function mpBeginHole(msg) {
   resetHoleObstacles(hole);
   const startTick = typeof msg.tick === 'number' ? msg.tick : 0;
   mpSimTick = startTick;
+  // New hole: never carry putt-stamp / host-tick floors from the previous hole.
+  // Dogfood (rarer/other_extra): lastPutt=4986 made sampleTick 0/1 look "stale" and
+  // ignore legitimate resync/idle for the entire next hole → free-run desync + water snaps.
+  mpLastPuttClientTick = null;
+  mpHostTick = startTick;
+  mpHostTickAt = performance.now();
+  mpLastHostTick = startTick;
   if (typeof msg.holeEpochMs === 'number' && Number.isFinite(msg.holeEpochMs)) {
     mpHoleEpochMs = msg.holeEpochMs;
   } else if (typeof msg.hostTimeMs === 'number' && Number.isFinite(msg.hostTimeMs)) {
     mpHoleEpochMs = msg.hostTimeMs - startTick * TICK_MS;
   }
-  mpNoteHostTick(startTick, msg.hostTimeMs);
-  mpLastHostTick = startTick;
   setHoleObstaclesAtTick(hole, startTick);
   // Seed balls from reliable roundState so a dropped resync snapshot can't leave an
   // empty roster (ball "disappears" until the next idle correction).
@@ -1696,6 +1704,10 @@ function mpBeginHole(msg) {
     p.vz = b.vz || 0;
     p.strokes = b.strokes || 0;
     p.holedOut = !!b.holedOut;
+    p.dunks = typeof b.dunks === 'number' ? b.dunks : 0;
+    p.floatTicks = 0;
+    p.floatZone = null;
+    p.floatCarry = null;
     p.errX = 0;
     p.errY = 0;
     p.rx = p.x;
@@ -1725,21 +1737,22 @@ function mpBeginHole(msg) {
   updateShareLevelButton();
 }
 
-function mpNoteHostTick(tick, hostTimeMs) {
-  // Monotonic host sample (puttApplied may be stamped at putt tick in the past).
+function mpNoteHostTick(tick, hostTimeMs, opts) {
+  // Monotonic host sample. puttApplied is stamped at putt tick (past) — callers must
+  // not pass that as a live sample or we re-anchor W0 as if the putt were "now".
   if (typeof tick !== 'number') return;
   if (tick < mpHostTick) return;
   mpHostTick = tick;
   mpHostTickAt = performance.now();
   mpLastHostTick = tick;
-  // Re-anchor shared epoch so ideal tick matches host's sample at receipt.
-  // Host is authority for "what tick the world is on"; W0 maps wall→tick.
-  // At receive time we treat sample tick as "about now" (one-way lag makes us
-  // slightly behind real host — correct for putts landing as past ticks).
-  if (typeof hostTimeMs === 'number' && Number.isFinite(hostTimeMs)) {
+  // Prefer fixed hole epoch from the wire (same W0 host used in tickDriver).
+  // Never invent W0 from (hostTimeMs - puttTick): puttApplied/juice use present wall
+  // with a past tick and would race the client ahead of the host.
+  if (opts && typeof opts.holeEpochMs === 'number' && Number.isFinite(opts.holeEpochMs)) {
+    mpHoleEpochMs = opts.holeEpochMs;
+  } else if (typeof hostTimeMs === 'number' && Number.isFinite(hostTimeMs) && !(opts && opts.skipEpoch)) {
     mpHoleEpochMs = hostTimeMs - tick * TICK_MS;
   } else if (mpHoleEpochMs > 0) {
-    // No host wall stamp: gently re-anchor using local wall so we don't race ahead.
     const ideal = Math.floor((Date.now() - mpHoleEpochMs) / TICK_MS);
     if (ideal > tick + 2) {
       mpHoleEpochMs = Date.now() - tick * TICK_MS;
@@ -1898,6 +1911,26 @@ function mpApplyAuthorityPose(p, b, hard, applyOpts) {
   // Absent wet on wire means dry (ballWire only sets the flag when true).
   p.wet = !!b.wet;
   p.wetStroke = !!b.wetStroke;
+  // Water float / dunk count — must match host for deterministic drop slots.
+  if (typeof b.dunks === 'number') p.dunks = b.dunks;
+  if (b.floating && typeof b.floating.ticks === 'number' && b.floating.ticks > 0) {
+    p.floatTicks = b.floating.ticks;
+    p.floatZone = b.floating.zone || p.floatZone;
+    p.floatCarry = {
+      vx: b.floating.vx || 0,
+      vy: b.floating.vy || 0,
+    };
+  } else if (hard && b.floating === null) {
+    // Explicit clear from host (landed / not floating).
+    p.floatTicks = 0;
+    p.floatZone = null;
+    p.floatCarry = null;
+  } else if (hard && b.floating === undefined && Math.hypot(p.vx || 0, p.vy || 0) < STOP_THRESHOLD) {
+    // Hard rest snap without float payload: not floating.
+    p.floatTicks = 0;
+    p.floatZone = null;
+    p.floatCarry = null;
+  }
   // Boost latch is leave-to-rearm (cleared when ball exits pad). Wire must preserve
   // firedBoosts while still on a pad — clearing on rest snaps re-fires and can loop.
   if (Array.isArray(b.firedBoosts)) {
@@ -1981,14 +2014,13 @@ function mpApplyPuttLocal(playerId, dragVector, fromServer, playSound) {
 
 function mpOnPuttApplied(msg) {
   if (!mpPlaying) return;
-  if (typeof msg.tick === 'number') {
-    mpNoteHostTick(msg.tick, msg.hostTimeMs);
-    // Never rewind simTick for a late puttApplied — that yanks a coasting ball backward.
-    if (msg.tick >= mpSimTick) {
-      mpSimTick = msg.tick;
-      setHoleObstaclesAtTick(currentHoles()[Game.currentHoleIndex], mpSimTick);
-    }
+  // puttApplied = confirmed input juice (+ optional remote launch for prediction).
+  // State truth remains hard replay (seed@H → resim). No single-ball "aging" hacks —
+  // free-run is only the shared mpUpdateLocalSim path for the whole world.
+  if (typeof msg.holeEpochMs === 'number' && Number.isFinite(msg.holeEpochMs)) {
+    mpHoleEpochMs = msg.holeEpochMs;
   }
+  const puttTick = typeof msg.tick === 'number' ? msg.tick : null;
   const isSelf = msg.playerId === mpPlayerId;
   let p = Game.players.get(msg.playerId);
   const hostPose = {
@@ -1997,38 +2029,36 @@ function mpOnPuttApplied(msg) {
     wet: msg.wet, wetStroke: msg.wetStroke,
   };
 
-  // puttApplied carries pose *at the putt tick* (rest x/y + full launch v). That is an
-  // impulse sample, not a live pose. Re-applying it after any coast re-fires Δv and
-  // teleports back to the tee — the classic launch rubber band.
+  // puttApplied carries pose *at the putt tick* (rest x/y + full launch v) — not live pose.
   if (isSelf && p) {
     const alreadyLaunched =
       Math.hypot(p.vx, p.vy) >= STOP_THRESHOLD || p.strokes >= (msg.strokes || 0);
-    // Late puttApplied while we already free-ran past putt tick: never re-impulse.
     const lateWhileCoasting =
-      typeof msg.tick === 'number' && msg.tick < mpSimTick && alreadyLaunched;
+      puttTick != null && puttTick < mpSimTick && alreadyLaunched;
     if (alreadyLaunched || lateWhileCoasting) {
-      // Confirm only. Optimistic coast is truth until hard replay/resync snapshot.
+      // Confirm only. Optimistic coast until hard replay.
       p.strokes = Math.max(p.strokes, msg.strokes || 0);
       if (typeof msg.stuckStickyIndex === 'number') p.stuckStickyIndex = msg.stuckStickyIndex;
       if (msg.wet !== undefined) p.wet = !!msg.wet;
       if (msg.wetStroke !== undefined) p.wetStroke = !!msg.wetStroke;
       mpSyncSelfFromPlayer(p);
     } else {
-      // Missed optimistic launch (or input arrived before local apply) — take impulse once.
       mpApplyPuttLocal(msg.playerId, msg.dragVector, hostPose, false);
     }
-  } else {
-    // Remote (or self with no local player yet): apply the launch impulse once.
-    if (!p) {
-      p = mpUpsertPlayer({
-        id: msg.playerId, name: '?', hue: 0,
-        x: msg.x, y: msg.y, vx: msg.vx, vy: msg.vy,
-        strokes: msg.strokes || 0, holedOut: false,
-        stuckStickyIndex: msg.stuckStickyIndex,
-      });
-    }
-    mpApplyPuttLocal(msg.playerId, msg.dragVector, hostPose, !isSelf);
+    return;
   }
+
+  // Remote: launch impulse for prediction; world free-runs only via mpUpdateLocalSim.
+  // Late puttApplied still places them at putt pose (host truth at T); hard corrects path.
+  if (!p) {
+    p = mpUpsertPlayer({
+      id: msg.playerId, name: '?', hue: 0,
+      x: msg.x, y: msg.y, vx: msg.vx, vy: msg.vy,
+      strokes: msg.strokes || 0, holedOut: false,
+      stuckStickyIndex: msg.stuckStickyIndex,
+    });
+  }
+  mpApplyPuttLocal(msg.playerId, msg.dragVector, hostPose, true);
 }
 
 function mpStepOneTick() {
@@ -2047,12 +2077,17 @@ function mpStepOneTick() {
     p.rx = p.x;
     p.ry = p.y;
     if (p.floatTicks <= 0) {
-      const slot = Math.max(0, [...Game.players.keys()].indexOf(p.id));
+      // Stable slot: sorted id order (must match host waterDropSlot).
+      const roster = [...Game.players.keys()].sort();
+      const slot = Math.max(0, roster.indexOf(p.id));
       const drop = waterDropPointFor(p.floatZone, waterDropIndexFor(slot, p.dunks || 1), hole);
       p.x = drop.x;
       p.y = drop.y;
       p.vx = 0;
       p.vy = 0;
+      p.floatTicks = 0;
+      p.floatZone = null;
+      p.floatCarry = null;
       markWetFromWater(p);
       p.errX = 0;
       p.errY = 0;
@@ -2144,6 +2179,32 @@ function mpStepOneTick() {
         }
       }
     }
+
+    // Ball–ball clashes (same order as host): predict collisions locally so host→guest
+    // does not phase through until a late hard clash snap. Host remains authority.
+    const activeNow = active
+      .filter((p) => !p.holedOut && !(p.floatTicks && p.floatTicks > 0))
+      .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    for (let i = 0; i < activeNow.length; i++) {
+      for (let j = i + 1; j < activeNow.length; j++) {
+        const pa = activeNow[i];
+        const pb = activeNow[j];
+        if (resolveBallBallCollision(pa, pb)) {
+          pa.errX = 0;
+          pa.errY = 0;
+          pb.errX = 0;
+          pb.errY = 0;
+          pa.rx = pa.x;
+          pa.ry = pa.y;
+          pb.rx = pb.x;
+          pb.ry = pb.y;
+          // Predictive clack only — achievements count from host clash events.
+          if (pa.id === mpPlayerId || pb.id === mpPlayerId) {
+            playSfx('bounce', 0.55);
+          }
+        }
+      }
+    }
   }
   // Quasi-rest window for local player (host validates with its own tracker).
   const me = Game.players.get(mpPlayerId);
@@ -2199,32 +2260,72 @@ function mpUpdateLocalSim(dt) {
 }
 
 function mpApplyCorrection(msg) {
+  // Law: docs/mp-hard-truth-sync.md
+  //   Hard @ H → seed host@H → resim H→present = sim truth.
+  //   Residual match = visual no-op only when prediction already agreed.
+  //   Soft = juice only (never sim).
   const hole = currentHoles()[msg.holeIndex];
   const tick = typeof msg.tick === 'number' ? msg.tick : elapsedMsToTick(msg.elapsedMs || 0);
   const reason = msg.reason || 'heartbeat';
-  // Trust host hard flag (idle keepalives / juice events are soft).
-  // Always hard on resync / post-rewind replay (full authority adopt, undoes bad optimistic putt).
   const hard = reason === 'resync' || reason === 'replay' ? true : !!msg.hard;
-  // Do NOT set mpPlaying here — only roundState / mpBeginHole starts a hole. Snapshots
-  // during holeEnding celebration stay in the active hole; after holeResults we ignore them.
-
-  // Host wire state is as-of `tick` (sample time), NOT "now". Under lag the client is often
-  // already at clientTick > tick. Applying sample pose as present yanks the ball backward
-  // along the path even when prediction matches. Correct path:
-  //   seed host@tick → resim to clientTick → if matches prior present, true no-op.
-  const forceAuthority = reason === 'resync' || reason === 'replay';
   const clientTickBefore = mpSimTick;
   const sampleInPast = hard && typeof tick === 'number' && tick < clientTickBefore;
 
-  // Non-authority hard snaps that are older than local coast: ignore mid-flight.
-  if (hard && !forceAuthority && sampleInPast) {
-    const anyMoving = [...Game.players.values()].some(
-      (p) => !p.holedOut && Math.hypot(p.vx || 0, p.vy || 0) >= STOP_THRESHOLD
-    );
-    if (anyMoving) return;
+  // Soft: juice only — never clock, epoch, or pose.
+  if (!hard) {
+    for (const ev of msg.events || []) mpHandleEvent(ev, hole, { juiceOnly: true });
+    return;
   }
 
-  // Snapshot present for same-tick residual after resim (path match ⇒ no visual change).
+  // Pure causality: hard that cannot include our unconfirmed putt must not wipe it.
+  // Remotes still update. Reject/resync always apply (rejectReason set).
+  //
+  // 1) sampleTick < lastOptimisticPutt — packet is strictly pre-shot.
+  // 2) hard idle at sampleTick <= putt tick — host end-of-tick snapshot is pre-putt
+  //    (putt applies on restore(T)); same-tick idle is the classic first-tee race.
+  // 3) hard idle while host self.strokes < local strokes — host has not counted our
+  //    shot yet (putt still in flight / lag). Idle hard is always rest on host.
+  const meForCausal = Game.players.get(mpPlayerId);
+  const hostMeForCausal = (msg.balls || []).find((b) => b.id === mpPlayerId);
+  const idleHostBehindPutt =
+    reason === 'idle' &&
+    meForCausal &&
+    hostMeForCausal &&
+    typeof hostMeForCausal.strokes === 'number' &&
+    meForCausal.strokes > hostMeForCausal.strokes;
+  const idleAtOrBeforePutt =
+    reason === 'idle' &&
+    mpLastPuttClientTick != null &&
+    typeof tick === 'number' &&
+    tick <= mpLastPuttClientTick;
+  const hardBeforePutt =
+    typeof tick === 'number' &&
+    mpLastPuttClientTick != null &&
+    tick < mpLastPuttClientTick;
+  if (
+    !msg.rejectReason &&
+    (hardBeforePutt || idleAtOrBeforePutt || idleHostBehindPutt)
+  ) {
+    mpNoteHostTick(tick, msg.hostTimeMs, { holeEpochMs: msg.holeEpochMs });
+    try {
+      console.info('[RB] ignore_stale_hard_before_putt', {
+        sampleTick: tick,
+        lastPuttClientTick: mpLastPuttClientTick,
+        reason,
+        clientTick: clientTickBefore,
+        idleHostBehindPutt: !!idleHostBehindPutt,
+        idleAtOrBeforePutt: !!idleAtOrBeforePutt,
+      });
+    } catch (_) {}
+    for (const b of msg.balls || []) {
+      if (b.id === mpPlayerId) continue;
+      const p = mpUpsertPlayer(b);
+      mpApplyAuthorityPose(p, b, true, { reason });
+    }
+    return;
+  }
+
+  // Snapshot present for residual visual no-op after resim.
   const presentById = new Map();
   if (sampleInPast) {
     for (const p of Game.players.values()) {
@@ -2236,7 +2337,7 @@ function mpApplyCorrection(msg) {
     }
   }
 
-  mpNoteHostTick(tick, msg.hostTimeMs);
+  mpNoteHostTick(tick, msg.hostTimeMs, { holeEpochMs: msg.holeEpochMs });
 
   if (msg.obstacles) {
     msg.obstacles.windmillAngles.forEach((a, i) => { if (hole.windmills[i]) hole.windmills[i].angle = a; });
@@ -2246,36 +2347,25 @@ function mpApplyCorrection(msg) {
     setHoleObstaclesAtTick(hole, tick);
   }
 
-  // Hard authority from the future (sample ahead of us): jump clock — do NOT free-run
-  // catch-up without host path (forceAuthority). Other hard: catch up first.
-  if (hard && typeof tick === 'number' && tick > mpSimTick && !forceAuthority) {
-    let guard = 0;
-    while (mpSimTick < tick && guard++ < 96) mpStepOneTick();
-  }
-
-  // Seed sim clock at sample tick for pose write + optional resim.
-  if (hard || mpSimTick > tick + 2) {
+  // Seed sim at host sample tick H (law step 1–2). No free-run catch-up past H without host path.
+  if (typeof tick === 'number') {
     mpSimTick = tick;
     if (!msg.obstacles) setHoleObstaclesAtTick(hole, tick);
   }
 
-  const deferVisual = sampleInPast; // resim then decide visual / no-op
+  const deferVisual = sampleInPast; // resim then residual visual check
   const seen = new Set();
   for (const b of msg.balls || []) {
     seen.add(b.id);
     const existed = Game.players.has(b.id);
     const p = mpUpsertPlayer(b);
-    // First sighting is always hard seed (need a starting pose).
-    mpApplyAuthorityPose(p, b, hard || !existed, {
+    mpApplyAuthorityPose(p, b, true, {
       reason,
       skipDiag: deferVisual,
       deferVisual,
     });
   }
-  // Never evaporate balls from soft/partial snapshots. Soft event packets can race;
-  // deleting missing ids made the local ball vanish mid-hole. Only prune on hard
-  // authority, and never delete self while a hole is active.
-  if (hard && (msg.balls || []).length > 0) {
+  if ((msg.balls || []).length > 0) {
     for (const id of Game.players.keys()) {
       if (seen.has(id)) continue;
       if (id === mpPlayerId) continue;
@@ -2283,12 +2373,10 @@ function mpApplyCorrection(msg) {
     }
   }
 
-  // Authority was in the past: integrate sample→present with the same stepper.
-  // If result matches what we already had, restore present (visual no-op).
-  // If not, keep resimmed state (real desync correction).
+  // Law step 3–4: resim H→present; result is sim truth unless residual matches (visual opt).
   if (deferVisual) {
-    const MATCH_PX = 0.75;
-    const MATCH_V = 3;
+    const MATCH_PX = 3;
+    const MATCH_V = 12;
     const stepsGoal = clientTickBefore - mpSimTick;
     let guard = 0;
     while (mpSimTick < clientTickBefore && guard++ < 256) {
@@ -2303,7 +2391,7 @@ function mpApplyCorrection(msg) {
       const dV = Math.hypot((p.vx || 0) - (before.vx || 0), (p.vy || 0) - (before.vy || 0));
       const matched = dPos < MATCH_PX && dV < MATCH_V && !hitCap;
       if (matched) {
-        // Shared path — host sample confirms client; leave present untouched.
+        // Prediction confirmed — visual no-op only.
         p.x = before.x;
         p.y = before.y;
         p.vx = before.vx;
@@ -2325,7 +2413,7 @@ function mpApplyCorrection(msg) {
           rejectReason: msg.rejectReason,
         });
       } else {
-        // True disagreement at present tick after host@sample + resim.
+        // Host-resimmed present is sim truth (hard correction).
         p.errX = 0;
         p.errY = 0;
         p.rx = p.x;
@@ -2354,8 +2442,7 @@ function mpApplyCorrection(msg) {
         } catch (_) {}
       }
     }
-  } else if (hard && (msg.rejectReason || reason === 'resync')) {
-    // Force-sync / reject path (not sample→present confirm). Loud for dogfood.
+  } else if (msg.rejectReason || reason === 'resync') {
     try {
       console.info('[RB] force_sync_or_resync', {
         rejectReason: msg.rejectReason || null,
@@ -2366,7 +2453,8 @@ function mpApplyCorrection(msg) {
     } catch (_) {}
   }
 
-  for (const ev of msg.events || []) mpHandleEvent(ev, hole);
+  // Hard already seeded poses (+ resim). Events are juice only — no second authority.
+  for (const ev of msg.events || []) mpHandleEvent(ev, hole, { juiceOnly: true });
 
   const me = Game.players.get(mpPlayerId);
   if (me) {
@@ -2428,7 +2516,10 @@ function mpShowBanner(text) {
   mpBannerTimer = setTimeout(() => el.classList.add('hidden'), 2500);
 }
 
-function mpHandleEvent(ev, hole) {
+function mpHandleEvent(ev, hole, opts) {
+  opts = opts || {};
+  // After hard seed+resim, poses are already authority — events must not re-author.
+  const juiceOnly = !!opts.juiceOnly;
   const mine = ev.id === mpPlayerId;
   switch (ev.kind) {
     case 'bounce':
@@ -2445,17 +2536,18 @@ function mpHandleEvent(ev, hole) {
         mpShowBanner('SPLASH! +1');
         achvOnSplash();
       }
+      // Pose/float come from hard ballWire (floating + dunks), not event coords.
       break;
     case 'blackHole':
       if (typeof ev.x === 'number') spawnSplash(ev.x, ev.y);
       if (mine) {
         soundWater();
         mpShowBanner('EVENT HORIZON! +1');
-        // Do not achvOnSplash — water skin is for water hazards only.
       }
       break;
     case 'clash':
-      if (Array.isArray(ev.balls)) {
+      // Hard snapshot balls[] already hold post-clash poses when juiceOnly.
+      if (!juiceOnly && Array.isArray(ev.balls)) {
         for (const b of ev.balls) {
           const p = Game.players.get(b.id) || mpUpsertPlayer({
             id: b.id, name: '?', hue: 0, x: b.x, y: b.y, vx: b.vx, vy: b.vy, strokes: 0, holedOut: false,

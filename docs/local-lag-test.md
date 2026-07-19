@@ -75,6 +75,42 @@ Observe-only — does **not** change physics.
 | `[RB] putt_resync` | Self puttApplied re-applied pose after already coasting |
 | `RbDiag.summary()` | Counters + recent events |
 
+## Regression gate (must match the browser)
+
+Synthetic harnesses can stay green while the browser rubber-bands. The **real** gate is
+real lag-proxy + residual after sample→present resim:
+
+```bash
+# Terminals: npm start  AND  npm run lag-proxy
+npm run test:e2e-lag
+npm run test:live-lag
+```
+
+**1p e2e** (`test:e2e-lag`): hard-truth client only (no idle-while-moving ignores). Multi-trial
+random extra FIFO lag/jitter (`E2E_LAG_TRIALS`, `E2E_LAG_SEED`). Residual after seed@H→resim
+must be ~0 on replay while moving.
+
+**1p synthetic** (`test:live-lag`): same residual assert, multi-trial random bi-lag
+(`LIVE_LAG_TRIALS`, `LIVE_LAG_SEED`).
+
+| Scenario | What it catches |
+|----------|-----------------|
+| `multi_putt_residual` | ≥3 putts; hard residual ~0 under random lag |
+| `keepalive_reorder` | putt vs newer keepalive must not `before_keepalive` |
+| `varied_aims` | non-axis putts residual-match |
+| **`npm run test:e2e-clash`** | **2 clients**, multi-trial random lag, equal + asymmetric seats |
+
+Fixed-timing hacks should not reliably pass random-lag trials.
+
+This client applies the **same ignore rules as `game.js`** (stale hard before putt,
+hard idle at/before putt tick, hard idle while host strokes lag local). If it fails, the
+browser will fail the same way (`path_mismatch_after_resim` / force-sync while moving).
+If it passes and the browser still snaps, the e2e rules diverged from `mpApplyCorrection`
+— fix the test, don't hide the snap.
+
+`npm run test:live-lag` / `test:solo-lag` are useful unit checks but **not** a substitute
+for `test:e2e-lag` / `test:e2e-clash`.
+
 ## Headless first-principles scenarios
 
 ```bash

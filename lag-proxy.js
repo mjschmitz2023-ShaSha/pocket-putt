@@ -7,8 +7,11 @@
 //     browser  ──lag+jitter──►  proxy  ──lag+jitter──►  relay (authority)
 //     browser  ◄─lag+jitter──  proxy  ◄─lag+jitter──  relay
 //
-// Each *message* is delayed independently (base LAG_MS ± JITTER_MS). Order is
-// preserved per direction (FIFO by deliver-at time).
+// Each *message* is delayed (base LAG_MS ± JITTER_MS). **Order is preserved
+// per direction** (WebSocket is TCP — real networks do not reorder frames on
+// one connection). Jitter only varies delay; a later message never jumps ahead
+// of an earlier one (that reordering broke puttApplied-before-hard and made
+// dual-client clash tests fail unrealistically).
 //
 // HTTP is reverse-proxied without artificial delay so assets load normally;
 // only WebSocket frames are delayed.
@@ -47,13 +50,15 @@ const upstreamWsBase = `${upstreamWsProto}//${upstreamHost}:${upstreamPort}`;
 
 /**
  * FIFO delayed sender for one direction of a live WebSocket.
- * Delays each payload by LAG_MS ± JITTER_MS without reordering past deliver-at.
+ * Delays each payload by LAG_MS ± JITTER_MS; never reorders (TCP/WS semantics).
  */
 function createDelayedPipe(sendFn, label) {
   /** @type {{ at: number, data: any, isBinary: boolean }[]} */
   const queue = [];
   let timer = null;
   let closed = false;
+  /** Monotonic floor so message N+1 never delivers before message N. */
+  let lastDeliverAt = 0;
 
   function jitteredDelay() {
     if (!JITTER_MS) return LAG_MS;
@@ -86,15 +91,15 @@ function createDelayedPipe(sendFn, label) {
   return {
     push(data, isBinary) {
       if (closed) return;
+      // FIFO: deliver-at is never earlier than the previous message's deliver-at.
+      const raw = Date.now() + jitteredDelay();
+      const at = Math.max(raw, lastDeliverAt + 1);
+      lastDeliverAt = at;
       queue.push({
-        at: Date.now() + jitteredDelay(),
+        at,
         data,
         isBinary: !!isBinary,
       });
-      // Keep queue ordered by deliver time (jitter can reorder relative to push order;
-      // for realism we allow that — real networks re-order; if you need strict FIFO
-      // by arrival, sort only when jitter is 0).
-      if (JITTER_MS > 0) queue.sort((a, b) => a.at - b.at);
       arm();
     },
     close() {

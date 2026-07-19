@@ -68,6 +68,8 @@ class NetPipe {
     this.dropRate = opts.dropRate || 0;
     this.queue = []; // { deliverAt, msg }
     this._rng = mulberry32(opts.seed ?? 1);
+    /** FIFO floor — jitter must not reorder (WebSocket/TCP semantics). */
+    this._lastDeliverAt = 0;
   }
 
   push(msg, nowMs) {
@@ -76,9 +78,10 @@ class NetPipe {
     }
     // Never drop puttApplied / roundState — those are reliable in production.
     const j = this.jitterMs ? (this._rng() * 2 - 1) * this.jitterMs : 0;
-    const deliverAt = nowMs + this.delayMs + j;
+    const raw = nowMs + this.delayMs + j;
+    const deliverAt = Math.max(raw, this._lastDeliverAt + 0.001);
+    this._lastDeliverAt = deliverAt;
     this.queue.push({ deliverAt, msg });
-    this.queue.sort((a, b) => a.deliverAt - b.deliverAt);
   }
 
   popReady(nowMs) {
@@ -308,7 +311,9 @@ function runScenarioFixed(scenario) {
   if (typeof scenario.holeIndex === 'number' && scenario.holeIndex !== session.currentHoleIndex) {
     session.beginHole(scenario.holeIndex);
   }
+  // Synthetic wallMs origin — keep host + client on the same epoch calendar.
   session.holeStartedAtMs = 0;
+  session.holeEpochMs = 0;
 
   const schedule = [];
   const ctx = {
@@ -444,9 +449,11 @@ function runScenarioFixed(scenario) {
   for (const msg of clientSock.drain()) {
     if (msg.type === 'roundState') {
       client.onRoundState(msg);
+      client.holeEpochMs = 0; // match synthetic host epoch
       client.noteHostTick(typeof msg.tick === 'number' ? msg.tick : 0, wallMs);
     } else if (msg.type === 'clockSync') {
       client.onClockSync(msg, wallMs);
+      client.holeEpochMs = 0;
     } else if (msg.type === 'snapshot') {
       client.onSnapshot(msg, wallMs);
     }

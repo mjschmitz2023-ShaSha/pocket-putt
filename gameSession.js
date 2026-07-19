@@ -18,7 +18,11 @@ const STROKE_PENALTY_SECONDS = 4;
 const PLAYER_HUES = [0, 45, 190, 270, 130, 320, 25, 210];
 const MAX_CATCH_UP_TICKS = 8;
 const MAX_BUFFERED_BYTES = 32768;
-const CORRECTION_IDLE_EVERY = 120; // 2s idle keepalives while aiming
+const CORRECTION_IDLE_EVERY = 120; // 2s soft idle keepalives while aiming
+// Hard idle only after continuous idle this long (~1.5s @ 60Hz). Must exceed typical
+// bidirectional lag so a putt still in the pipe is applied (replay) before rest hard fires.
+// Shorter values race optimism: host rest hard arrives while client already launched.
+const IDLE_HARD_AFTER_TICKS = 90;
 // Must match client mpStepOneTick: N calls of stepBallPhysics(TICK_DT/N) per sim tick.
 // (Inner shared.js also uses 4 microsteps — host and client must use the same N.)
 const PHYSICS_SUBTICKS = 4;
@@ -111,6 +115,8 @@ class GameSession {
     this.holeResultsAtMs = 0;
     this.pendingEvents = [];
     this.wasIdle = false;
+    /** Consecutive idle ticks (for deferred hard idle). */
+    this.idleStreak = 0;
     this.lastActivity = Date.now();
     this._holeAdvanceTimer = null; // legacy; progression is wall-clock in tickDriver
     this._destroyed = false;
@@ -295,6 +301,7 @@ class GameSession {
     this.holeResultsAtMs = 0;
     this.pendingEvents = [];
     this.wasIdle = false;
+    this.idleStreak = 0;
     this.snapshotRing = [];
     this.inputLog = [];
     this.pendingReplayFrom = null;
@@ -407,6 +414,7 @@ class GameSession {
       vy: p.ball.vy,
       strokes: p.strokes,
       holedOut: p.holedOut,
+      dunks: p.dunks || 0,
       // Index latch (not object ref) so clients keep escape-grass vs trap-sticky correct.
       stuckStickyIndex: typeof p.ball.stuckStickyIndex === 'number' ? p.ball.stuckStickyIndex : -1,
     };
@@ -424,7 +432,27 @@ class GameSession {
       wire.z = p.ball.z;
       wire.vz = p.ball.vz;
     }
+    // Water float must be on the wire or laggy clients end float on a different drop slot.
+    if (p.floating) {
+      wire.floating = {
+        ticks: p.floating.ticks,
+        zone: p.floating.zone,
+        vx: p.floating.vx || 0,
+        vy: p.floating.vy || 0,
+      };
+    } else {
+      wire.floating = null;
+    }
     return wire;
+  }
+
+  /** Roster slot for water drop — sorted by id so host and client agree. */
+  waterDropSlot(player) {
+    const roster = [...this.players.values()]
+      .filter((p) => p.connected)
+      .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    const idx = roster.findIndex((p) => p.id === player.id);
+    return Math.max(0, idx);
   }
 
   /**
@@ -639,8 +667,7 @@ class GameSession {
       fl.ticks -= 1;
       Shared.stepWaterFloat(p.ball, fl, fl.zone, this.simTick * TICK_DT, TICK_DT);
       if (fl.ticks <= 0) {
-        const roster = [...this.players.values()];
-        const idx = Shared.waterDropIndexFor(roster.indexOf(p), p.dunks || 1);
+        const idx = Shared.waterDropIndexFor(this.waterDropSlot(p), p.dunks || 1);
         const drop = Shared.waterDropPointFor(fl.zone, idx, hole);
         p.ball.x = drop.x;
         p.ball.y = drop.y;
@@ -756,14 +783,24 @@ class GameSession {
 
     const anyMoving = active.some((p) => Math.hypot(p.ball.vx, p.ball.vy) >= Shared.STOP_THRESHOLD);
     const idle = !anyMoving && tickEvents.length === 0;
-    const becameIdle = idle && !this.wasIdle;
     this.wasIdle = idle;
+    if (idle) this.idleStreak = (this.idleStreak || 0) + 1;
+    else this.idleStreak = 0;
+
     if (tickEvents.length > 0) {
       this.sendCorrectionNow(tickEvents, { reason: 'event' });
-    } else if (becameIdle) {
-      // Safety net: hard idle so aim poses match (should be ~no-op when tick-stamps work).
+    } else if (
+      idle &&
+      this.pendingPutts.length === 0 &&
+      this.idleStreak === IDLE_HARD_AFTER_TICKS
+    ) {
+      // Hard idle once after sustained rest — not on the first idle tick (races lagging putts).
+      // Belt for real rest desync (tee or post-shot). Pre-putt race is client causality
+      // (packet cannot include unconfirmed putt) — do not silence idle to hide it.
+      // Healthy paths residual-match → visual no-op (docs/mp-hard-truth-sync.md).
       this.sendCorrectionNow([], { reason: 'idle', includeObstacles: true, hard: true });
-    } else if (idle && this.simTick % CORRECTION_IDLE_EVERY === 0) {
+    } else if (idle && this.simTick % CORRECTION_IDLE_EVERY === 0 && this.idleStreak > IDLE_HARD_AFTER_TICKS) {
+      // Soft juice/keepalive only after we've already passed the hard-idle gate.
       this.sendCorrectionNow([], { reason: 'idle', includeObstacles: true, hard: false });
     }
 
@@ -833,9 +870,12 @@ class GameSession {
     if (player.clockTrusted === false) {
       return { ok: false, reason: 'untrusted' };
     }
-    if (player.lastKeepaliveTick != null && T < player.lastKeepaliveTick) {
-      return { ok: false, reason: 'before_keepalive' };
-    }
+    // Do NOT reject T < lastKeepaliveTick.
+    // Under bidirectional lag a putt stamped at T routinely arrives AFTER a keepalive
+    // stamped at K > T (client free-ran and sent clientClock while the putt was still
+    // in flight). Strict "before_keepalive" force-synced host rest over an optimistic
+    // coast — the browser rubber band with rejectReason before_keepalive.
+    // History ring (too_old) already bounds how far back a putt may claim.
     if (T < 0) return { ok: false, reason: 'negative' };
     // Too far in the past for history ring.
     if (T < hostNow - TRUST_WINDOW_TICKS) {
