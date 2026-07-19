@@ -41,6 +41,8 @@ function createEmptyPathTrace(code) {
     holeIndex: 0,
     hostTick: 0,
     clearedReason: null,
+    /** Observability only — off unless PATH_TRACE=1 or a client sends pathTraceEnable. */
+    enabled: process.env.PATH_TRACE === '1' || process.env.PATH_TRACE === 'true',
     /** @type {Record<string, { playerId: string, name: string, samples: object[] }>} */
     host: Object.create(null),
     /** @type {Record<string, object>} */
@@ -208,16 +210,25 @@ class GameSession {
   }
 
   clearPathTrace(reason) {
+    const wasEnabled = !!(this.pathTrace && this.pathTrace.enabled);
     this.pathTrace = createEmptyPathTrace(this.code);
+    this.pathTrace.enabled = wasEnabled;
     this.pathTrace.clearedReason = reason || null;
     this.pathTrace.holeIndex = this.currentHoleIndex;
   }
 
+  enablePathTrace() {
+    if (!this.pathTrace) this.pathTrace = createEmptyPathTrace(this.code);
+    this.pathTrace.enabled = true;
+  }
+
   /**
    * Append one host sample for every connected ball (dense truth).
+   * Observability only — no-op unless pathTrace.enabled.
    * @param {{ sub?: number|null, phase?: string }} [meta]
    */
   recordPathTraceHost(meta) {
+    if (!this.pathTrace || !this.pathTrace.enabled) return;
     meta = meta || {};
     const phase = meta.phase || (this._replaying ? 'replay' : 'live');
     const sub = meta.sub != null ? meta.sub : null;
@@ -252,7 +263,7 @@ class GameSession {
   }
 
   pathTraceNoteEvent(ev) {
-    if (!ev || !this.pathTrace) return;
+    if (!ev || !this.pathTrace || !this.pathTrace.enabled) return;
     this.pathTrace.events.push({
       wallMs: Date.now(),
       hostTick: this.simTick,
@@ -1662,9 +1673,13 @@ class GameSession {
       this.handleClientClock(player, msg);
     } else if (msg.type === 'putt') {
       this.handlePutt(player, msg);
+    } else if (msg.type === 'pathTraceEnable') {
+      this.enablePathTrace();
     } else if (msg.type === 'pathTraceClientDump') {
+      this.enablePathTrace();
       this.handlePathTraceClientDump(player, msg);
     } else if (msg.type === 'pathTraceRequest') {
+      this.enablePathTrace();
       this.handlePathTraceRequest(player);
     } else if (msg.type === 'pathTraceClear') {
       this.clearPathTrace('client_request');

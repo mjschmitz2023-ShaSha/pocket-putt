@@ -20,6 +20,9 @@ npm run lag-proxy
 
 ## Capture a putt
 
+Path-trace is **opt-in only** (`?pathtrace=1` or `localStorage.ppPathTrace=1`).  
+Without that, no client panel, no per-subtick host pathTrace buffer (production `posePath` catch-up is separate and always on).
+
 1. **Putter** (host or guest):  
    `http://localhost:8977/?pathtrace=1`  
    (or via lag-proxy `:8978`)

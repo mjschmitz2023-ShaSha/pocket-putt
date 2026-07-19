@@ -1335,6 +1335,7 @@ const PathTrace = {
 
   init() {
     this.enabled = mpPathTraceEnabled();
+    window.PathTrace = this;
     if (!this.enabled) return;
     try {
       console.info(
@@ -1343,7 +1344,15 @@ const PathTrace = {
       );
     } catch (_) {}
     this.ensurePanel();
-    window.PathTrace = this;
+    this.enableHostRecording();
+  },
+
+  /** Tell host to start dense path-trace recording (opt-in observability). */
+  enableHostRecording() {
+    if (!this.enabled) return;
+    if (mpSocket && mpSocket.readyState === 1) {
+      mpSocket.send(JSON.stringify({ type: 'pathTraceEnable' }));
+    }
   },
 
   clear() {
@@ -1514,10 +1523,13 @@ const PathTrace = {
   },
 };
 PathTrace.init();
-if (document.readyState === 'loading') {
-  document.addEventListener('DOMContentLoaded', () => PathTrace.ensurePanel());
-} else {
-  PathTrace.ensurePanel();
+// Panel only when ?pathtrace=1 (or localStorage) — never mount in normal play.
+if (PathTrace.enabled) {
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', () => PathTrace.ensurePanel());
+  } else {
+    PathTrace.ensurePanel();
+  }
 }
 
 // ---- Rubber-band detector (observe only — never changes physics) ----
@@ -1775,6 +1787,7 @@ function mpConnect(opts = {}) {
     const roomInput = document.getElementById('lobby-room-input');
     if (roomInput && queryRoom && !hasCustomLevel) roomInput.value = queryRoom;
     mpSetRelayStatus('Connected. Create a room or join with a code.');
+    if (PathTrace.enabled) PathTrace.enableHostRecording();
 
     // Pending user action after a reconnect wins over deep-link join.
     if (mpPendingAction) {
@@ -1964,6 +1977,7 @@ function mpBeginHole(msg) {
   resetUnsettledTimer();
   resetAchvHoleCounters();
   mpInRound = true;
+  if (PathTrace.enabled) PathTrace.enableHostRecording();
   gameMenuEl.classList.remove('hidden');
   hud.classList.remove('hidden');
   hideAllScreens();
