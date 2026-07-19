@@ -26,7 +26,28 @@ const IDLE_HARD_AFTER_TICKS = 90;
 // Must match client mpStepOneTick: N calls of stepBallPhysics(TICK_DT/N) per sim tick.
 // (Inner shared.js also uses 4 microsteps — host and client must use the same N.)
 const PHYSICS_SUBTICKS = 4;
+/**
+ * Wire path samples per ball on hard (time-even since last hard → present).
+ * Dense subtick record is decimated to this many keyframes; client T0→T2 catch-up uses them.
+ */
+const PATH_CATCHUP_SAMPLES = 10;
+/** Max dense samples retained per ball for path-trace observability (~16s @ 4 subticks). */
+const PATH_TRACE_MAX_SAMPLES = 4000;
 const MAX_PLAYERS = Number(process.env.RELAY_MAX_PLAYERS) || 8;
+
+function createEmptyPathTrace(code) {
+  return {
+    room: code || null,
+    holeIndex: 0,
+    hostTick: 0,
+    clearedReason: null,
+    /** @type {Record<string, { playerId: string, name: string, samples: object[] }>} */
+    host: Object.create(null),
+    /** @type {Record<string, object>} */
+    clients: Object.create(null),
+    events: [],
+  };
+}
 // Tick-stamped putts: whole-hole history ring + input log (docs/mp-tick-stamped-inputs.md).
 // Snapshot = end-of-tick state. Putt at clientTick T applies on restore(T), then physics T→T+1.
 const HISTORY_TICKS = 30;
@@ -125,6 +146,14 @@ class GameSession {
     /** @type {{ tick: number, playerId: string, kind: string, dragVector: {x:number,y:number} }[]} */
     this.inputLog = [];
     this._replaying = false;
+    /** During replay: ball–ball off while simTick ≤ this (inclusive). null = clashful. */
+    this._replayClashlessUntil = null;
+    /**
+     * When set (runReplay), record host path samples after every physics subtick
+     * so observer trails match free-run density (~4px) not 1 sample/tick (~16px).
+     * @type {Map<string, { tick:number, x:number, y:number, vx:number, vy:number }[]>|null}
+     */
+    this._pathRecordById = null;
     /** @type {number|null} coalesce concurrent late inputs to earliest tick */
     this.pendingReplayFrom = null;
     /**
@@ -133,10 +162,160 @@ class GameSession {
      * @type {{ playerId: string, clientTick: number, dragVector: {x:number,y:number} }[]}
      */
     this.pendingPutts = [];
+    /**
+     * Host simTick of the last hard snapshot broadcast.
+     * Wire catch-up paths only include samples after this tick (last hard → this hard),
+     * not each ball’s full stroke from putt impulse (that re-animated old putts on peers).
+     * @type {number|null}
+     */
+    this.lastHardTick = null;
+    /**
+     * Path-trace observability (human + tools). Dense host samples + client dumps.
+     * Not on the wire except pathTrace* control messages.
+     */
+    this.pathTrace = createEmptyPathTrace(this.code);
+  }
+
+  /** Mark that a hard snapshot left the host (path window origin for the next hard). */
+  noteHardSyncSent(msg) {
+    if (!msg || msg.type !== 'snapshot' || !msg.hard) return;
+    this.lastHardTick = this.simTick;
+    // Start a new path interval for the next hard (buffer was just snapshotted onto the wire).
+    for (const p of this.players.values()) {
+      p.posePath = [];
+    }
+  }
+
+  /**
+   * Path on every hard, same rule for every ball:
+   * whatever is in posePath (samples since previous hard; cleared after each hard),
+   * time-even decimated for the wire. No putter filters, min-length, or synthetic poses.
+   */
+  pathsSinceLastHard() {
+    /** @type {Map<string, { tick:number, x:number, y:number, vx:number, vy:number }[]>} */
+    const map = new Map();
+    for (const p of this.players.values()) {
+      if (!p.connected || !p.ball) continue;
+      const dense = p.posePath || [];
+      if (dense.length === 0) continue;
+      map.set(p.id, this.pathTimeEvenDecimate(dense, PATH_CATCHUP_SAMPLES));
+    }
+    return map;
   }
 
   touch() {
     this.lastActivity = Date.now();
+  }
+
+  clearPathTrace(reason) {
+    this.pathTrace = createEmptyPathTrace(this.code);
+    this.pathTrace.clearedReason = reason || null;
+    this.pathTrace.holeIndex = this.currentHoleIndex;
+  }
+
+  /**
+   * Append one host sample for every connected ball (dense truth).
+   * @param {{ sub?: number|null, phase?: string }} [meta]
+   */
+  recordPathTraceHost(meta) {
+    meta = meta || {};
+    const phase = meta.phase || (this._replaying ? 'replay' : 'live');
+    const sub = meta.sub != null ? meta.sub : null;
+    const wallMs = Date.now();
+    const pt = this.pathTrace;
+    pt.holeIndex = this.currentHoleIndex;
+    pt.hostTick = this.simTick;
+    for (const p of this.players.values()) {
+      if (!p.connected || !p.ball) continue;
+      let lane = pt.host[p.id];
+      if (!lane) {
+        lane = { playerId: p.id, name: p.name || p.id, samples: [] };
+        pt.host[p.id] = lane;
+      }
+      lane.name = p.name || p.id;
+      lane.samples.push({
+        i: lane.samples.length,
+        tick: this.simTick,
+        sub,
+        x: p.ball.x,
+        y: p.ball.y,
+        vx: p.ball.vx || 0,
+        vy: p.ball.vy || 0,
+        phase,
+        wallMs,
+      });
+      if (lane.samples.length > PATH_TRACE_MAX_SAMPLES) {
+        lane.samples.splice(0, lane.samples.length - PATH_TRACE_MAX_SAMPLES);
+        for (let k = 0; k < lane.samples.length; k++) lane.samples[k].i = k;
+      }
+    }
+  }
+
+  pathTraceNoteEvent(ev) {
+    if (!ev || !this.pathTrace) return;
+    this.pathTrace.events.push({
+      wallMs: Date.now(),
+      hostTick: this.simTick,
+      ...ev,
+    });
+    if (this.pathTrace.events.length > 500) {
+      this.pathTrace.events.splice(0, this.pathTrace.events.length - 500);
+    }
+  }
+
+  /** Full dump for viewer / HTTP / WS. */
+  buildPathTraceBundle() {
+    const pt = this.pathTrace;
+    return {
+      version: 1,
+      room: this.code,
+      holeIndex: this.currentHoleIndex,
+      hostTick: this.simTick,
+      capturedAt: Date.now(),
+      host: pt.host,
+      clients: pt.clients,
+      events: pt.events,
+      meta: {
+        clearedReason: pt.clearedReason || null,
+        physicsSubticks: PHYSICS_SUBTICKS,
+        pathCatchupSamples: PATH_CATCHUP_SAMPLES,
+        historyTicks: HISTORY_TICKS,
+      },
+    };
+  }
+
+  handlePathTraceClientDump(player, msg) {
+    if (!player || !msg) return;
+    const samples = Array.isArray(msg.samples) ? msg.samples : [];
+    const events = Array.isArray(msg.events) ? msg.events : [];
+    // Cap client dumps so a runaway client cannot balloon memory.
+    const capped = samples.length > PATH_TRACE_MAX_SAMPLES
+      ? samples.slice(samples.length - PATH_TRACE_MAX_SAMPLES)
+      : samples;
+    this.pathTrace.clients[player.id] = {
+      playerId: player.id,
+      name: player.name || msg.name || player.id,
+      role: typeof msg.role === 'string' ? msg.role : 'client',
+      focusPlayerId: msg.focusPlayerId || null,
+      samples: capped,
+      events,
+      receivedAt: Date.now(),
+      sampleCount: capped.length,
+    };
+    this.pathTraceNoteEvent({
+      kind: 'client_dump',
+      from: player.id,
+      samples: capped.length,
+      role: msg.role || 'client',
+    });
+  }
+
+  handlePathTraceRequest(player) {
+    if (!player || !player.ws) return;
+    this.send(player.ws, {
+      type: 'pathTraceBundle',
+      bundle: this.buildPathTraceBundle(),
+    });
   }
 
   playerCount() {
@@ -235,6 +414,7 @@ class GameSession {
 
   broadcastReliable(msg) {
     this.broadcast(msg);
+    this.noteHardSyncSent(msg);
   }
 
   broadcastLobbyState() {
@@ -257,6 +437,7 @@ class GameSession {
       if (p.ws.bufferedAmount > MAX_BUFFERED_BYTES) continue;
       p.ws.send(raw);
     }
+    this.noteHardSyncSent(msg);
   }
 
   ensureHost() {
@@ -286,6 +467,9 @@ class GameSession {
       p.dunks = 0;
       p.floating = null; // never carry a hazard float across holes
       p.speedTracker = Shared.createSpeedAvgTracker();
+      p.strokePath = [];
+      p.posePath = [];
+      p.lastPuttTick = null;
       // Fresh clock trust for the hole (keepalives re-establish).
       p.lastKeepaliveTick = null;
       p.lastKeepaliveWall = 0;
@@ -308,10 +492,13 @@ class GameSession {
     this.pendingPutts = [];
     this._replaying = false;
     this.state = 'PLAYING';
+    this.lastHardTick = null;
+    this.clearPathTrace('beginHole');
     this.touch();
     Shared.setHoleObstaclesAtTick(hole, 0);
     // Seed end-of-tick-0 snapshot (tee setup) so putts at T=0 can restore.
     this.pushSnapshot();
+    this.recordPathTraceHost({ sub: null, phase: 'tee' });
     // Reliable roundState now carries tee balls; also push a hard resync for obstacles.
     this.broadcastReliable(this.roundStatePayload());
     this.broadcastReliable(this.clockSyncPayload());
@@ -333,6 +520,8 @@ class GameSession {
     const finishSeconds = this.simTick / TICK_HZ;
     const holeScore = finishSeconds + p.strokes * STROKE_PENALTY_SECONDS;
     p.holedOut = true;
+    p.strokePath = [];
+    p.lastPuttTick = null;
     if (p.ball) {
       p.ball.vx = 0;
       p.ball.vy = 0;
@@ -399,7 +588,11 @@ class GameSession {
     }
   }
 
-  ballWire(p) {
+  /**
+   * @param {object} p
+   * @param {{ path?: { tick:number, x:number, y:number, vx:number, vy:number }[] }} [wireOpts]
+   */
+  ballWire(p, wireOpts) {
     const wire = {
       id: p.id,
       name: p.name,
@@ -418,6 +611,9 @@ class GameSession {
       // Index latch (not object ref) so clients keep escape-grass vs trap-sticky correct.
       stuckStickyIndex: typeof p.ball.stuckStickyIndex === 'number' ? p.ball.stuckStickyIndex : -1,
     };
+    if (wireOpts && Array.isArray(wireOpts.path) && wireOpts.path.length > 0) {
+      wire.path = wireOpts.path;
+    }
     // Per-stroke boost latch — clients must not re-arm on idle snaps while still on a pad.
     if (p.ball.firedBoosts instanceof Set && p.ball.firedBoosts.size > 0) {
       wire.firedBoosts = [...p.ball.firedBoosts];
@@ -490,6 +686,8 @@ class GameSession {
       hard = false;
     }
     const hole = this.currentHoles()[this.currentHoleIndex];
+    // Every hard carries path for every ball (samples since previous hard). Soft: no path.
+    const pathById = hard ? this.pathsSinceLastHard() : null;
     const msg = {
       type: 'snapshot',
       courseIndex: this.courseIndex,
@@ -502,7 +700,11 @@ class GameSession {
       reason,
       hard,
       events: events || [],
-      balls: [...this.players.values()].filter((p) => p.connected && p.ball).map((p) => this.ballWire(p)),
+      balls: [...this.players.values()]
+        .filter((p) => p.connected && p.ball)
+        .map((p) =>
+          this.ballWire(p, pathById && pathById.has(p.id) ? { path: pathById.get(p.id) } : undefined)
+        ),
     };
     if (includeObstacles) {
       msg.obstacles = {
@@ -742,34 +944,43 @@ class GameSession {
         }
       }
 
-      const activeNow = [...this.players.values()]
-        .filter((p) => p.connected && p.ball && !p.holedOut && !p.floating)
-        .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
-      for (let i = 0; i < activeNow.length; i++) {
-        for (let j = i + 1; j < activeNow.length; j++) {
-          const pa = activeNow[i];
-          const pb = activeNow[j];
-          const a = pa.ball;
-          const b = pb.ball;
-          if (Shared.resolveBallBallCollision(a, b)) {
-            const key = pa.id + '|' + pb.id;
-            if (!clashedPairs.has(key)) {
-              clashedPairs.add(key);
-              tickEvents.push({
-                kind: 'clash',
-                a: pa.id,
-                b: pb.id,
-                x: (a.x + b.x) / 2,
-                y: (a.y + b.y) / 2,
-                balls: [
-                  { id: pa.id, x: a.x, y: a.y, vx: a.vx, vy: a.vy },
-                  { id: pb.id, x: b.x, y: b.y, vx: b.vx, vy: b.vy },
-                ],
-              });
+      // Superposition window: ball–ball off while simTick ≤ clashlessUntil (putt resolution).
+      const clashOn =
+        this._replayClashlessUntil == null || this.simTick > this._replayClashlessUntil;
+      if (clashOn) {
+        const activeNow = [...this.players.values()]
+          .filter((p) => p.connected && p.ball && !p.holedOut && !p.floating)
+          .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+        for (let i = 0; i < activeNow.length; i++) {
+          for (let j = i + 1; j < activeNow.length; j++) {
+            const pa = activeNow[i];
+            const pb = activeNow[j];
+            const a = pa.ball;
+            const b = pb.ball;
+            if (Shared.resolveBallBallCollision(a, b)) {
+              const key = pa.id + '|' + pb.id;
+              if (!clashedPairs.has(key)) {
+                clashedPairs.add(key);
+                tickEvents.push({
+                  kind: 'clash',
+                  a: pa.id,
+                  b: pb.id,
+                  x: (a.x + b.x) / 2,
+                  y: (a.y + b.y) / 2,
+                  balls: [
+                    { id: pa.id, x: a.x, y: a.y, vx: a.vx, vy: a.vy },
+                    { id: pb.id, x: b.x, y: b.y, vx: b.vx, vy: b.vy },
+                  ],
+                });
+              }
             }
           }
         }
       }
+      this.recordPathSamples(this._pathRecordById, {
+        sub: s,
+        phase: this._replaying ? 'replay' : 'live',
+      });
     }
   }
 
@@ -821,14 +1032,20 @@ class GameSession {
 
   /**
    * Live step: physics + corrections + ring push.
-   * @param {{ silent?: boolean }} [opts] silent=true during rewind replay (no mid-history sends)
+   * @param {{ silent?: boolean, clashlessUntil?: number|null }} [opts]
+   *   silent=true during rewind replay (no mid-history sends).
+   *   clashlessUntil=T1 → ball–ball off while simTick ≤ T1 after the step increment.
    */
   stepSimulation(opts) {
     if (this.state !== 'PLAYING' || this._destroyed) return;
     const silent = !!(opts && opts.silent);
+    if (opts && opts.clashlessUntil != null) {
+      this._replayClashlessUntil = opts.clashlessUntil;
+    }
     this.stepPhysicsOneTick();
     this.pushSnapshot();
     if (!silent) {
+      this._replayClashlessUntil = null;
       // Future-stamped putts become due when host reaches their clientTick.
       this.processPendingPutts();
       this.emitTickCorrections();
@@ -841,11 +1058,72 @@ class GameSession {
     }
   }
 
+  /**
+   * Record host-truth pose samples every subtick (every ball).
+   * posePath → wire path on hard (since lastHard). strokePath → putt stroke (tests / diagnostics).
+   */
+  recordPathSamples(pathById, meta) {
+    meta = meta || {};
+    for (const p of this.players.values()) {
+      if (!p.connected || !p.ball) continue;
+      const sample = {
+        tick: this.simTick,
+        x: p.ball.x,
+        y: p.ball.y,
+        vx: p.ball.vx || 0,
+        vy: p.ball.vy || 0,
+      };
+      if (meta.sub != null) sample.sub = meta.sub;
+      if (meta.phase) sample.phase = meta.phase;
+      if (pathById) {
+        let arr = pathById.get(p.id);
+        if (!arr) {
+          arr = [];
+          pathById.set(p.id, arr);
+        }
+        arr.push(sample);
+      }
+      if (!p.posePath) p.posePath = [];
+      p.posePath.push(sample);
+      if (p.lastPuttTick != null && !p.holedOut) {
+        if (!p.strokePath) p.strokePath = [];
+        p.strokePath.push(sample);
+      }
+    }
+    this.recordPathTraceHost(meta);
+  }
+
+  /**
+   * Time-even decimate dense path → N keyframes (oldest → newest).
+   * Even in sample index ≈ even in time when samples are fixed-rate subticks.
+   */
+  pathTimeEvenDecimate(samples, n) {
+    const N = typeof n === 'number' && n > 0 ? Math.floor(n) : PATH_CATCHUP_SAMPLES;
+    if (!samples || samples.length === 0) return [];
+    if (samples.length <= N) return samples.slice();
+    if (N === 1) return [samples[samples.length - 1]];
+    const out = [];
+    for (let i = 0; i < N; i++) {
+      const u = i / (N - 1);
+      const idx = Math.round(u * (samples.length - 1));
+      const s = samples[idx];
+      out.push({
+        tick: s.tick,
+        x: s.x,
+        y: s.y,
+        vx: s.vx || 0,
+        vy: s.vy || 0,
+      });
+    }
+    return out;
+  }
+
   forceSyncPlayer(player, rejectReason) {
     if (!player || !player.ws) return;
     const msg = this.buildCorrection([], { reason: 'resync', includeObstacles: true, hard: true });
     if (rejectReason) msg.rejectReason = rejectReason;
     this.send(player.ws, msg);
+    this.noteHardSyncSent(msg);
   }
 
   /**
@@ -923,14 +1201,20 @@ class GameSession {
   runReplay(fromTick) {
     this._replaying = true;
     let Tstar = fromTick;
+    /** Earliest rewind origin in this run (may step earlier if nested late inputs). */
+    let earliestTstar = fromTick;
     const targetTick = this.simTick;
     let lastAppliedJuice = [];
+    /** @type {Map<string, { tick:number, x:number, y:number, vx:number, vy:number }[]>} */
+    let pathById = new Map();
     try {
       while (Tstar != null) {
         this.pendingReplayFrom = null;
+        if (Tstar < earliestTstar) earliestTstar = Tstar;
         const snap = this.getSnapshot(Tstar);
         if (!snap) {
           // History gap — force-sync everyone and abort.
+          this._replayClashlessUntil = null;
           this.broadcastReliable(
             this.buildCorrection([], { reason: 'resync', includeObstacles: true, hard: true })
           );
@@ -940,15 +1224,34 @@ class GameSession {
         // Drop ring entries after Tstar — they will be rebuilt by silent steps.
         this.snapshotRing = this.snapshotRing.filter((e) => e.tick <= Tstar);
         this.pendingEvents = [];
+        pathById = new Map();
+        this._pathRecordById = pathById;
 
-        // Juice only for putts at the rewind origin (new late inputs); later ticks re-apply silently.
+        // Keep pose samples before Tstar; silent re-sim re-records tick >= Tstar into posePath.
+        for (const p of this.players.values()) {
+          if (p.posePath && p.posePath.length) {
+            p.posePath = p.posePath.filter((s) => s.tick < Tstar);
+          }
+          if (p.strokePath && p.strokePath.length) {
+            p.strokePath = p.strokePath.filter((s) => s.tick < Tstar);
+          }
+        }
+
+        // Latest legal putt tick in this resolution window → end of clashless superposition.
+        let T1 = Tstar;
+        for (const rec of this.inputLog) {
+          if (rec.kind !== 'putt') continue;
+          if (rec.tick >= Tstar && rec.tick <= targetTick && rec.tick > T1) T1 = rec.tick;
+        }
+
         lastAppliedJuice = this.applyInputsForTick(Tstar);
+        this.recordPathSamples(pathById, { sub: null, phase: 'replay_boundary' });
         let t = Tstar;
         while (t < targetTick) {
-          this.stepSimulation({ silent: true });
+          this.stepSimulation({ silent: true, clashlessUntil: T1 });
           t = this.simTick;
-          // After arriving at t, apply putts stamped t before further steps.
           this.applyInputsForTick(t);
+          this.recordPathSamples(pathById, { sub: null, phase: 'replay_boundary' });
         }
 
         if (this.pendingReplayFrom != null) {
@@ -958,7 +1261,17 @@ class GameSession {
         break;
       }
 
-      // Juice: puttApplied for SFX (state truth is the hard snapshot below).
+      this._replayClashlessUntil = null;
+      this._pathRecordById = null;
+
+      // Path on hard is always built inside buildCorrection (posePath since lastHard).
+      this.broadcastReliable(
+        this.buildCorrection([], {
+          reason: 'replay',
+          includeObstacles: true,
+          hard: true,
+        })
+      );
       for (const rec of lastAppliedJuice) {
         const puttMsg = {
           type: 'puttApplied',
@@ -982,11 +1295,6 @@ class GameSession {
         }
         this.broadcastReliable(puttMsg);
       }
-
-      // Hard full-hole snapshot after rewind/replay (reliable — state truth).
-      this.broadcastReliable(
-        this.buildCorrection([], { reason: 'replay', includeObstacles: true, hard: true })
-      );
       this.pendingEvents = [];
 
       // Hole-end if everyone finished during replay.
@@ -1005,6 +1313,8 @@ class GameSession {
       }
     } finally {
       this._replaying = false;
+      this._replayClashlessUntil = null;
+      this._pathRecordById = null;
     }
   }
 
@@ -1080,6 +1390,16 @@ class GameSession {
     });
     const minLog = this.simTick - HISTORY_TICKS - 1;
     this.inputLog = this.inputLog.filter((r) => r.tick >= minLog);
+
+    // New stroke marker (posePath is continuous; not cleared — path on hard is lastHard→now).
+    player.lastPuttTick = T;
+    player.strokePath = [];
+    this.pathTraceNoteEvent({
+      kind: 'putt_commit',
+      playerId: player.id,
+      clientTick: T,
+      drag: { x: clamped.x, y: clamped.y },
+    });
 
     this.scheduleReplayFrom(T);
   }
@@ -1221,6 +1541,10 @@ class GameSession {
       speedTracker: Shared.createSpeedAvgTracker(),
       perHoleScores: [],
       totalScore: 0,
+      /** Dense poses from last putt impulse → now (catch-up path source). */
+      strokePath: [],
+      posePath: [],
+      lastPuttTick: null,
     };
     this.players.set(id, player);
     this.ensureHost();
@@ -1338,6 +1662,13 @@ class GameSession {
       this.handleClientClock(player, msg);
     } else if (msg.type === 'putt') {
       this.handlePutt(player, msg);
+    } else if (msg.type === 'pathTraceClientDump') {
+      this.handlePathTraceClientDump(player, msg);
+    } else if (msg.type === 'pathTraceRequest') {
+      this.handlePathTraceRequest(player);
+    } else if (msg.type === 'pathTraceClear') {
+      this.clearPathTrace('client_request');
+      this.send(player.ws, { type: 'pathTraceCleared' });
     }
   }
 

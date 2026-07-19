@@ -1,5 +1,12 @@
-// Pure-Node mirror of game.js multiplayer coast reconcilation (no DOM/audio).
-// Used by the rubber-band harness to quantify soft/hard snaps vs host ground truth.
+// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+// !!!!  CRITICAL TEST DEBT — COPIED CLIENT, NOT game.js                     !!!!
+// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+// This file is a Pure-Node *reimplementation* of multiplayer coast reconciliation.
+// Rubber-band / live-lag harnesses drive THIS copy, not game.js.
+// Green harness results do NOT prove the browser client is correct.
+// REQUIRED FIX: load the real client correction path in Node (extract from game.js
+// like shared.js dual browser/Node export) and delete this mirror.
+// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 'use strict';
 
 const Shared = require('../shared.js');

@@ -2,20 +2,14 @@
 /**
  * Dual-client clash under REAL relay + unpredictable extra lag/jitter.
  *
- * Anti-hack rules for this test:
- *   - No fixed lag that a same-batch "nudge N ticks" can paper over.
- *   - Each trial draws lag/jitter from a wide range (seeded but varying).
- *   - Inbound messages delayed with FIFO (TCP-like); delay is per-message random.
- *   - Free-run is only shared catchUp (whole world) — no single-ball aging.
+ * Host/network: REAL relay + lag-proxy.
  *
- * Scenarios (each run multiple trials):
- *   1) both on lag-proxy URL + extra random delay
- *   2) mutual head-on
- *   3) asym: proxy host → direct guest (+ random extra on each side)
- *   4) asym: direct host → proxy guest
+ * !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+ * !!!!  CRITICAL: In-test HardTruth-style clients COPY game.js correction.  !!!!
+ * !!!!  Green e2e-clash ≠ proof that browser game.js is correct.            !!!!
+ * !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
  *
  * Requires: npm start (:8977) AND npm run lag-proxy (:8978)
- *   npm run test:e2e-clash
  */
 'use strict';
 

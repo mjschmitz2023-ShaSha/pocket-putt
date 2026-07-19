@@ -49,6 +49,7 @@ const MIME = {
 const STATIC_FILES = [
   'index.html',
   'style.css',
+  'mp-recon.js',
   'game.js',
   'shared.js',
   'share-level.js',
@@ -58,6 +59,8 @@ const STATIC_FILES = [
   'editor-snap.js',
   'editor-gizmos.js',
   'editor.css',
+  'path-trace.html',
+  'path-trace-viewer.js',
   'putt.wav',
   'echoey_putt.wav',
   'putt_go_in.wav',
@@ -241,6 +244,82 @@ const httpServer = http.createServer((req, res) => {
         sendJson(res, 500, { ok: false, error: 'server_error', detail: String(e && e.message ? e.message : e) });
       });
     return;
+  }
+  // Path-trace observability:
+  //   GET /path-trace           → list active rooms (codes + sample counts)
+  //   GET /path-trace/ROOMCODE  → full host+client dump for that room
+  if (req.method === 'GET' || req.method === 'HEAD') {
+    if (urlPath === '/path-trace' || urlPath === '/path-trace/') {
+      const list = [];
+      for (const [code, room] of rooms) {
+        const b = room.session && room.session.buildPathTraceBundle
+          ? room.session.buildPathTraceBundle()
+          : null;
+        let hostSamples = 0;
+        if (b && b.host) {
+          for (const id of Object.keys(b.host)) {
+            hostSamples += (b.host[id].samples && b.host[id].samples.length) || 0;
+          }
+        }
+        list.push({
+          code,
+          players: room.session ? room.session.connectedCount() : 0,
+          state: room.session ? room.session.state : null,
+          hostTick: b ? b.hostTick : null,
+          hostSamples,
+          clientDumps: b && b.clients ? Object.keys(b.clients).length : 0,
+          events: b && b.events ? b.events.length : 0,
+        });
+      }
+      if (req.method === 'HEAD') {
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+        res.end();
+        return;
+      }
+      sendJson(res, 200, { ok: true, rooms: list });
+      return;
+    }
+    const m = urlPath.match(/^\/path-trace\/([A-Za-z0-9]+)$/i);
+    if (m) {
+      const room = getRoom(m[1]);
+      if (!room || !room.session) {
+        const codes = [...rooms.keys()];
+        sendJson(res, 404, {
+          ok: false,
+          error: 'room_not_found',
+          room: String(m[1]).toUpperCase(),
+          activeRooms: codes,
+          hint:
+            codes.length === 0
+              ? 'No rooms on this relay. Create a room in the game first (relay restart clears all rooms).'
+              : `Room not active. Live rooms: ${codes.join(', ')}`,
+        });
+        return;
+      }
+      if (typeof room.session.buildPathTraceBundle !== 'function') {
+        sendJson(res, 500, {
+          ok: false,
+          error: 'path_trace_unavailable',
+          hint: 'Restart npm start — this relay process predates path-trace.',
+        });
+        return;
+      }
+      if (req.method === 'HEAD') {
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+        res.end();
+        return;
+      }
+      try {
+        sendJson(res, 200, room.session.buildPathTraceBundle());
+      } catch (e) {
+        sendJson(res, 500, {
+          ok: false,
+          error: 'bundle_failed',
+          detail: String(e && e.message ? e.message : e),
+        });
+      }
+      return;
+    }
   }
   serveStatic(req, res);
 });

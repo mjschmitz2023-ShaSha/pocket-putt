@@ -33,7 +33,7 @@ agree    → keep prior present (no visual change)
 Never:
 
 - Soft-blend mid-flight to hide disagreement  
-- Ignore hard because “we’re moving” except pure **causality** (see below)  
+- Skip hard pose on **self** (another player can knock your ball; hard is whole-hole authority)  
 - Rewind/advance sim clock from soft packets  
 
 ---
@@ -43,6 +43,27 @@ Never:
 **Soft = juice only** (SFX, particles, banners).
 
 Never touch: `x/y/vx/vy/z`, strokes (except cosmetic max), float, `mpSimTick`, hole epoch.
+
+---
+
+## Visual catch-up (host path history)
+
+**Every hard** (not only replay) carries per-ball **`path`**.
+
+| After seed@H → resim | Draw |
+|----------------------|------|
+| **Residual match** | Visual **no-op** (restore prior present). |
+| **`!matched`** + path | Sim = host present. **Draw** catch-up: current board → host path (from nearest sample forward) → live (`N = path.length`). Never rewinds to last-hard path[0]. |
+
+Host rules (always the same):
+
+1. Record **posePath** every physics subtick for every ball.  
+2. On hard: path = time-even decimation of that ball’s posePath (buffer since previous hard).  
+3. After hard: clear posePath (next hard starts a new interval).  
+
+No putter-only logic, min-length checks, or synthetic keyframes. Soft packets: no path.  
+Client: residual match → no path play; else path if present.  
+Regression: `npm run test:dave-trail-hypotheses`. Observability: `docs/path-trace.md`.
 
 ---
 
@@ -56,21 +77,9 @@ Never touch: `x/y/vx/vy/z`, strokes (except cosmetic max), float, `mpSimTick`, h
 
 ---
 
-## Causality exception (narrow)
+## No self-skip on hard
 
-Only skip applying hard **self** state when hard has **no** `rejectReason` and any of:
-
-1. `sampleTick < lastOptimisticPuttTick` (strictly before our unconfirmed putt)  
-2. `reason === 'idle'` and `sampleTick <= lastOptimisticPuttTick` (end-of-tick idle is pre-putt; putt applies on restore(T) — same-tick first-tee race)  
-3. `reason === 'idle'` and host self `strokes` **&lt;** local self strokes (host has not counted our shot yet; putt still in flight)
-
-That packet cannot include our shot. Remotes on the packet may still update.  
-Reject / resync always apply (undo bad optimism).
-
-**Host still sends hard idle** after sustained rest (tee or post-shot) — it is the belt for
-real rest desync and should residual-match when healthy. Do **not** silence tee idle to
-hide putt races; client causality handles pre-putt idle. A true idle snap while both sides
-are at rest is a desync bug to fix, not a reason to drop idle.
+Hard applies to **all** balls, including local player. Skipping self to protect optimistic putts loses clashes and other players’ interactions with your ball. Residual match after host-resim present is the only visual no-op when free-run already agreed — not “ignore hard pose.”
 
 ---
 

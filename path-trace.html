@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Path Trace — Pocket Putt</title>
+  <style>
+    :root {
+      --bg: #0b1018;
+      --panel: #121a26;
+      --border: #2a3f5c;
+      --text: #e6eefc;
+      --muted: #8aa0bc;
+      --host: #5ddea0;
+      --putter: #6eb6ff;
+      --observer: #ffb454;
+      --wire: #e86b6b;
+      --gap: #ff4d6d;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 13px/1.4 system-ui, -apple-system, Segoe UI, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+    header {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--border);
+      background: var(--panel);
+    }
+    header h1 {
+      font-size: 15px;
+      margin: 0 12px 0 0;
+      font-weight: 700;
+    }
+    header .muted { color: var(--muted); }
+    button, label.file {
+      background: #1c2a3d;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 6px 10px;
+      cursor: pointer;
+      font: inherit;
+    }
+    button:hover, label.file:hover { border-color: #4a6a94; }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    label.file input { display: none; }
+    .main {
+      display: grid;
+      grid-template-columns: 1fr 320px;
+      gap: 0;
+      min-height: calc(100vh - 110px);
+    }
+    @media (max-width: 900px) {
+      .main { grid-template-columns: 1fr; }
+    }
+    .plot-wrap {
+      padding: 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    canvas#plot {
+      width: 100%;
+      height: min(62vh, 640px);
+      background: #070b12;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      cursor: crosshair;
+    }
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 14px;
+      color: var(--muted);
+    }
+    .legend span::before {
+      content: '';
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border-radius: 2px;
+      margin-right: 6px;
+      vertical-align: -1px;
+    }
+    .legend .host::before { background: var(--host); }
+    .legend .putter::before { background: var(--putter); }
+    .legend .observer::before { background: var(--observer); }
+    .legend .wire::before { background: var(--wire); }
+    .scrub {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 4px 0;
+    }
+    .scrub input[type=range] { flex: 1; }
+    .side {
+      border-left: 1px solid var(--border);
+      background: var(--panel);
+      padding: 12px;
+      overflow: auto;
+      max-height: calc(100vh - 110px);
+    }
+    .side h2 {
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--muted);
+      margin: 14px 0 6px;
+    }
+    .side h2:first-child { margin-top: 0; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-variant-numeric: tabular-nums;
+    }
+    th, td {
+      text-align: left;
+      padding: 3px 4px;
+      border-bottom: 1px solid #1a2636;
+      font-size: 12px;
+    }
+    th { color: var(--muted); font-weight: 600; }
+    .metric { font-size: 18px; font-weight: 700; }
+    .metric.bad { color: var(--gap); }
+    .metric.ok { color: var(--host); }
+    .help {
+      color: var(--muted);
+      font-size: 12px;
+      padding: 8px 14px 12px;
+      border-bottom: 1px solid var(--border);
+      background: #0e1520;
+    }
+    .help code {
+      background: #1a2433;
+      padding: 1px 5px;
+      border-radius: 3px;
+      font-size: 11px;
+    }
+    select {
+      background: #1c2a3d;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 5px 8px;
+      font: inherit;
+    }
+    .keys { color: var(--muted); font-size: 11px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Path Trace</h1>
+    <button type="button" id="btn-list">List rooms</button>
+    <button type="button" id="btn-fetch">Fetch room dump</button>
+    <label class="file">Load JSON<input type="file" id="file" accept="application/json,.json" /></label>
+    <button type="button" id="btn-export">Export bundle</button>
+    <span class="muted" id="meta">No dump loaded</span>
+  </header>
+  <div class="help">
+    <strong>Workflow:</strong>
+    1) <code>npm start</code> then two browsers with <code>?pathtrace=1</code> (same room).
+    2) Make a putt. 3) On <em>each</em> client: PathTrace panel → <strong>Push dump</strong>.
+    4) Open this page from the <em>same origin</em> as the game
+    (<code>http://localhost:8977/path-trace.html</code> — not file://).
+    5) <strong>List rooms</strong> / <strong>Fetch</strong> with the live code
+    (relay restart wipes rooms). Host samples exist without Push; client lanes need Push.
+    Step with <kbd>←</kbd>/<kbd>→</kbd> (Shift = ×10).
+  </div>
+  <div id="fetch-status" class="help" style="padding-top:4px;padding-bottom:8px"></div>
+  <div class="main">
+    <div class="plot-wrap">
+      <canvas id="plot" width="1000" height="640"></canvas>
+      <div class="legend">
+        <span class="host">Host dense (bright = up to playhead)</span>
+        <span class="putter">Putter client</span>
+        <span class="observer">Observer client</span>
+        <span class="wire">Wire path (N keyframes)</span>
+      </div>
+      <div class="scrub">
+        <button type="button" id="btn-prev" title="←">◀</button>
+        <input type="range" id="slider" min="0" max="0" value="0" />
+        <button type="button" id="btn-next" title="→">▶</button>
+        <span id="step-label">0 / 0</span>
+      </div>
+      <div class="keys">← → step · Shift+arrow ×10 · Home/End · click plot to jump nearest</div>
+      <div>
+        Focus ball
+        <select id="focus-ball"></select>
+        · Putter client
+        <select id="sel-putter"></select>
+        · Observer client
+        <select id="sel-observer"></select>
+      </div>
+    </div>
+    <aside class="side">
+      <h2>Step</h2>
+      <div id="step-info">—</div>
+      <h2>Distances at cursor</h2>
+      <table>
+        <tr><th>pair</th><th>Δ pos</th><th>Δ v</th></tr>
+        <tr><td>putter ↔ host</td><td id="d-ph" class="metric">—</td><td id="dv-ph">—</td></tr>
+        <tr><td>observer ↔ host</td><td id="d-oh" class="metric">—</td><td id="dv-oh">—</td></tr>
+        <tr><td>putter ↔ observer</td><td id="d-po" class="metric">—</td><td id="dv-po">—</td></tr>
+      </table>
+      <h2>Poses</h2>
+      <table>
+        <tr><th>lane</th><th>tick</th><th>sub</th><th>x</th><th>y</th><th>phase</th></tr>
+        <tbody id="pose-rows"></tbody>
+      </table>
+      <h2>Neighbor gap (this step)</h2>
+      <table>
+        <tr><th>lane</th><th>Δ from prev</th></tr>
+        <tbody id="gap-rows"></tbody>
+      </table>
+      <h2>Events near step</h2>
+      <pre id="events" style="white-space:pre-wrap;font-size:11px;color:var(--muted);margin:0"></pre>
+    </aside>
+  </div>
+  <script src="path-trace-viewer.js"></script>
+</body>
+</html>

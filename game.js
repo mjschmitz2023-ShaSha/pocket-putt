@@ -1288,6 +1288,238 @@ const MP_SOFT_ERR_PX = 10;
 const MP_HARD_ERR_PX = 80;
 const MP_ERR_DECAY_TAU = 0.12;
 
+// Path catch-up + free-run trail: shared module (browser window.MpRecon / Node require).
+const MpRecon = window.MpRecon;
+
+function mpStartVisualPath(p, path) {
+  MpRecon.startVisualPath(p, path, performance.now());
+  if (typeof PathTrace !== 'undefined' && PathTrace.enabled) {
+    PathTrace.noteEvent({
+      kind: 'vis_path_start',
+      ballId: p.id,
+      n: path && path.length,
+      path: (path || []).map((s) => ({
+        tick: s.tick,
+        x: s.x,
+        y: s.y,
+        vx: s.vx || 0,
+        vy: s.vy || 0,
+      })),
+    });
+  }
+}
+function mpAdvanceVisualPaths(now) {
+  for (const p of Game.players.values()) {
+    MpRecon.advanceVisualPathOne(p, now);
+  }
+}
+
+// ---- Path-trace recorder (observability; ?pathtrace=1 or localStorage.ppPathTrace=1) ----
+// Records this client's complete ball history (sim + render) for the path-trace viewer.
+const PATH_TRACE_MAX = 4000;
+function mpPathTraceEnabled() {
+  const q = MP_PARAMS.get('pathtrace');
+  if (q === '0' || q === 'false') return false;
+  if (q === '1' || q === 'true') return true;
+  try {
+    if (localStorage.getItem('ppPathTrace') === '1') return true;
+  } catch (_) {}
+  return false;
+}
+const PathTrace = {
+  enabled: false,
+  samples: [], // all balls, interleaved; filter by ballId in viewer
+  events: [],
+  panel: null,
+  statusEl: null,
+
+  init() {
+    this.enabled = mpPathTraceEnabled();
+    if (!this.enabled) return;
+    try {
+      console.info(
+        '[PathTrace] ON — records sim+render samples every subtick. ' +
+          'Push dump after a putt, then open /path-trace.html?room=CODE'
+      );
+    } catch (_) {}
+    this.ensurePanel();
+    window.PathTrace = this;
+  },
+
+  clear() {
+    this.samples = [];
+    this.events = [];
+    this.setStatus('cleared');
+  },
+
+  setStatus(t) {
+    if (this.statusEl) this.statusEl.textContent = t;
+  },
+
+  noteEvent(ev) {
+    if (!this.enabled) return;
+    this.events.push({
+      wallMs: performance.now(),
+      tick: mpSimTick,
+      ...ev,
+    });
+    if (this.events.length > 400) this.events.splice(0, this.events.length - 400);
+  },
+
+  /**
+   * Record one sample for every known ball.
+   * @param {{ sub?: number|null, phase?: string, note?: string }} meta
+   */
+  recordAll(meta) {
+    if (!this.enabled) return;
+    meta = meta || {};
+    const wallMs = performance.now();
+    const tick = mpSimTick;
+    for (const p of Game.players.values()) {
+      this.samples.push({
+        i: this.samples.length,
+        ballId: p.id,
+        tick,
+        sub: meta.sub != null ? meta.sub : null,
+        x: p.x,
+        y: p.y,
+        vx: p.vx || 0,
+        vy: p.vy || 0,
+        rx: p.rx != null ? p.rx : p.x,
+        ry: p.ry != null ? p.ry : p.y,
+        phase: meta.phase || 'sim',
+        note: meta.note || null,
+        visPathFrames: p.visPathFrames != null ? p.visPathFrames : null,
+        wallMs,
+      });
+    }
+    if (this.samples.length > PATH_TRACE_MAX) {
+      this.samples.splice(0, this.samples.length - PATH_TRACE_MAX);
+      for (let k = 0; k < this.samples.length; k++) this.samples[k].i = k;
+    }
+    this.setStatus(`${this.samples.length} samples · tick ${tick}`);
+  },
+
+  localDump() {
+    const names = {};
+    for (const p of Game.players.values()) names[p.id] = p.name || p.id;
+    return {
+      version: 1,
+      role: 'client',
+      playerId: mpPlayerId,
+      name: names[mpPlayerId] || mpPlayerId,
+      room: mpRoomCode,
+      simTick: mpSimTick,
+      hostTick: mpHostTick,
+      focusPlayerId: null,
+      samples: this.samples.slice(),
+      events: this.events.slice(),
+      playerNames: names,
+      capturedAt: Date.now(),
+    };
+  },
+
+  pushToServer() {
+    if (!mpSocket || mpSocket.readyState !== 1) {
+      this.setStatus('no socket');
+      return;
+    }
+    const dump = this.localDump();
+    mpSocket.send(
+      JSON.stringify({
+        type: 'pathTraceClientDump',
+        role: dump.role,
+        name: dump.name,
+        focusPlayerId: dump.focusPlayerId,
+        samples: dump.samples,
+        events: dump.events,
+      })
+    );
+    this.setStatus(`pushed ${dump.samples.length} → request bundle…`);
+    mpSocket.send(JSON.stringify({ type: 'pathTraceRequest' }));
+  },
+
+  downloadLocal() {
+    const dump = this.localDump();
+    const blob = new Blob([JSON.stringify(dump, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `pathtrace-client-${mpPlayerId || 'me'}-${Date.now()}.json`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    this.setStatus('downloaded local');
+  },
+
+  openViewer(bundle) {
+    if (bundle) {
+      try {
+        sessionStorage.setItem('ppPathTraceBundle', JSON.stringify(bundle));
+      } catch (e) {
+        try {
+          console.warn('[PathTrace] sessionStorage failed', e);
+        } catch (_) {}
+      }
+    }
+    const room = mpRoomCode || '';
+    const url = `/path-trace.html${room ? `?room=${encodeURIComponent(room)}` : ''}`;
+    window.open(url, '_blank');
+  },
+
+  onBundle(msg) {
+    if (!msg || !msg.bundle) return;
+    this.setStatus(
+      `bundle host=${Object.keys(msg.bundle.host || {}).length} clients=${Object.keys(msg.bundle.clients || {}).length}`
+    );
+    this.openViewer(msg.bundle);
+  },
+
+  ensurePanel() {
+    if (this.panel || !document.body) return;
+    const el = document.createElement('div');
+    el.id = 'path-trace-panel';
+    el.innerHTML =
+      '<div style="font:12px/1.3 system-ui,sans-serif;position:fixed;right:8px;bottom:8px;z-index:99999;' +
+      'background:rgba(10,14,20,.92);color:#e8f0ff;border:1px solid #3a5a80;border-radius:8px;' +
+      'padding:8px 10px;min-width:200px;box-shadow:0 4px 20px rgba(0,0,0,.4)">' +
+      '<div style="font-weight:700;margin-bottom:4px">PathTrace</div>' +
+      '<div id="path-trace-status" style="opacity:.85;margin-bottom:6px;max-width:220px">recording…</div>' +
+      '<div style="display:flex;flex-wrap:wrap;gap:4px">' +
+      '<button type="button" data-pt="push" style="cursor:pointer">Push dump</button>' +
+      '<button type="button" data-pt="view" style="cursor:pointer">Viewer</button>' +
+      '<button type="button" data-pt="dl" style="cursor:pointer">Save local</button>' +
+      '<button type="button" data-pt="clr" style="cursor:pointer">Clear</button>' +
+      '</div></div>';
+    document.body.appendChild(el);
+    this.panel = el;
+    this.statusEl = el.querySelector('#path-trace-status');
+    el.addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-pt]');
+      if (!btn) return;
+      const act = btn.getAttribute('data-pt');
+      if (act === 'push') this.pushToServer();
+      else if (act === 'view') {
+        // Prefer live server bundle if in room.
+        if (mpSocket && mpSocket.readyState === 1) {
+          mpSocket.send(JSON.stringify({ type: 'pathTraceRequest' }));
+          this.setStatus('requesting bundle…');
+        } else this.openViewer(null);
+      } else if (act === 'dl') this.downloadLocal();
+      else if (act === 'clr') {
+        this.clear();
+        if (mpSocket && mpSocket.readyState === 1) {
+          mpSocket.send(JSON.stringify({ type: 'pathTraceClear' }));
+        }
+      }
+    });
+  },
+};
+PathTrace.init();
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', () => PathTrace.ensurePanel());
+} else {
+  PathTrace.ensurePanel();
+}
+
 // ---- Rubber-band detector (observe only — never changes physics) ----
 // Enable: ?rbdebug=1  or  localStorage.ppRbDebug = '1'
 // Live RTT lag for realism must come from lag-proxy.js (bidirectional), not here.
@@ -1644,6 +1876,13 @@ function mpConnect(opts = {}) {
       // timer free-running and blocked feeling like the next hole would never start.
       if (!mpPlaying) return;
       mpApplyCorrection(msg);
+    } else if (msg.type === 'pathTraceBundle') {
+      if (PathTrace.enabled) PathTrace.onBundle(msg);
+    } else if (msg.type === 'pathTraceCleared') {
+      if (PathTrace.enabled) {
+        PathTrace.clear();
+        PathTrace.setStatus('host cleared');
+      }
     } else if (msg.type === 'holeResults') {
       mpPlaying = false;
       mpStopKeepalives();
@@ -2048,17 +2287,24 @@ function mpOnPuttApplied(msg) {
     return;
   }
 
-  // Remote: launch impulse for prediction; world free-runs only via mpUpdateLocalSim.
-  // Late puttApplied still places them at putt pose (host truth at T); hard corrects path.
+  // Remote puttApplied = juice only (SFX). Do NOT teleport sim/draw to putt-tick pose —
+  // that was the large discontinuity (trail jump) before host path catch-up.
+  // Pose + path truth arrive on hard replay (balls[].path → mpStartVisualPath).
   if (!p) {
     p = mpUpsertPlayer({
       id: msg.playerId, name: '?', hue: 0,
-      x: msg.x, y: msg.y, vx: msg.vx, vy: msg.vy,
+      x: msg.x, y: msg.y, vx: 0, vy: 0,
       strokes: msg.strokes || 0, holedOut: false,
       stuckStickyIndex: msg.stuckStickyIndex,
     });
+    // Keep draw at spawn pose until hard path plays; do not launch visually here.
+    p.rx = p.x;
+    p.ry = p.y;
   }
-  mpApplyPuttLocal(msg.playerId, msg.dragVector, hostPose, true);
+  if (msg.dragVector) {
+    const launch = computeLaunchVelocity(clampDragVector(msg.dragVector) || msg.dragVector);
+    soundPutt(Math.hypot(launch.vx, launch.vy) / MAX_LAUNCH_SPEED);
+  }
 }
 
 function mpStepOneTick() {
@@ -2205,6 +2451,7 @@ function mpStepOneTick() {
         }
       }
     }
+    if (PathTrace.enabled) PathTrace.recordAll({ sub: s, phase: 'sim' });
   }
   // Quasi-rest window for local player (host validates with its own tracker).
   const me = Game.players.get(mpPlayerId);
@@ -2228,8 +2475,17 @@ function mpUpdateLocalSim(dt) {
     steps++;
   }
 
+  const nowT = performance.now();
+  // Host-path visual catch-up first (render-only; does not write sim x/y).
+  mpAdvanceVisualPaths(nowT);
+  if (PathTrace.enabled) PathTrace.recordAll({ sub: null, phase: 'render' });
+
   const decay = Math.exp(-dt / MP_ERR_DECAY_TAU);
   for (const p of Game.players.values()) {
+    if (p.visPath && p.visPath.length >= 2) {
+      // Catch-up owns rx/ry until finished.
+      continue;
+    }
     p.errX *= decay;
     p.errY *= decay;
     if (Math.hypot(p.errX, p.errY) < 0.5) {
@@ -2240,16 +2496,9 @@ function mpUpdateLocalSim(dt) {
     p.ry = p.y + p.errY;
     p.rz = p.z || 0;
   }
-  // Cosmetics trails from render positions.
-  const nowT = performance.now();
+  // Cosmetics trails from render positions (MpRecon free-run + 600ms prune).
   for (const p of Game.players.values()) {
-    if (!p.trail) { p.trailPts = null; continue; }
-    if (!p.trailPts) p.trailPts = [];
-    const lastPt = p.trailPts[p.trailPts.length - 1];
-    if (!lastPt || Math.hypot(p.rx - lastPt.x, p.ry - lastPt.y) > 4) {
-      p.trailPts.push({ x: p.rx, y: p.ry, t: nowT });
-    }
-    while (p.trailPts.length && nowT - p.trailPts[0].t > 600) p.trailPts.shift();
+    MpRecon.freeRunTrailAndPrune(p, nowT);
   }
   const me = Game.players.get(mpPlayerId);
   if (me) mpSyncSelfFromPlayer(me);
@@ -2277,64 +2526,18 @@ function mpApplyCorrection(msg) {
     return;
   }
 
-  // Pure causality: hard that cannot include our unconfirmed putt must not wipe it.
-  // Remotes still update. Reject/resync always apply (rejectReason set).
-  //
-  // 1) sampleTick < lastOptimisticPutt — packet is strictly pre-shot.
-  // 2) hard idle at sampleTick <= putt tick — host end-of-tick snapshot is pre-putt
-  //    (putt applies on restore(T)); same-tick idle is the classic first-tee race.
-  // 3) hard idle while host self.strokes < local strokes — host has not counted our
-  //    shot yet (putt still in flight / lag). Idle hard is always rest on host.
-  const meForCausal = Game.players.get(mpPlayerId);
-  const hostMeForCausal = (msg.balls || []).find((b) => b.id === mpPlayerId);
-  const idleHostBehindPutt =
-    reason === 'idle' &&
-    meForCausal &&
-    hostMeForCausal &&
-    typeof hostMeForCausal.strokes === 'number' &&
-    meForCausal.strokes > hostMeForCausal.strokes;
-  const idleAtOrBeforePutt =
-    reason === 'idle' &&
-    mpLastPuttClientTick != null &&
-    typeof tick === 'number' &&
-    tick <= mpLastPuttClientTick;
-  const hardBeforePutt =
-    typeof tick === 'number' &&
-    mpLastPuttClientTick != null &&
-    tick < mpLastPuttClientTick;
-  if (
-    !msg.rejectReason &&
-    (hardBeforePutt || idleAtOrBeforePutt || idleHostBehindPutt)
-  ) {
-    mpNoteHostTick(tick, msg.hostTimeMs, { holeEpochMs: msg.holeEpochMs });
-    try {
-      console.info('[RB] ignore_stale_hard_before_putt', {
-        sampleTick: tick,
-        lastPuttClientTick: mpLastPuttClientTick,
-        reason,
-        clientTick: clientTickBefore,
-        idleHostBehindPutt: !!idleHostBehindPutt,
-        idleAtOrBeforePutt: !!idleAtOrBeforePutt,
-      });
-    } catch (_) {}
-    for (const b of msg.balls || []) {
-      if (b.id === mpPlayerId) continue;
-      const p = mpUpsertPlayer(b);
-      mpApplyAuthorityPose(p, b, true, { reason });
-    }
-    return;
-  }
+  // Hard is whole-hole authority for every ball — including self.
+  // Do not skip self pose: another player's putt/clash can rewrite your ball; residual
+  // match is the only visual no-op when free-run already agreed with host-resim present.
 
-  // Snapshot present for residual visual no-op after resim.
+  // Snapshot present for residual (match → visual no-op; !match → path if host sent one).
   const presentById = new Map();
-  if (sampleInPast) {
-    for (const p of Game.players.values()) {
-      presentById.set(p.id, {
-        x: p.x, y: p.y, vx: p.vx, vy: p.vy, z: p.z || 0, vz: p.vz || 0,
-        rx: p.rx, ry: p.ry, errX: p.errX || 0, errY: p.errY || 0,
-        strokes: p.strokes, holedOut: !!p.holedOut,
-      });
-    }
+  for (const p of Game.players.values()) {
+    presentById.set(p.id, {
+      x: p.x, y: p.y, vx: p.vx, vy: p.vy, z: p.z || 0, vz: p.vz || 0,
+      rx: p.rx, ry: p.ry, errX: p.errX || 0, errY: p.errY || 0,
+      strokes: p.strokes, holedOut: !!p.holedOut,
+    });
   }
 
   mpNoteHostTick(tick, msg.hostTimeMs, { holeEpochMs: msg.holeEpochMs });
@@ -2373,59 +2576,47 @@ function mpApplyCorrection(msg) {
     }
   }
 
-  // Law step 3–4: resim H→present; result is sim truth unless residual matches (visual opt).
+  // Law step 3–4: optional resim H→present; residual visual policy for every hard.
+  let stepsGoal = 0;
+  let stepsRun = 0;
+  let hitCap = false;
   if (deferVisual) {
-    const MATCH_PX = 3;
-    const MATCH_V = 12;
-    const stepsGoal = clientTickBefore - mpSimTick;
+    stepsGoal = clientTickBefore - mpSimTick;
     let guard = 0;
     while (mpSimTick < clientTickBefore && guard++ < 256) {
       mpStepOneTick();
     }
-    const stepsRun = guard;
-    const hitCap = mpSimTick < clientTickBefore;
-    for (const [id, before] of presentById) {
-      const p = Game.players.get(id);
-      if (!p) continue;
-      const dPos = Math.hypot(p.x - before.x, p.y - before.y);
-      const dV = Math.hypot((p.vx || 0) - (before.vx || 0), (p.vy || 0) - (before.vy || 0));
-      const matched = dPos < MATCH_PX && dV < MATCH_V && !hitCap;
-      if (matched) {
-        // Prediction confirmed — visual no-op only.
-        p.x = before.x;
-        p.y = before.y;
-        p.vx = before.vx;
-        p.vy = before.vy;
-        p.z = before.z;
-        p.vz = before.vz;
-        p.errX = before.errX;
-        p.errY = before.errY;
-        p.rx = before.rx;
-        p.ry = before.ry;
-        p.rz = before.z;
-        if (typeof before.strokes === 'number') p.strokes = before.strokes;
-        p.holedOut = before.holedOut;
-        RbDiag.noteAuthority(p, before, true, before, {
-          reason,
-          applied: true,
-          matched: true,
-          residualAfterResim: dPos,
-          rejectReason: msg.rejectReason,
-        });
-      } else {
-        // Host-resimmed present is sim truth (hard correction).
-        p.errX = 0;
-        p.errY = 0;
-        p.rx = p.x;
-        p.ry = p.y;
-        p.rz = p.z || 0;
-        RbDiag.noteAuthority(p, { x: p.x, y: p.y, vx: p.vx, vy: p.vy }, true, before, {
-          reason,
-          applied: true,
-          matched: false,
-          residualAfterResim: dPos,
-          rejectReason: msg.rejectReason,
-        });
+    stepsRun = guard;
+    hitCap = mpSimTick < clientTickBefore;
+  }
+  // Residual for all hard snaps (present-stamped included). Path catch-up only if
+  // !matched and host attached a path for that ball (path = lastHard→thisHard window).
+  for (const [id, before] of presentById) {
+    const p = Game.players.get(id);
+    if (!p) continue;
+    const hostBall = (msg.balls || []).find((b) => b.id === id);
+    const path = hostBall && Array.isArray(hostBall.path) ? hostBall.path : null;
+    const vis = MpRecon.applyHardBallVisual(p, before, path, {
+      hitCap,
+      nowMs: performance.now(),
+    });
+    if (vis.matched) {
+      RbDiag.noteAuthority(p, before, true, before, {
+        reason,
+        applied: true,
+        matched: true,
+        residualAfterResim: vis.dPos,
+        rejectReason: msg.rejectReason,
+      });
+    } else {
+      RbDiag.noteAuthority(p, { x: p.x, y: p.y, vx: p.vx, vy: p.vy }, true, before, {
+        reason,
+        applied: true,
+        matched: false,
+        residualAfterResim: vis.dPos,
+        rejectReason: msg.rejectReason,
+      });
+      if (vis.pathCatchup || vis.dPos > 3) {
         try {
           console.info('[RB] path_mismatch_after_resim', {
             reason,
@@ -2434,15 +2625,23 @@ function mpApplyCorrection(msg) {
             stepsGoal,
             stepsRun,
             hitCap,
-            dPos: Math.round(dPos * 10) / 10,
-            dV: Math.round(dV * 10) / 10,
-            beforeV: Math.round(Math.hypot(before.vx, before.vy) * 10) / 10,
-            afterV: Math.round(Math.hypot(p.vx || 0, p.vy || 0) * 10) / 10,
+            dPos: Math.round(vis.dPos * 10) / 10,
+            dV: Math.round(vis.dV * 10) / 10,
+            pathSamples: path ? path.length : 0,
+            pathCatchup: vis.pathCatchup,
           });
         } catch (_) {}
       }
     }
-  } else if (msg.rejectReason || reason === 'resync') {
+  }
+  // Balls that appeared only on this hard (no before snapshot): path if host sent one.
+  for (const b of msg.balls || []) {
+    if (presentById.has(b.id)) continue;
+    const p = Game.players.get(b.id);
+    if (!p || !Array.isArray(b.path) || b.path.length === 0) continue;
+    mpStartVisualPath(p, b.path);
+  }
+  if (msg.rejectReason || reason === 'resync') {
     try {
       console.info('[RB] force_sync_or_resync', {
         rejectReason: msg.rejectReason || null,
@@ -2455,6 +2654,24 @@ function mpApplyCorrection(msg) {
 
   // Hard already seeded poses (+ resim). Events are juice only — no second authority.
   for (const ev of msg.events || []) mpHandleEvent(ev, hole, { juiceOnly: true });
+
+  if (PathTrace.enabled) {
+    PathTrace.noteEvent({
+      kind: 'hard_snapshot',
+      reason,
+      sampleTick: tick,
+      clientTickBefore,
+      balls: (msg.balls || []).map((b) => ({
+        id: b.id,
+        x: b.x,
+        y: b.y,
+        vx: b.vx,
+        vy: b.vy,
+        pathN: Array.isArray(b.path) ? b.path.length : 0,
+      })),
+    });
+    PathTrace.recordAll({ sub: null, phase: 'after_hard', note: reason || 'hard' });
+  }
 
   const me = Game.players.get(mpPlayerId);
   if (me) {

@@ -208,14 +208,19 @@ Host maintains for the last **~30 ticks**:
 
 ### 7.2 On legal late putt at `T`
 
-1. Insert into input log  
+1. Insert into input log (**never omit a legal putt**)  
 2. Let `T* = min tick affected` (this putt; if multiple pending, earliest)  
-3. Restore whole-hole snapshot at **start of tick `T*`** (or end of `T*-1`—pick one convention and keep it)  
-4. Replay ticks `T* .. H` (host now):  
+3. Restore whole-hole snapshot at end of tick `T*` (putt applies on that pose)  
+4. Let `T1` = latest legal putt tick in `[T*, H]` among the input log  
+5. Replay ticks `T* .. H` (host now):  
    - **Input phase:** apply *all* inputs for this tick (see simultaneous putts)  
-   - **Physics phase:** existing `stepSimulation` body for one tick (subticks, floats, clashes, water, …)  
-5. Broadcast **hard full-hole snapshot** at `H`  
-6. Optionally still emit `puttApplied` for juice/debug; **state truth is the hard snapshot**
+   - **Physics phase:** existing `stepSimulation` body for one tick  
+   - **Superposition:** ball–ball **clash disabled** while `simTick ≤ T1` (clashless putt window)  
+   - **Collapse:** ball–ball **on** for `simTick > T1`  
+6. Broadcast **hard full-hole snapshot** at `H` with per-ball **path samples** (host truth) for client visual catch-up  
+7. Optionally still emit `puttApplied` for juice/debug; **state truth is the hard snapshot**
+
+**Why clashless until `T1`:** contested multi-putt under lag should not let archaeological earlier ticks knock a ball before the latest putt in the resolution window via ball–ball. All putts still apply at their stamps; walls/hazards still run. Laggy players may phase; snappy players keep a clean launch.
 
 ### 7.3 Simultaneous same-tick putts
 

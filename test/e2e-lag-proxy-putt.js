@@ -1,19 +1,16 @@
 #!/usr/bin/env node
 /**
- * 1p residual regression under REAL lag-proxy + extra unpredictable FIFO delay.
+ * 1p residual under REAL lag-proxy + FIFO delay.
  *
- * Apply path MUST match game.js hard-truth law (docs/mp-hard-truth-sync.md):
- *   soft = juice only
- *   hard @ H → seed → resim H→present = sim truth
- *   residual match = visual no-op only
- *   causality ignore: tick < lastOptimisticPutt; hard idle also if host strokes
- *   behind local or sampleTick <= putt tick (no idle-while-moving maze)
+ * Host path: REAL (relay GameSession).
  *
- * Anti-hack: multi-trial random lag/jitter (not a single 80±40 sweet spot).
+ * !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+ * !!!!  CRITICAL: HardTruthClient BELOW IS A COPY of game.js correction,   !!!!
+ * !!!!  NOT the browser client. Green e2e-lag does NOT prove game.js is OK. !!!
+ * !!!!  REQUIRED FIX: drive actual game.js correction in Node/headless.      !!!!
+ * !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
  *
  * Requires: npm start (:8977) AND npm run lag-proxy (:8978)
- *   npm run test:e2e-lag
- *   E2E_LAG_TRIALS=5 E2E_LAG_SEED=123 npm run test:e2e-lag
  */
 'use strict';
 

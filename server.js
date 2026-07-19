@@ -21,6 +21,7 @@ const MIME = {
 const STATIC_FILES = [
   'index.html',
   'style.css',
+  'mp-recon.js',
   'game.js',
   'shared.js',
   'putt.wav',

@@ -37,7 +37,10 @@
     "test:e2e-lag": "node test/e2e-lag-proxy-putt.js",
     "test:e2e-clash": "node test/e2e-lag-proxy-clash.js",
     "test:water-drop": "node test/water-drop-sync.js",
-    "test:client-clash": "node test/client-ball-clash.js"
+    "test:client-clash": "node test/client-ball-clash.js",
+    "test:putt-superposition": "node test/putt-superposition.js",
+    "test:dave-trail-hypotheses": "node test/dave-trail-hypotheses.js",
+    "path-trace": "echo Open http://localhost:8977/path-trace.html — see docs/path-trace.md"
   },
   "engines": {
     "node": ">=18"

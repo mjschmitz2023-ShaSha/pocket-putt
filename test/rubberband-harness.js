@@ -2,22 +2,19 @@
 /**
  * Rubber-band harness
  * -------------------
- * Real GameSession + ClientModel (mirror of game.js coast path).
+ * Real GameSession + ClientModel.
+ *
+ * !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+ * !!!!  CRITICAL: ClientModel is a COPY of game.js, not game.js.            !!!!
+ * !!!!  Green solo-lag / rubberband ≠ browser client correctness.           !!!!
+ * !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
  *
  * Network model (matches lag-proxy.js philosophy):
  *   - pipeDown: server → client (snapshots, puttApplied)
  *   - pipeUp:   client → server (putts) when bidirectional + lag
- *   Each side: delayMs ± jitterMs (independent).
- *
- * First-principles baseline: solo_1p_* (1 player). Deterministic physics ⇒
- * hardSnapsWhileMoving must be 0 even under bidirectional lag.
- *
- * Live browser: use lag-proxy.js (true bidirectional WS proxy), not one-way hacks.
- *   docs/local-lag-test.md
  *
  * Usage:
  *   npm run test:solo-lag
- *   node test/rubberband-harness.js solo_1p_bidirectional_lag
  *   node test/rubberband-harness.js --all
  */
 'use strict';
