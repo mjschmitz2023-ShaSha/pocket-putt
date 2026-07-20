@@ -1,0 +1,792 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Top Down — two-stage drop preview</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%;
+    background: #0e1116;
+    color: #e8edf2;
+    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+  }
+  .wrap {
+    min-height: 100%;
+    display: flex; flex-direction: column; align-items: center;
+    gap: 16px; padding: 22px 16px 40px;
+  }
+  h1 { font-size: 16px; font-weight: 650; letter-spacing: .2px; margin: 0; }
+  h1 small { color: #7d8794; font-weight: 500; margin-left: 8px; }
+  .stage {
+    position: relative;
+    width: min(800px, 96vw);
+    aspect-ratio: 800 / 500;
+    border-radius: 12px; overflow: hidden;
+    box-shadow: 0 12px 40px rgba(0,0,0,.5), 0 0 0 1px rgba(255,255,255,.06) inset;
+  }
+  canvas { width: 100%; height: 100%; display: block; }
+  .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: center; }
+  button {
+    appearance: none; border: 1px solid rgba(255,255,255,.14);
+    background: #1a1f27; color: #e8edf2; font: inherit; font-weight: 550;
+    padding: 8px 15px; border-radius: 9px; cursor: pointer;
+    transition: background .15s, border-color .15s, transform .05s;
+  }
+  button:hover { background: #232a34; border-color: rgba(255,255,255,.24); }
+  button:active { transform: translateY(1px); }
+  button.rec[data-on="1"] { background: #b3372f; border-color: #e0554c; }
+  button.mode[data-on="1"] { background: #2b5fb0; border-color: #5aa0ff; }
+  #shield-controls { display: none; }
+  #shield-controls.on { display: flex; }
+  #shield-controls label { flex-direction: row; align-items: center; gap: 8px; color: #9aa4b1; font-size: 12px; }
+  #shield-controls input[type="range"] { width: 120px; }
+  .tunables {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 10px 18px; width: min(800px, 96vw);
+    background: #141922; border: 1px solid rgba(255,255,255,.07);
+    border-radius: 10px; padding: 14px 16px;
+  }
+  .tunables label { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color: #9aa4b1; }
+  .tunables .val { color: #cfe3ff; font-variant-numeric: tabular-nums; font-weight: 600; }
+  input[type="range"] { width: 100%; accent-color: #5aa0ff; }
+  .hint { color: #7d8794; font-size: 12px; max-width: 800px; text-align: center; }
+  .status { font-size: 12px; color: #8ea2bd; min-height: 16px; font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Top&nbsp;Down <small>two-stage hole · drop-into-stage-2 preview</small></h1>
+
+  <div class="stage">
+    <canvas id="c" width="800" height="500"></canvas>
+  </div>
+
+  <div class="controls">
+    <button id="mode-hole" class="mode" data-on="1">🏔 Hole 1</button>
+    <button id="mode-shield" class="mode" data-on="0">🛡 KingLuiIV demo</button>
+    <span style="width:10px"></span>
+    <button id="restart">↻ Restart</button>
+    <button id="rec" class="rec" data-on="0">● Record clip</button>
+    <span class="status" id="status"></span>
+  </div>
+
+  <div class="controls" id="shield-controls">
+    <label>Players
+      <input type="range" id="s-players" min="2" max="5" step="1" value="4" />
+      <span class="val" id="v-players">4</span>
+    </label>
+    <label>KingLuiIV life (ticks @ 60Hz)
+      <input type="range" id="s-shieldticks" min="12" max="360" step="1" value="68" />
+      <span class="val" id="v-shieldticks">68 · 1.13s</span>
+    </label>
+  </div>
+
+  <div class="tunables">
+    <label>Drop apex — DROP_H <span class="val" id="v-drop">150</span>
+      <input type="range" id="s-drop" min="60" max="260" step="5" value="150" />
+    </label>
+    <label>Restitution — REST <span class="val" id="v-rest">0.60</span>
+      <input type="range" id="s-rest" min="0.30" max="0.80" step="0.02" value="0.60" />
+    </label>
+    <label>Bounces <span class="val" id="v-bounce">3</span>
+      <input type="range" id="s-bounce" min="1" max="5" step="1" value="3" />
+    </label>
+    <label>Gravity — RAMP_GRAVITY <span class="val" id="v-grav">1400</span>
+      <input type="range" id="s-grav" min="700" max="2400" step="50" value="1400" />
+    </label>
+  </div>
+
+  <p class="hint">
+    Mirrors the game's real height axis: ball lifts <code>z·0.35</code>, scales
+    <code>1+z/260</code>; shadow <code>shrink = max(0.45, 1−z/600)</code>; bounce physics
+    <code>z += vz·dt; vz −= g·dt</code>, rebound <code>vz = −vz·REST</code>. Whatever feels
+    right here ports straight into <code>game.js</code>.
+  </p>
+</div>
+
+<script>
+"use strict";
+// ---- Constants mirrored from the real game (shared.js / game.js) ----
+const BALL_RADIUS = 7;
+let RAMP_GRAVITY = 1400;   // shared.js:56
+let DROP_H = 150;          // initial apex height (z units) for the stage-2 drop
+let REST = 0.60;           // per-bounce restitution (peak decays by REST^2)
+let BOUNCES = 3;           // diminishing bounces after the initial fall
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const W = 800, H = 500;
+
+// ---- HOLE 1 · "The Great Descent" (par 4) ----
+// Stage 1: alpine ridge — snowy summit tee (upper-left) descends a dogleg to the cliff-edge
+// drop marker (lower-right). Stage 2: valley funnel green — land on the tee pedestal (the
+// funnel-immune fixed-optimal spot), then putt off into the funnel that gathers to the cup.
+const S1 = {
+  tee:      { x: 95,  y: 105 },
+  ctrl:     { x: 250, y: 430 },     // quadratic control → sweeps down the face, then along the ledge
+  firstPin: { x: 665, y: 405 },     // cliff-ledge drop marker (NOT a real cup)
+  walls: [ [40,40,760,40], [760,40,760,460], [760,460,40,460], [40,460,40,40] ],
+  boulders: [ {x:430,y:175,r:26}, {x:525,y:120,r:18}, {x:160,y:250,r:15} ],
+  pines: [ {x:70,y:430,s:1}, {x:120,y:458,s:.8}, {x:715,y:150,s:1.1}, {x:745,y:255,s:.9}, {x:58,y:335,s:.85} ],
+};
+const S2 = {
+  tee:    { x: 235, y: 160 },       // the drop-in tee pedestal (fixed-optimal spot)
+  cup:    { x: 480, y: 335, r: 11 },
+  funnel: { cx: 480, cy: 335, rx: 125, ry: 100, rot: 0, k: 8 },   // small oval bowl (shape/size vary per hole)
+  walls:  [ [40,40,760,40], [760,40,760,460], [760,460,40,460], [40,460,40,40] ],
+  flowers:[ {x:120,y:405,h:'#ffd23f'},{x:665,y:120,h:'#ff8fab'},{x:600,y:430,h:'#c77dff'},{x:180,y:255,h:'#ffd23f'},{x:705,y:385,h:'#8aff5a'} ],
+};
+
+// ---- Animation state machine ----
+const PHASE = { S1_ROLL:'s1', DESCEND:'descend', DROP:'drop', S2_TEE:'tee', S2_FUNNEL:'funnel', DONE:'done' };
+let st;
+function reset() {
+  st = {
+    phase: PHASE.S1_ROLL,
+    t: 0,                       // time in current phase (s)
+    ball: { x: S1.tee.x, y: S1.tee.y, z: 0, vz: 0, vx: 0, vy: 0, squash: 0 },
+    reboundsDone: 0,
+    strokes: 1,
+    fade: 0,                    // descend crossfade 0..1
+  };
+}
+reset();
+
+// eased approach roll: ease-out from A to B over `dur`
+function lerp(a, b, u) { return a + (b - a) * u; }
+function easeOut(u) { return 1 - Math.pow(1 - u, 2.2); }
+function quadBezier(p0, p1, p2, t) { const u = 1 - t; return { x: u*u*p0.x + 2*u*t*p1.x + t*t*p2.x, y: u*u*p0.y + 2*u*t*p1.y + t*t*p2.y }; }
+// elliptical catchment test — the funnel's SHAPE varies per hole (rx/ry/rotation): <1 = inside
+function funnelHas(F, x, y) {
+  const dx = x - F.cx, dy = y - F.cy, ca = Math.cos(F.rot || 0), sa = Math.sin(F.rot || 0);
+  const rx0 = dx * ca + dy * sa, ry0 = -dx * sa + dy * ca;
+  return (rx0 / F.rx) ** 2 + (ry0 / F.ry) ** 2 < 1;
+}
+// Stage-2 funnel finish: a spring-well bowl. Inside the catchment the ball is pulled toward
+// the cup with force ∝ distance (stiffness F.k), so it damps in and settles. Miss the
+// catchment and there's no gather — a smaller funnel demands a more accurate first putt.
+function s2FunnelStep(b, dt) {
+  const F = S2.funnel;
+  if (funnelHas(F, b.x, b.y)) { b.vx += (F.cx - b.x) * F.k * dt; b.vy += (F.cy - b.y) * F.k * dt; }
+  const fr = Math.exp(-1.7 * dt); b.vx *= fr; b.vy *= fr;
+  const sp = Math.hypot(b.vx, b.vy), vmax = 560; if (sp > vmax) { b.vx *= vmax / sp; b.vy *= vmax / sp; }
+  b.x += b.vx * dt; b.y += b.vy * dt;
+  const m = 48;
+  if (b.x < m) { b.x = m; b.vx = Math.abs(b.vx) * 0.7; }
+  if (b.x > W - m) { b.x = W - m; b.vx = -Math.abs(b.vx) * 0.7; }
+  if (b.y < m) { b.y = m; b.vy = Math.abs(b.vy) * 0.7; }
+  if (b.y > H - m) { b.y = H - m; b.vy = -Math.abs(b.vy) * 0.7; }
+  return Math.hypot(S2.cup.x - b.x, S2.cup.y - b.y) < S2.cup.r + 3 && sp < 170;   // holed?
+}
+
+function update(dt) {
+  const b = st.ball;
+  st.t += dt;
+  // squash always decays (game.js pattern: squash *= exp(-10 dt))
+  b.squash *= Math.exp(-10 * dt);
+
+  if (st.phase === PHASE.S1_ROLL) {
+    const dur = 2.0, u = Math.min(st.t / dur, 1), e = easeOut(u);
+    const p = quadBezier(S1.tee, S1.ctrl, S1.firstPin, e);   // dogleg descent down the ridge
+    b.x = p.x; b.y = p.y;
+    if (u >= 1) { st.phase = PHASE.DESCEND; st.t = 0; }
+  }
+  else if (st.phase === PHASE.DESCEND) {
+    const dur = 0.55; st.fade = Math.min(st.t / dur, 1);
+    if (st.fade >= 1) {
+      // seed the drop onto the valley tee pedestal
+      st.phase = PHASE.DROP; st.t = 0;
+      b.x = S2.tee.x; b.y = S2.tee.y; b.vx = 0; b.vy = 0;
+      b.z = DROP_H; b.vz = 0; st.reboundsDone = 0;
+      st.strokes = 2;
+    }
+  }
+  else if (st.phase === PHASE.DROP) {
+    // ballistic z integration mirroring the ramp/airborne code in shared.js
+    b.z += b.vz * dt;
+    b.vz -= RAMP_GRAVITY * dt;
+    if (b.z <= 0) {                       // touchdown on the tee
+      b.z = 0;
+      const impact = Math.abs(b.vz);
+      if (st.reboundsDone < BOUNCES) {
+        b.vz = impact * REST;             // rebound upward, decayed
+        st.reboundsDone++;
+        b.squash = Math.min(0.6, 0.15 + impact / 900);
+        tick(impact);
+      } else {
+        b.vz = 0; b.squash = 0.35; tick(impact);
+        st.phase = PHASE.S2_TEE; st.t = 0;   // parked on the tee (funnel-immune)
+      }
+    }
+  }
+  else if (st.phase === PHASE.S2_TEE) {
+    if (st.t > 0.85) {                    // take the first shot: putt OFF the tee toward the cup
+      const dx = S2.cup.x - b.x, dy = S2.cup.y - b.y, d = Math.hypot(dx, dy) || 1;
+      b.vx = dx / d * 400; b.vy = dy / d * 400;   // firmer putt to reach the tighter funnel
+      st.phase = PHASE.S2_FUNNEL; st.t = 0; st.strokes = 3;
+    }
+  }
+  else if (st.phase === PHASE.S2_FUNNEL) {
+    if (s2FunnelStep(b, dt)) { b.vx = 0; b.vy = 0; b.x = S2.cup.x; b.y = S2.cup.y; st.phase = PHASE.DONE; st.t = 0; }
+  }
+  else if (st.phase === PHASE.DONE) {
+    if (st.t > 1.8) reset();               // loop
+  }
+}
+
+// ---- soft bounce tick (WebAudio, optional feel) ----
+let actx = null;
+function tick(impact) {
+  try {
+    actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+    const o = actx.createOscillator(), g = actx.createGain();
+    o.frequency.value = 220 + Math.min(impact, 700) * 0.25;
+    g.gain.value = 0.0001;
+    o.connect(g); g.connect(actx.destination);
+    const now = actx.currentTime;
+    g.gain.exponentialRampToValueAtTime(Math.min(0.14, 0.03 + impact/4000), now + 0.005);
+    g.gain.exponentialRampToValueAtTime(0.0001, now + 0.12);
+    o.start(now); o.stop(now + 0.13);
+  } catch (e) {}
+}
+
+// ---------- rendering ----------
+function grass(x0, y0, w, h, hue) {
+  const g = ctx.createLinearGradient(0, y0, 0, y0 + h);
+  g.addColorStop(0, hue[0]); g.addColorStop(1, hue[1]);
+  ctx.fillStyle = g; ctx.fillRect(x0, y0, w, h);
+  // faint mow stripes
+  ctx.globalAlpha = 0.05; ctx.fillStyle = '#ffffff';
+  for (let sx = x0; sx < x0 + w; sx += 46) ctx.fillRect(sx, y0, 23, h);
+  ctx.globalAlpha = 1;
+}
+function walls(list) {
+  ctx.strokeStyle = '#2f5d3a'; ctx.lineWidth = 10; ctx.lineCap = 'round';
+  ctx.strokeStyle = '#e9e4d0';
+  for (const [x1,y1,x2,y2] of list) {
+    ctx.beginPath(); ctx.moveTo(x1,y1); ctx.lineTo(x2,y2); ctx.stroke();
+  }
+}
+function firstPinMarker(x, y, phase) {
+  // distinct from the real cup: a glowing amber ring + chevron "drop here"
+  ctx.save();
+  const pulse = 0.5 + 0.5 * Math.sin(phase * 4);
+  ctx.strokeStyle = 'rgba(255,196,84,' + (0.55 + 0.35*pulse) + ')';
+  ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.arc(x, y, 15, 0, Math.PI*2); ctx.stroke();
+  ctx.beginPath(); ctx.arc(x, y, 9 + pulse*3, 0, Math.PI*2); ctx.stroke();
+  // downward chevrons
+  ctx.fillStyle = 'rgba(255,196,84,0.9)';
+  for (let i = 0; i < 2; i++) {
+    const yy = y + 22 + i*8;
+    ctx.beginPath();
+    ctx.moveTo(x-7, yy); ctx.lineTo(x, yy+6); ctx.lineTo(x+7, yy);
+    ctx.lineTo(x+7, yy+3); ctx.lineTo(x, yy+9); ctx.lineTo(x-7, yy+3);
+    ctx.closePath(); ctx.fill();
+  }
+  ctx.restore();
+}
+function cupAndFlag(cup, phase) {
+  ctx.save();
+  // cup shadow + hole (mirrors draw.js drawHoleAndFlag structure)
+  const rg = ctx.createRadialGradient(cup.x, cup.y, 0, cup.x, cup.y, cup.r + 6);
+  rg.addColorStop(0, 'rgba(0,0,0,0.75)'); rg.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = rg;
+  ctx.beginPath(); ctx.arc(cup.x, cup.y, cup.r + 6, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#111';
+  ctx.beginPath(); ctx.arc(cup.x, cup.y, cup.r, 0, Math.PI*2); ctx.fill();
+  // flag
+  const top = cup.y - 46;
+  ctx.strokeStyle = '#eee'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(cup.x, cup.y - 4); ctx.lineTo(cup.x, top); ctx.stroke();
+  const flutter = Math.sin(phase * 3) * 3;
+  ctx.fillStyle = '#e6483f';
+  ctx.beginPath();
+  ctx.moveTo(cup.x, top); ctx.lineTo(cup.x + 26, top + 6 + flutter);
+  ctx.lineTo(cup.x, top + 13); ctx.closePath(); ctx.fill();
+  ctx.restore();
+}
+function drawBallShadow(x, y, z) {
+  const shrink = Math.max(0.45, 1 - z / 600);
+  const alpha = 0.28 * Math.max(0.4, 1 - z / 420);   // gentle fade with height (cue)
+  ctx.fillStyle = 'rgba(0,0,0,' + alpha.toFixed(3) + ')';
+  ctx.beginPath();
+  ctx.ellipse(x, y + 2, BALL_RADIUS * shrink, BALL_RADIUS * 0.55 * shrink, 0, 0, Math.PI*2);
+  ctx.fill();
+}
+function drawBall(b) {
+  const zh = b.z || 0;
+  if (zh > 0) drawBallShadow(b.x, b.y, zh);
+  ctx.save();
+  ctx.translate(b.x, b.y - zh * 0.35);
+  const airScale = 1 + zh / 260;
+  ctx.scale(airScale, airScale);
+  const stretch = b.squash || 0;
+  ctx.scale(1 + stretch * 0.5, 1 - stretch * 0.35);
+  // ball body
+  const g = ctx.createRadialGradient(-2.4, -2.6, 1, 0, 0, BALL_RADIUS + 1);
+  g.addColorStop(0, '#ffffff'); g.addColorStop(1, '#c9d2dc');
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(0, 0, BALL_RADIUS, 0, Math.PI*2); ctx.fill();
+  ctx.strokeStyle = 'rgba(40,50,60,0.55)'; ctx.lineWidth = 1;
+  ctx.stroke();
+  ctx.restore();
+}
+
+// ---- decor ----
+function drawSnowcaps() {
+  ctx.save();
+  ctx.fillStyle = 'rgba(240,245,252,0.94)';
+  ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(800, 0); ctx.lineTo(800, 44);
+  ctx.lineTo(760,58); ctx.lineTo(700,40); ctx.lineTo(640,60); ctx.lineTo(560,42);
+  ctx.lineTo(480,64); ctx.lineTo(400,44); ctx.lineTo(320,62); ctx.lineTo(240,40);
+  ctx.lineTo(160,60); ctx.lineTo(80,44); ctx.lineTo(0,58); ctx.closePath(); ctx.fill();
+  ctx.fillStyle = 'rgba(181,206,231,0.4)'; ctx.fillRect(0, 44, 800, 5);
+  ctx.restore();
+}
+function drawBoulder(x, y, r) {
+  ctx.save();
+  ctx.fillStyle = 'rgba(0,0,0,0.25)'; ctx.beginPath(); ctx.ellipse(x, y + r*0.5, r*1.05, r*0.5, 0, 0, Math.PI*2); ctx.fill();
+  const g = ctx.createRadialGradient(x - r*0.4, y - r*0.4, r*0.2, x, y, r);
+  g.addColorStop(0, '#9aa3ac'); g.addColorStop(1, '#5c646d');
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI*2); ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.12)'; ctx.lineWidth = 1; ctx.stroke();
+  ctx.restore();
+}
+function drawPine(x, y, s) {
+  ctx.save(); ctx.translate(x, y); ctx.scale(s, s);
+  ctx.fillStyle = 'rgba(0,0,0,0.22)'; ctx.beginPath(); ctx.ellipse(0, 2, 12, 4, 0, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#3c5a3a';
+  for (let i = 0; i < 3; i++) { const yy = -i*11; ctx.beginPath(); ctx.moveTo(0, yy-22); ctx.lineTo(13-i*2, yy+2); ctx.lineTo(-13+i*2, yy+2); ctx.closePath(); ctx.fill(); }
+  ctx.fillStyle = '#5a4632'; ctx.fillRect(-2, 2, 4, 6);
+  ctx.restore();
+}
+function drawStream() {
+  ctx.save(); const t = performance.now()/1000;
+  ctx.fillStyle = 'rgba(90,170,220,0.32)';
+  ctx.beginPath(); ctx.moveTo(0, 500);
+  for (let x = 0; x <= 800; x += 40) ctx.lineTo(x, 454 + Math.sin(x*0.02 + t)*5);
+  ctx.lineTo(800, 500); ctx.closePath(); ctx.fill();
+  ctx.restore();
+}
+function drawFlower(x, y, hue) {
+  ctx.save(); ctx.fillStyle = hue;
+  for (let i = 0; i < 4; i++) { const a = i*Math.PI/2; ctx.beginPath(); ctx.arc(x + Math.cos(a)*2.4, y + Math.sin(a)*2.4, 2, 0, Math.PI*2); ctx.fill(); }
+  ctx.fillStyle = '#ffe08a'; ctx.beginPath(); ctx.arc(x, y, 1.6, 0, Math.PI*2); ctx.fill();
+  ctx.restore();
+}
+
+function drawStage1() {
+  grass(0, 0, W, H, ['#6b7a89', '#49525d']);   // alpine slate rock
+  drawSnowcaps();
+  ctx.strokeStyle = 'rgba(255,255,255,0.05)'; ctx.lineWidth = 1;   // scree / contour hints
+  for (let i = 0; i < 5; i++) { ctx.beginPath(); ctx.moveTo(0, 130 + i*70); ctx.quadraticCurveTo(400, 108 + i*70, 800, 148 + i*70); ctx.stroke(); }
+  for (const bo of S1.boulders) drawBoulder(bo.x, bo.y, bo.r);
+  for (const p of S1.pines) drawPine(p.x, p.y, p.s);
+  walls(S1.walls);
+  const vg = ctx.createRadialGradient(770, 470, 10, 770, 470, 180);   // cliff void beyond the ledge
+  vg.addColorStop(0, 'rgba(0,0,0,0.5)'); vg.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = vg; ctx.fillRect(560, 320, 240, 160);
+  firstPinMarker(S1.firstPin.x, S1.firstPin.y, st.t + performance.now()/1000);
+  ctx.fillStyle = 'rgba(255,255,255,0.6)'; ctx.beginPath(); ctx.arc(S1.tee.x, S1.tee.y, 3, 0, Math.PI*2); ctx.fill();
+}
+function drawFunnel(F) {   // nested elliptical contour rings — the bowl; shape/size vary per hole
+  ctx.save(); ctx.translate(F.cx, F.cy); ctx.rotate(F.rot || 0);
+  ctx.strokeStyle = 'rgba(255,255,255,0.08)'; ctx.lineWidth = 1.5;
+  const rings = 7;
+  for (let i = rings; i >= 1; i--) { const k = i / rings; ctx.beginPath(); ctx.ellipse(0, 0, F.rx * k, F.ry * k, 0, 0, Math.PI*2); ctx.stroke(); }
+  ctx.restore();
+}
+function drawStage2() {
+  grass(0, 0, W, H, ['#5aa64f', '#3c7a3f']);   // warm valley meadow
+  drawStream();
+  drawFunnel(S2.funnel);
+  for (const f of S2.flowers) drawFlower(f.x, f.y, f.h);
+  walls(S2.walls);
+  cupAndFlag(S2.cup, performance.now()/1000);
+  drawTee(S2.tee.x, S2.tee.y);
+}
+
+function label(text, sub) {
+  ctx.save();
+  ctx.fillStyle = 'rgba(0,0,0,0.42)';
+  ctx.fillRect(0, 0, W, 40);
+  ctx.fillStyle = '#fff'; ctx.font = '600 17px system-ui, sans-serif';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, 16, 20);
+  if (sub) {
+    ctx.fillStyle = 'rgba(255,255,255,0.7)'; ctx.font = '500 13px system-ui, sans-serif';
+    ctx.textAlign = 'right'; ctx.fillText(sub, W - 16, 20); ctx.textAlign = 'left';
+  }
+  ctx.restore();
+}
+
+function render() {
+  ctx.clearRect(0, 0, W, H);
+  const b = st.ball;
+
+  if (st.phase === PHASE.S1_ROLL) {
+    drawStage1(); drawBall(b);
+    label('Hole 1 · The Great Descent', 'Par 4 · down the mountain to the ledge');
+  }
+  else if (st.phase === PHASE.DESCEND) {
+    drawStage1(); drawBall(b);
+    // crossfade to the valley + darkened shaft, reads as "dropping off the cliff"
+    ctx.save(); ctx.globalAlpha = st.fade; drawStage2(); ctx.restore();
+    ctx.fillStyle = 'rgba(0,0,0,' + (0.35 * (1 - Math.abs(st.fade-0.5)*2)).toFixed(3) + ')';
+    ctx.fillRect(0,0,W,H);
+    label('▼ Off the cliff, into the valley', '');
+  }
+  else if (st.phase === PHASE.DROP) {
+    drawStage2(); drawBall(b);
+    label('Stage 2 · Drop onto the tee', 'bounce ' + st.reboundsDone + ' / ' + BOUNCES);
+  }
+  else if (st.phase === PHASE.S2_TEE) {
+    drawStage2(); drawBall(b);
+    label('Stage 2 · On the tee', 'the fixed-optimal spot — funnel-immune');
+  }
+  else if (st.phase === PHASE.S2_FUNNEL) {
+    drawStage2(); drawBall(b);
+    label('Stage 2 · The funnel green', 'gathering down to the cup');
+  }
+  else { // DONE
+    drawStage2();
+    ctx.save();
+    ctx.beginPath(); ctx.arc(S2.cup.x, S2.cup.y, S2.cup.r-1, 0, Math.PI*2); ctx.clip();
+    drawBall({ x: S2.cup.x, y: S2.cup.y, z: 0, squash: 0.2 });
+    ctx.restore();
+    label('Holed · Par 4', 'The Great Descent — looping…');
+  }
+}
+
+// ==================================================================
+//  SHIELD LAB — prototype of the one-time Stage-2 collision shield
+// ==================================================================
+// Rule: every player drops to the SAME fixed-optimal spot, so their balls stack.
+// Each player's first Stage-2 shot is SHIELDED = ghost vs other balls (no collision),
+// so the stack doesn't scramble. Shield deactivates on the FIRST of: (a) that player
+// putts, or (b) their ball is struck by another ball (absorbs the hit, then pops).
+const HUES = ['#ff5a5a', '#ffd23f', '#4fd0ff', '#8aff5a', '#c77dff'];
+// Side-by-side value demo: identical drop into the SAME optimal spot, run twice —
+// LEFT without the shield (engine collision bumps players off the spot), RIGHT with
+// KingLuiIV (they keep the optimal spot, then all play a clean first shot at once).
+const FIELD = { w: 330, h: 380, drop: { x: 108, y: 116 }, cup: { x: 220, y: 268, r: 11 },
+                funnel: { cx: 220, cy: 268, radius: 150, strength: 470 } };
+const PANELS = [
+  { ox: 44,  oy: 74, shielded: false, frame: 'rgba(232,120,92,0.9)',
+    title: 'WITHOUT shield', sub: 'collision bumps players off the optimal spot' },
+  { ox: 430, oy: 74, shielded: true,  frame: 'rgba(96,186,255,0.95)',
+    title: 'WITH KingLuiIV', sub: 'everyone keeps the optimal spot, then plays clean' },
+];
+let shieldPlayerCount = 4;
+let LAB = null;
+// Tick-perfect: mirror the real sim clock (shared.js TICK_HZ = 60). Durations are in TICKS.
+const S_TICK_HZ = 60, S_TICK_DT = 1 / S_TICK_HZ;
+const SHIELD_NAME = 'KingLuiIV';
+let SHIELD_TICKS = 68;          // KingLuiIV lifetime = 1.14s @ 60Hz → 68.4 → 68 ticks (tick-perfect). Ends early on putt/struck.
+const GRACE_TICKS = 12;         // post-pop immunity (~0.2s): avoids re-collision instantly after impact
+let shieldAccum = 0;            // real-time accumulator → fixed 60Hz ticks
+
+function labMakeBalls(n, seeds) {
+  return seeds.map((s, i) => ({
+    hue: HUES[i % HUES.length],
+    x: FIELD.drop.x + s.ox, y: FIELD.drop.y + s.oy,
+    vx: 0, vy: 0, z: s.z, vz: 0, squash: 0, landed: false,
+    shieldActive: true, used: false, holed: false, order: i,
+    shieldTicks: SHIELD_TICKS, graceTicks: 0,
+  }));
+}
+function labReset(n) {
+  // deterministic seeds → both panels get IDENTICAL inputs; only the shield differs
+  const seeds = [];
+  // every player drops to the EXACT same spot (Drop Clause); only the z-stagger differs so
+  // they cascade in. Shielded → they stay perfectly co-located; unshielded → collision scatters.
+  for (let i = 0; i < n; i++) seeds.push({ ox: 0, oy: 0, z: DROP_H + i * 16 });
+  LAB = { tick: 0, phase: 'drop', phaseTick: 0, msg: '', sims: PANELS.map(p => ({ panel: p, balls: labMakeBalls(n, seeds) })) };
+}
+
+// Ball-ball collision. Base is the real engine's elastic resolve (shared.js:1750, e=0.92);
+// the extra `overlap*KICK` term is a demo-only "pile-up squirt" so a stack of balls dropped
+// on one point visibly scatters — that scatter is exactly what the shield prevents.
+const KICK = 20;
+function ballBall(a, b) {
+  if ((a.z || 0) > 0 || (b.z || 0) > 0) return false;   // airborne pass-over
+  const dx = b.x - a.x, dy = b.y - a.y, minD = BALL_RADIUS * 2;
+  let dist = Math.hypot(dx, dy), nx, ny;
+  if (dist < 1e-4) {                                     // co-located (all dropped to the SAME spot):
+    const ang = ((a.order || 0) + (b.order || 0) + 1) * 2.39996323;  // deterministic golden-angle scatter axis
+    nx = Math.cos(ang); ny = Math.sin(ang); dist = 0;
+  } else {
+    if (dist >= minD) return false;
+    nx = dx / dist; ny = dy / dist;
+  }
+  const overlap = (minD - dist) / 2;
+  a.x -= nx * overlap; a.y -= ny * overlap; b.x += nx * overlap; b.y += ny * overlap;
+  const rel = (b.vx - a.vx) * nx + (b.vy - a.vy) * ny;
+  const e = 0.92, j = (1 + e) * Math.max(0, -rel) / 2 + overlap * KICK;
+  a.vx -= j * nx; a.vy -= j * ny; b.vx += j * nx; b.vy += j * ny;
+  return true;
+}
+
+// ground motion in a panel's LOCAL coords: friction + walls. The drop lands players on the
+// TEE pedestal (the fixed-optimal spot) — a flat platform that does NOT feed the funnel, so
+// balls hold their exact spot until they're putted off the tee. (No funnel/holing in this
+// positional demo; the tee is what keeps the stacked balls parked on the optimal spot.)
+function labStepGround(b) {
+  const fr = Math.exp(-2.5 * S_TICK_DT); b.vx *= fr; b.vy *= fr;
+  b.x += b.vx * S_TICK_DT; b.y += b.vy * S_TICK_DT;
+  const m = 13;
+  if (b.x < m) { b.x = m; b.vx = Math.abs(b.vx) * 0.6; }
+  if (b.x > FIELD.w - m) { b.x = FIELD.w - m; b.vx = -Math.abs(b.vx) * 0.6; }
+  if (b.y < m) { b.y = m; b.vy = Math.abs(b.vy) * 0.6; }
+  if (b.y > FIELD.h - m) { b.y = FIELD.h - m; b.vy = -Math.abs(b.vy) * 0.6; }
+}
+
+// one fixed 60Hz sim tick, run on BOTH panels — everything here is tick-perfect
+function labTick() {
+  if (!LAB) labReset(shieldPlayerCount);
+  LAB.tick++;
+  let anyAir = false;
+  for (const sim of LAB.sims) {
+    const shielded = sim.panel.shielded;
+    for (const b of sim.balls) {
+      if (b.z > 0) {                                     // the drop-in fall (ballistic z)
+        anyAir = true;
+        b.z += b.vz * S_TICK_DT; b.vz -= RAMP_GRAVITY * S_TICK_DT;
+        if (b.z <= 0) { b.z = 0; b.vz = 0; b.landed = true; b.squash = 0.4; }
+      }
+      b.squash *= Math.exp(-10 * S_TICK_DT);
+      if (b.graceTicks > 0) b.graceTicks--;
+      if (shielded && b.landed && b.shieldActive) {      // KingLuiIV lifetime counts down in ticks
+        if (b.shieldTicks > 0) b.shieldTicks--;
+        if (b.shieldTicks <= 0) { b.shieldActive = false; b.graceTicks = GRACE_TICKS; }
+      }
+      if (b.landed && (b.z || 0) <= 0 && !b.holed) labStepGround(b);
+    }
+    // ball-ball collisions among grounded balls; shielded/grace balls are immune (ghost)
+    const g = sim.balls.filter(b => b.landed && (b.z || 0) <= 0 && !b.holed);
+    for (let i = 0; i < g.length; i++) for (let k = i + 1; k < g.length; k++) {
+      const a = g[i], b = g[k];
+      if (shielded && (a.shieldActive || a.graceTicks > 0 || b.shieldActive || b.graceTicks > 0)) continue;
+      ballBall(a, b);
+    }
+  }
+  // timeline (tick-perfect): drop onto the tee → settle (scramble vs held stack) → loop.
+  // Loop fires once every shielded ball's KingLuiIV has expired, before the stack breaks up.
+  if (LAB.phase === 'drop' && !anyAir && LAB.tick > 20) {
+    LAB.phase = 'settle'; LAB.phaseTick = LAB.tick;
+  } else if (LAB.phase === 'settle') {
+    const held = LAB.tick - LAB.phaseTick;
+    const shieldedSim = LAB.sims.find(s => s.panel.shielded);
+    const anyShieldLeft = shieldedSim.balls.some(b => b.shieldActive);
+    LAB.msg = held < 30 ? 'four players drop onto the same TEE — the fixed-optimal spot'
+      : anyShieldLeft ? 'WITHOUT shield they get bumped off the tee — KingLuiIV keeps everyone on it'
+      : 'KingLuiIV expired (68 ticks) — take your first shot before it does';
+    if (!anyShieldLeft) { LAB.expireHold = (LAB.expireHold || 0) + 1; if (LAB.expireHold > 3) labReset(shieldPlayerCount); }
+  }
+}
+
+function roundRectPath(x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+// the TEE pedestal at the fixed-optimal drop: a flat raised pad the ball rests on, immune
+// to the funnel until it's putted off — the literal "optimal starting spot" of the Drop Clause
+function drawTee(cx, cy) {
+  ctx.save();
+  const rx = 12, ry = 6, h = 9;                          // smaller cap, raised on a short pedestal
+  ctx.fillStyle = 'rgba(0,0,0,0.26)';                    // ground shadow at the pedestal base
+  ctx.beginPath(); ctx.ellipse(cx, cy + h + 3, rx + 2, ry - 1, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#8b9659';                             // pedestal column
+  ctx.fillRect(cx - rx, cy, rx * 2, h);
+  ctx.fillStyle = '#79834b';                             // base rim (darker)
+  ctx.beginPath(); ctx.ellipse(cx, cy + h, rx, ry, 0, 0, Math.PI * 2); ctx.fill();
+  const g = ctx.createRadialGradient(cx - 3, cy - 3, 1, cx, cy, rx);  // raised cap (lighter)
+  g.addColorStop(0, '#eef1d6'); g.addColorStop(1, '#bcc790');
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.5)'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2); ctx.stroke();
+  ctx.fillStyle = 'rgba(60,70,40,0.6)'; ctx.font = '700 7px system-ui, sans-serif';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText('TEE', cx, cy);
+  ctx.textAlign = 'left';
+  ctx.restore();
+}
+
+// draw a ball in the CURRENT (already panel-translated) coord space, with z-loft + shadow
+function drawBallLocal(b, opt) {
+  opt = opt || {};
+  const scale = opt.scale == null ? 1 : opt.scale;
+  const oy = opt.offsetY || 0;
+  const op = opt.opacity == null ? 1 : opt.opacity;
+  const zh = b.z || 0, shrink = Math.max(0.45, 1 - zh / 600);
+  ctx.save();
+  ctx.globalAlpha = op * 0.30;                           // ground-anchored shadow "lie"
+  ctx.fillStyle = '#000';
+  ctx.beginPath();
+  ctx.ellipse(b.x, b.y + oy + 2, BALL_RADIUS * scale * shrink, BALL_RADIUS * 0.55 * scale * shrink, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.globalAlpha = op;
+  ctx.translate(b.x, b.y + oy - zh * 0.35);
+  const s2 = scale * (1 + zh / 260); ctx.scale(s2, s2);
+  const st = b.squash || 0; ctx.scale(1 + st * 0.5, 1 - st * 0.35);
+  const g = ctx.createRadialGradient(-2.4, -2.6, 1, 0, 0, BALL_RADIUS + 1);
+  g.addColorStop(0, '#ffffff'); g.addColorStop(1, b.hue);
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(0, 0, BALL_RADIUS, 0, Math.PI * 2); ctx.fill();
+  ctx.lineWidth = 1; ctx.strokeStyle = 'rgba(30,40,50,0.5)'; ctx.stroke();
+  if (opt.blueOutline) {                                 // active KingLuiIV ball on top of the stack
+    ctx.lineWidth = 5; ctx.strokeStyle = 'rgba(90,180,255,0.22)';
+    ctx.beginPath(); ctx.arc(0, 0, BALL_RADIUS + 4.5, 0, Math.PI * 2); ctx.stroke();
+    ctx.lineWidth = 2.4; ctx.strokeStyle = 'rgba(96,186,255,0.95)';
+    ctx.beginPath(); ctx.arc(0, 0, BALL_RADIUS + 2.5, 0, Math.PI * 2); ctx.stroke();
+  }
+  ctx.restore();
+}
+// shielded resting balls at the drop render as a depth stack; everything else renders flat
+function drawPanelBalls(sim) {
+  const stack = [], freeb = [];
+  for (const b of sim.balls) {
+    const resting = b.landed && (b.z || 0) <= 0.5 && Math.hypot(b.vx, b.vy) < 3;
+    const inStack = sim.panel.shielded && b.shieldActive && resting &&
+                    Math.hypot(b.x - FIELD.drop.x, b.y - FIELD.drop.y) < 18;
+    (inStack ? stack : freeb).push(b);
+  }
+  stack.sort((a, b) => a.order - b.order);
+  for (const b of freeb) drawBallLocal(b, {});
+  for (let d = stack.length - 1; d >= 0; d--) {          // deepest first, blue-outline top last
+    const scale = d === 0 ? 1 : Math.max(0.4, 0.8 - (d - 1) * 0.1);
+    const opacity = d === 0 ? 1 : Math.max(0.35, 0.85 - (d - 1) * 0.15);
+    drawBallLocal(stack[d], { scale, offsetY: d * 4, opacity, blueOutline: d === 0 });
+  }
+}
+
+function labRender() {
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = '#0e1116'; ctx.fillRect(0, 0, W, H);
+  for (const sim of LAB.sims) {
+    const P = sim.panel;
+    ctx.save();
+    ctx.translate(P.ox, P.oy);
+    const g = ctx.createLinearGradient(0, 0, 0, FIELD.h);   // same green in both — only the shield differs
+    g.addColorStop(0, '#3c7f8a'); g.addColorStop(1, '#2c5f6e');
+    ctx.fillStyle = g; roundRectPath(0, 0, FIELD.w, FIELD.h, 10); ctx.fill();
+    ctx.save(); roundRectPath(0, 0, FIELD.w, FIELD.h, 10); ctx.clip();
+    ctx.strokeStyle = 'rgba(255,255,255,0.09)'; ctx.lineWidth = 1.5;   // funnel contour rings
+    for (let r = FIELD.funnel.radius; r > 16; r -= 22) {
+      ctx.beginPath(); ctx.arc(FIELD.funnel.cx, FIELD.funnel.cy, r, 0, Math.PI * 2); ctx.stroke();
+    }
+    cupAndFlag(FIELD.cup, performance.now() / 1000);
+    drawTee(FIELD.drop.x, FIELD.drop.y);                 // the fixed-optimal tee pedestal
+    drawPanelBalls(sim);
+    ctx.restore();
+    ctx.strokeStyle = P.frame; ctx.lineWidth = 2; roundRectPath(0, 0, FIELD.w, FIELD.h, 10); ctx.stroke();
+    ctx.fillStyle = '#fff'; ctx.font = '700 14px system-ui, sans-serif'; ctx.textBaseline = 'alphabetic';
+    ctx.fillText(P.title, 2, -26);
+    ctx.fillStyle = 'rgba(255,255,255,0.62)'; ctx.font = '500 11px system-ui, sans-serif';
+    ctx.fillText(P.sub, 2, -11);
+    ctx.restore();
+  }
+  label('🛡 ' + SHIELD_NAME + ' — why the shield matters', LAB.msg || 'dropping to the optimal spot…');
+}
+
+// ---- main loop ----
+let MODE = 'hole';
+let last = performance.now();
+function frame(ts) {
+  let dt = Math.min((ts - last) / 1000, 1/30);
+  last = ts;
+  if (MODE === 'shield') {
+    shieldAccum += dt;                                   // fixed 60Hz stepping → tick-perfect
+    let steps = 0;
+    while (shieldAccum >= S_TICK_DT && steps < 8) { labTick(); shieldAccum -= S_TICK_DT; steps++; }
+    labRender();
+  } else { update(dt); render(); }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// ---- controls ----
+const status = document.getElementById('status');
+document.getElementById('restart').onclick = () => {
+  if (MODE === 'shield') { labReset(shieldPlayerCount); shieldAccum = 0; } else reset();
+  last = performance.now();
+};
+
+function bindRange(id, valId, set, fmt) {
+  const s = document.getElementById(id), v = document.getElementById(valId);
+  s.oninput = () => { set(parseFloat(s.value)); v.textContent = fmt(parseFloat(s.value)); };
+}
+bindRange('s-drop', 'v-drop', x => DROP_H = x, x => x.toFixed(0));
+bindRange('s-rest', 'v-rest', x => REST = x, x => x.toFixed(2));
+bindRange('s-bounce', 'v-bounce', x => BOUNCES = x, x => x.toFixed(0));
+bindRange('s-grav', 'v-grav', x => RAMP_GRAVITY = x, x => x.toFixed(0));
+
+// ---- mode toggle + shield-lab controls ----
+const modeHoleBtn = document.getElementById('mode-hole');
+const modeShieldBtn = document.getElementById('mode-shield');
+const shieldControls = document.getElementById('shield-controls');
+function setMode(m) {
+  MODE = m;
+  modeHoleBtn.dataset.on = m === 'hole' ? '1' : '0';
+  modeShieldBtn.dataset.on = m === 'shield' ? '1' : '0';
+  shieldControls.classList.toggle('on', m === 'shield');
+  if (m === 'shield') { labReset(shieldPlayerCount); shieldAccum = 0; } else reset();
+  last = performance.now();
+  status.textContent = '';
+}
+modeHoleBtn.onclick = () => setMode('hole');
+modeShieldBtn.onclick = () => setMode('shield');
+bindRange('s-players', 'v-players', x => { shieldPlayerCount = x | 0; labReset(shieldPlayerCount); }, x => (x | 0).toString());
+bindRange('s-shieldticks', 'v-shieldticks', x => { SHIELD_TICKS = x | 0; labReset(shieldPlayerCount); },
+  x => (x | 0) + ' · ' + ((x | 0) / 60).toFixed(2) + 's');
+
+// ---- recorder (Safari records mp4; Chrome webm) ----
+let rec = null, chunks = [];
+const recBtn = document.getElementById('rec');
+recBtn.onclick = () => {
+  if (rec && rec.state === 'recording') { rec.stop(); return; }
+  const stream = canvas.captureStream(60);
+  const types = ['video/mp4', 'video/webm;codecs=vp9', 'video/webm'];
+  const mime = types.find(t => window.MediaRecorder && MediaRecorder.isTypeSupported(t)) || '';
+  try { rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined); }
+  catch (e) { status.textContent = 'Recording unsupported: ' + e.message; return; }
+  chunks = [];
+  rec.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+  rec.onstop = () => {
+    const blob = new Blob(chunks, { type: rec.mimeType || mime || 'video/webm' });
+    const ext = (rec.mimeType || mime).includes('mp4') ? 'mp4' : 'webm';
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'topdown-drop.' + ext;
+    a.click();
+    recBtn.dataset.on = '0'; recBtn.textContent = '● Record clip';
+    status.textContent = 'Saved topdown-drop.' + ext;
+  };
+  if (MODE === 'shield') { labReset(shieldPlayerCount); shieldAccum = 0; } else reset();
+  last = performance.now();
+  rec.start();
+  recBtn.dataset.on = '1'; recBtn.textContent = '■ Stop & save';
+  status.textContent = 'Recording…';
+};
+
+// ---- deep link: preview-topdown.html#shield3 opens the lab with 3 players + auto-demo ----
+(function initFromHash() {
+  const m = (location.hash || '').match(/^#shield(\d)?/);
+  if (!m) return;
+  if (m[1]) {
+    shieldPlayerCount = Math.max(2, Math.min(5, +m[1]));
+    document.getElementById('s-players').value = shieldPlayerCount;
+    document.getElementById('v-players').textContent = String(shieldPlayerCount);
+  }
+  setMode('shield');
+})();
+</script>
+</body>
+</html>

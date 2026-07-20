@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Top Down · Stage-1 tee shots (Holes 2–19)</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: #0d1014; color: #e8edf2;
+    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif; }
+  header { padding: 22px 20px 6px; }
+  h1 { font-size: 17px; font-weight: 650; margin: 0; }
+  header p { color: #8792a0; margin: 6px 0 0; font-size: 13px; max-width: 900px; }
+  .grid { display: grid; gap: 16px; padding: 18px 20px 48px;
+    grid-template-columns: repeat(auto-fill, minmax(288px, 1fr)); }
+  figure { margin: 0; background: #141922; border: 1px solid rgba(255,255,255,.07);
+    border-radius: 12px; overflow: hidden; box-shadow: 0 8px 24px rgba(0,0,0,.35); }
+  canvas { width: 100%; display: block; background: #000; }
+  figcaption { padding: 9px 12px 11px; }
+  .cap-top { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+  .name { font-weight: 640; font-size: 14px; }
+  .par { color: #9aa4b1; font-size: 12px; font-variant-numeric: tabular-nums; }
+  .shape { color: #ffc65a; font-size: 11.5px; margin-top: 2px; }
+  .biome { color: #7d8794; font-size: 11px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Top&nbsp;Down · Stage-1 tee shots <span style="color:#7d8794;font-weight:500">— Holes 2–19 mockup</span></h1>
+  <p>The approach half: the ball tees off and rolls its own line — dogleg, S-curve, or sweep — down
+     to the <b>cliff-edge drop marker</b> (amber), where it drops into the Stage-2 green. Each hole
+     has a different path shape, obstacles, and biome. Pairs with the Stage-2 funnel gallery.</p>
+</header>
+<div class="grid" id="grid"></div>
+
+<script>
+"use strict";
+const BALL_R = 5, TILE_W = 300, TILE_H = 200;
+
+const PAL = {
+  meadow:   { g:['#5aa64f','#3c7a3f'], ac:'#7fdcff', dot:'#ffe07a', tree:'#2f5d3a' },
+  desert:   { g:['#d7b268','#a67c3e'], ac:'#f0d79a', dot:'#e08a3d', tree:'#7a9a4a' },
+  tundra:   { g:['#93bccb','#5d8a9c'], ac:'#eaf6fb', dot:'#cfe8f2', tree:'#dff0f5' },
+  volcanic: { g:['#5c4a49','#2f2527'], ac:'#ff6a3d', dot:'#ffb057', tree:'#7a3a2a' },
+  autumn:   { g:['#c1893c','#7f5227'], ac:'#f0c070', dot:'#e2542f', tree:'#8a3f22' },
+  tropical: { g:['#37ad86','#227a60'], ac:'#5ad2ff', dot:'#ffe07a', tree:'#1f6f4f' },
+  twilight: { g:['#5b5b93','#302f57'], ac:'#c77dff', dot:'#ffe07a', tree:'#3a2f6e' },
+  highland: { g:['#7f9d5c','#516d3a'], ac:'#c9d98f', dot:'#e6b3d0', tree:'#3c5a3a' },
+  moss:     { g:['#4f8f63','#2f5f43'], ac:'#9fe6c0', dot:'#ffe07a', tree:'#274c38' },
+  slate:    { g:['#6b7a89','#454e59'], ac:'#dbe6f0', dot:'#a9c7e6', tree:'#3a4a3a' },
+};
+
+// tee → (bezier control) → cliff-edge drop marker. Obstacles: r=rock, t=tree. Path shape varies.
+const HOLES = [
+  { n:2,  name:'Basin',           par:4, biome:'meadow',   tee:{x:55,y:52},  ctrl:{x:95,y:185}, pin:{x:245,y:150}, obs:[['t',150,60],['r',110,120]], shape:'long right sweep' },
+  { n:3,  name:'The Keyhole',     par:4, biome:'slate',    tee:{x:55,y:150}, ctrl:{x:210,y:40}, pin:{x:245,y:145}, obs:[['r',150,95],['r',185,70]], shape:'dogleg over the top' },
+  { n:4,  name:'Tilted Table',    par:5, biome:'highland', tee:{x:55,y:55},  ctrl:{x:60,y:170}, pin:{x:245,y:150}, obs:[['t',120,150],['t',150,170]], shape:'down then across' },
+  { n:5,  name:'Long Valley',     par:5, biome:'autumn',   tee:{x:45,y:100}, ctrl:{x:150,y:60}, pin:{x:250,y:130}, obs:[['t',95,150],['t',210,60]], shape:'S-curve' },
+  { n:6,  name:'Crater',          par:4, biome:'volcanic', tee:{x:55,y:150}, ctrl:{x:150,y:150},pin:{x:245,y:70},  obs:[['r',120,110],['r',175,150]], shape:'low approach, climb' },
+  { n:7,  name:'Pinch',           par:4, biome:'tropical', tee:{x:60,y:55},  ctrl:{x:190,y:100},pin:{x:245,y:150}, obs:[['t',120,110],['t',150,140]], shape:'tight right bend' },
+  { n:8,  name:'The Saucer',      par:5, biome:'meadow',   tee:{x:50,y:150}, ctrl:{x:80,y:55},  pin:{x:250,y:110}, obs:[['t',110,60],['r',175,140]], shape:'up-and-over left' },
+  { n:9,  name:'Rift',            par:4, biome:'slate',    tee:{x:75,y:52},  ctrl:{x:230,y:70}, pin:{x:245,y:155}, obs:[['r',150,120],['r',120,150]], shape:'hug the top rail' },
+  { n:10, name:'Whirlpool',       par:5, biome:'tropical', tee:{x:45,y:100}, ctrl:{x:150,y:185},pin:{x:250,y:100}, obs:[['t',110,60],['t',200,60]], shape:'deep low sweep' },
+  { n:11, name:'The Ladle',       par:4, biome:'autumn',   tee:{x:55,y:150}, ctrl:{x:130,y:45}, pin:{x:245,y:80},  obs:[['t',100,120],['r',185,120]], shape:'scoop up-left' },
+  { n:12, name:'Sidewinder',      par:5, biome:'desert',   tee:{x:48,y:70},  ctrl:{x:150,y:170},pin:{x:250,y:80},  obs:[['r',105,130],['r',195,135]], shape:'double bend' },
+  { n:13, name:'Sinkhole',        par:4, biome:'twilight', tee:{x:60,y:55},  ctrl:{x:130,y:120},pin:{x:245,y:150}, obs:[['t',175,90],['t',140,60]], shape:'gentle diagonal' },
+  { n:14, name:'The Amphitheater',par:5, biome:'highland', tee:{x:45,y:100}, ctrl:{x:150,y:52}, pin:{x:250,y:105}, obs:[['t',95,150],['t',205,150]], shape:'high arc' },
+  { n:15, name:'Gulley',          par:4, biome:'moss',     tee:{x:55,y:150}, ctrl:{x:150,y:150},pin:{x:245,y:75},  obs:[['t',110,110],['t',185,105]], shape:'run the gulley' },
+  { n:16, name:'The Cauldron',    par:5, biome:'volcanic', tee:{x:50,y:60},  ctrl:{x:60,y:175}, pin:{x:250,y:120}, obs:[['r',115,140],['r',150,165]], shape:'plunge then across' },
+  { n:17, name:'Split Level',     par:4, biome:'tundra',   tee:{x:70,y:52},  ctrl:{x:210,y:60}, pin:{x:245,y:150}, obs:[['t',150,110],['r',185,130]], shape:'top rail, drop right' },
+  { n:18, name:'The Maw',         par:5, biome:'twilight', tee:{x:50,y:150}, ctrl:{x:150,y:60}, pin:{x:250,y:150}, obs:[['t',105,90],['t',200,90]], shape:'wide W' },
+  { n:19, name:"Journey's End",   par:5, biome:'tropical', tee:{x:45,y:95},  ctrl:{x:150,y:130},pin:{x:252,y:100}, obs:[['t',100,55],['t',205,150]], shape:'grand finale sweep' },
+];
+
+// tuned launch (aim offset from tee→pin, power) so each shot navigates its obstacles to the pin
+const AIM = { 2:{a:0.24,p:390}, 3:{a:-0.36,p:400}, 4:{a:0.4,p:390}, 5:{a:-0.32,p:400}, 6:{a:0.28,p:380},
+  7:{a:0,p:400}, 8:{a:-0.04,p:400}, 9:{a:0.44,p:390}, 10:{a:-0.4,p:380}, 11:{a:-0.52,p:400}, 12:{a:0.28,p:400},
+  13:{a:-0.08,p:400}, 14:{a:0.6,p:370}, 15:{a:-0.48,p:400}, 16:{a:0,p:400}, 17:{a:-0.04,p:400}, 18:{a:-0.32,p:380}, 19:{a:0.24,p:400} };
+const RREST = 0.7;   // obstacle bounce
+
+const grid = document.getElementById('grid');
+const tiles = [];
+for (const h of HOLES) {
+  const fig = document.createElement('figure');
+  const cv = document.createElement('canvas'); cv.width = TILE_W; cv.height = TILE_H;
+  const cap = document.createElement('figcaption');
+  cap.innerHTML = '<div class="cap-top"><span class="name">' + h.n + '. ' + h.name +
+    '</span><span class="par">Par ' + h.par + '</span></div>' +
+    '<div class="shape">⤳ ' + h.shape + '</div>' +
+    '<div class="biome">' + h.biome + ' ridge</div>';
+  fig.appendChild(cv); fig.appendChild(cap); grid.appendChild(fig);
+  tiles.push({ h, ctx: cv.getContext('2d'), st: null });
+}
+
+const PH = { ROLL:0, ATPIN:1, DROP:2, WAIT:3 };
+function resetTile(t) {
+  const h = t.h, aim = AIM[h.n];
+  const base = Math.atan2(h.pin.y - h.tee.y, h.pin.x - h.tee.x) + aim.a;
+  t.st = { phase: PH.ROLL, tt: 0, drop: 0, trail: [],
+    b: { x: h.tee.x, y: h.tee.y, vx: Math.cos(base) * aim.p, vy: Math.sin(base) * aim.p },
+    obs: h.obs.map(o => ({ x: o[1], y: o[2], r: o[0] === 'r' ? 12 : 9 })) };
+}
+
+function stepTile(t, dt) {
+  const s = t.st, h = t.h; s.tt += dt;
+  if (s.phase === PH.ROLL) {
+    const b = s.b, steps = Math.max(1, Math.ceil(dt / (1/60))), sub = dt / steps;   // substep: no tunneling
+    for (let k = 0; k < steps; k++) {
+      const fr = Math.exp(-1.3 * sub); b.vx *= fr; b.vy *= fr;
+      b.x += b.vx * sub; b.y += b.vy * sub;
+      const m = 14;
+      if (b.x < m) { b.x = m; b.vx = Math.abs(b.vx) * 0.7; }
+      if (b.x > TILE_W - m) { b.x = TILE_W - m; b.vx = -Math.abs(b.vx) * 0.7; }
+      if (b.y < m) { b.y = m; b.vy = Math.abs(b.vy) * 0.7; }
+      if (b.y > TILE_H - m) { b.y = TILE_H - m; b.vy = -Math.abs(b.vy) * 0.7; }
+      for (const o of s.obs) {                                     // circle collision vs rocks/trees
+        const dx = b.x - o.x, dy = b.y - o.y, d = Math.hypot(dx, dy), md = BALL_R + o.r;
+        if (d < md && d > 1e-4) {
+          const nx = dx / d, ny = dy / d, ov = md - d; b.x += nx * ov; b.y += ny * ov;
+          const vn = b.vx * nx + b.vy * ny; if (vn < 0) { b.vx -= (1 + RREST) * vn * nx; b.vy -= (1 + RREST) * vn * ny; }
+        }
+      }
+    }
+    s.trail.push({ x: b.x, y: b.y }); if (s.trail.length > 30) s.trail.shift();
+    if (Math.hypot(h.pin.x - b.x, h.pin.y - b.y) < 11 || s.tt > 4.5) { s.phase = PH.ATPIN; s.tt = 0; }
+  }
+  else if (s.phase === PH.ATPIN) { if (s.tt > 0.5) { s.phase = PH.DROP; s.tt = 0; } }
+  else if (s.phase === PH.DROP) { s.drop = Math.min(s.tt / 0.55, 1); if (s.drop >= 1) { s.phase = PH.WAIT; s.tt = 0; } }
+  else if (s.phase === PH.WAIT) { if (s.tt > 0.7) resetTile(t); }
+}
+
+function drawRock(ctx, x, y) {
+  ctx.save(); ctx.fillStyle = 'rgba(0,0,0,0.25)'; ctx.beginPath(); ctx.ellipse(x, y+5, 12, 5, 0, 0, Math.PI*2); ctx.fill();
+  const g = ctx.createRadialGradient(x-4, y-4, 2, x, y, 12); g.addColorStop(0,'#9aa3ac'); g.addColorStop(1,'#5c646d');
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x, y, 11, 0, Math.PI*2); ctx.fill(); ctx.restore();
+}
+function drawTree(ctx, x, y, col) {
+  ctx.save(); ctx.fillStyle = 'rgba(0,0,0,0.22)'; ctx.beginPath(); ctx.ellipse(x, y+2, 10, 3, 0, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = col;
+  for (let i = 0; i < 3; i++) { const yy = -i*9; ctx.beginPath(); ctx.moveTo(x, y+yy-18); ctx.lineTo(x+11-i*2, y+yy+2); ctx.lineTo(x-11+i*2, y+yy+2); ctx.closePath(); ctx.fill(); }
+  ctx.restore();
+}
+function firstPin(ctx, x, y, pulse) {
+  ctx.save();
+  ctx.strokeStyle = 'rgba(255,196,84,' + (0.55 + 0.35*pulse) + ')'; ctx.lineWidth = 2.2;
+  ctx.beginPath(); ctx.arc(x, y, 12, 0, Math.PI*2); ctx.stroke();
+  ctx.beginPath(); ctx.arc(x, y, 6 + pulse*2.5, 0, Math.PI*2); ctx.stroke();
+  ctx.fillStyle = 'rgba(255,196,84,0.9)';
+  for (let i = 0; i < 2; i++) { const yy = y + 17 + i*6; ctx.beginPath();
+    ctx.moveTo(x-5, yy); ctx.lineTo(x, yy+5); ctx.lineTo(x+5, yy); ctx.lineTo(x+5, yy+2.5); ctx.lineTo(x, yy+7); ctx.lineTo(x-5, yy+2.5); ctx.closePath(); ctx.fill(); }
+  ctx.restore();
+}
+function drawBall(ctx, x, y, scale, alpha) {
+  ctx.save(); ctx.globalAlpha = alpha;
+  ctx.fillStyle = 'rgba(0,0,0,0.26)'; ctx.beginPath(); ctx.ellipse(x, y+2, BALL_R*scale, BALL_R*0.55*scale, 0, 0, Math.PI*2); ctx.fill();
+  ctx.translate(x, y); ctx.scale(scale, scale);
+  const g = ctx.createRadialGradient(-1.6,-1.8,0.5,0,0,BALL_R+1); g.addColorStop(0,'#fff'); g.addColorStop(1,'#c9d2dc');
+  ctx.fillStyle = g; ctx.beginPath(); ctx.arc(0,0,BALL_R,0,Math.PI*2); ctx.fill();
+  ctx.strokeStyle = 'rgba(40,50,60,0.5)'; ctx.lineWidth = 0.8; ctx.stroke();
+  ctx.restore();
+}
+
+function renderTile(t) {
+  const ctx = t.ctx, h = t.h, p = PAL[h.biome], s = t.st;
+  const g = ctx.createLinearGradient(0,0,0,TILE_H); g.addColorStop(0,p.g[0]); g.addColorStop(1,p.g[1]);
+  ctx.fillStyle = g; ctx.fillRect(0,0,TILE_W,TILE_H);
+  ctx.globalAlpha = 0.05; ctx.fillStyle = '#fff';
+  for (let sx=0; sx<TILE_W; sx+=30) ctx.fillRect(sx,0,15,TILE_H); ctx.globalAlpha = 1;
+  ctx.strokeStyle = '#e9e4d0'; ctx.lineWidth = 6; ctx.lineCap = 'round'; ctx.strokeRect(9,9,TILE_W-18,TILE_H-18);
+  // cliff void behind the drop marker
+  const vg = ctx.createRadialGradient(h.pin.x, h.pin.y+8, 4, h.pin.x, h.pin.y+8, 60);
+  vg.addColorStop(0,'rgba(0,0,0,0.42)'); vg.addColorStop(1,'rgba(0,0,0,0)');
+  ctx.fillStyle = vg; ctx.beginPath(); ctx.arc(h.pin.x, h.pin.y+8, 60, 0, Math.PI*2); ctx.fill();
+  for (const o of h.obs) { if (o[0]==='r') drawRock(ctx, o[1], o[2]); else drawTree(ctx, o[1], o[2], p.tree); }
+  const pulse = 0.5 + 0.5*Math.sin(performance.now()/1000*4);
+  firstPin(ctx, h.pin.x, h.pin.y, pulse);
+  // tee mark
+  ctx.fillStyle = 'rgba(255,255,255,0.55)'; ctx.beginPath(); ctx.arc(h.tee.x, h.tee.y, 2.5, 0, Math.PI*2); ctx.fill();
+  // ball + physics shot trail
+  if (s.phase === PH.ROLL) {
+    ctx.save(); ctx.strokeStyle = 'rgba(255,255,255,0.28)'; ctx.lineWidth = 1.4; ctx.lineJoin = 'round';
+    ctx.beginPath(); s.trail.forEach((q, i) => { i ? ctx.lineTo(q.x, q.y) : ctx.moveTo(q.x, q.y); }); ctx.stroke(); ctx.restore();
+    drawBall(ctx, s.b.x, s.b.y, 1, 1);
+  }
+  else if (s.phase === PH.ATPIN) drawBall(ctx, h.pin.x, h.pin.y, 1, 1);
+  else if (s.phase === PH.DROP) drawBall(ctx, h.pin.x, h.pin.y + s.drop*3, 1 - s.drop*0.7, 1 - s.drop);
+  // "drops to Stage 2" hint during drop
+  if (s.phase === PH.DROP) { ctx.save(); ctx.globalAlpha = 1 - s.drop; ctx.fillStyle = '#ffd27a';
+    ctx.font = '700 10px system-ui, sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('▼ drop', h.pin.x, h.pin.y + 34); ctx.restore(); }
+}
+
+for (const t of tiles) resetTile(t);
+let last = performance.now();
+function frame(ts) {
+  let dt = Math.min((ts-last)/1000, 1/30); last = ts;
+  for (const t of tiles) { stepTile(t, dt); renderTile(t); }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Top Down · Stage-2 funnel greens (Holes 2–19)</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: #0d1014; color: #e8edf2;
+    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif; }
+  header { padding: 22px 20px 6px; }
+  h1 { font-size: 17px; font-weight: 650; margin: 0; }
+  header p { color: #8792a0; margin: 6px 0 0; font-size: 13px; max-width: 900px; }
+  .grid { display: grid; gap: 16px; padding: 18px 20px 48px;
+    grid-template-columns: repeat(auto-fill, minmax(288px, 1fr)); }
+  figure { margin: 0; background: #141922; border: 1px solid rgba(255,255,255,.07);
+    border-radius: 12px; overflow: hidden; box-shadow: 0 8px 24px rgba(0,0,0,.35); }
+  canvas { width: 100%; display: block; background: #000; }
+  figcaption { padding: 9px 12px 11px; }
+  .cap-top { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+  .name { font-weight: 640; font-size: 14px; }
+  .par { color: #9aa4b1; font-size: 12px; font-variant-numeric: tabular-nums; }
+  .shape { color: #7fd0ff; font-size: 11.5px; margin-top: 2px; }
+  .biome { color: #7d8794; font-size: 11px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Top&nbsp;Down · Stage-2 funnel greens <span style="color:#7d8794;font-weight:500">— Holes 2–19 mockup</span></h1>
+  <p>Each green loops the Stage-2 flow: the ball drops onto the <b>tee pedestal</b> (funnel-immune),
+     rests, then putts <b>off the tee</b> and the <b>funnel bowl</b> gathers it to the cup. Every hole
+     has a different funnel <b>shape &amp; size</b> and its own biome. Prototype — physics mirror the harness.</p>
+</header>
+<div class="grid" id="grid"></div>
+
+<script>
+"use strict";
+const BALL_R = 5, DROP_H = 92, REST = 0.6, RAMP_G = 1400, TILE_W = 300, TILE_H = 200;
+
+// ---- biome palettes ----
+const PAL = {
+  meadow:   { g:['#5aa64f','#3c7a3f'], ac:'#7fdcff', dot:'#ffe07a' },
+  desert:   { g:['#d7b268','#a67c3e'], ac:'#f0d79a', dot:'#e08a3d' },
+  tundra:   { g:['#93bccb','#5d8a9c'], ac:'#eaf6fb', dot:'#cfe8f2' },
+  volcanic: { g:['#5c4a49','#2f2527'], ac:'#ff6a3d', dot:'#ffb057' },
+  autumn:   { g:['#c1893c','#7f5227'], ac:'#f0c070', dot:'#e2542f' },
+  tropical: { g:['#37ad86','#227a60'], ac:'#5ad2ff', dot:'#ffe07a' },
+  twilight: { g:['#5b5b93','#302f57'], ac:'#c77dff', dot:'#ffe07a' },
+  highland: { g:['#7f9d5c','#516d3a'], ac:'#c9d98f', dot:'#e6b3d0' },
+  moss:     { g:['#4f8f63','#2f5f43'], ac:'#9fe6c0', dot:'#ffe07a' },
+  slate:    { g:['#6b7a89','#454e59'], ac:'#dbe6f0', dot:'#a9c7e6' },
+};
+
+// ---- the 18 greens (tile coords 300x200). Funnel shape/size varies on every hole. ----
+const HOLES = [
+  { n:2,  name:'Basin',           par:4, biome:'meadow',   tee:{x:70,y:56},  cup:{x:205,y:120}, F:{rx:82,ry:78,rot:0,   k:8},  shape:'wide gentle bowl' },
+  { n:3,  name:'The Keyhole',     par:4, biome:'slate',    tee:{x:60,y:150}, cup:{x:210,y:80},  F:{rx:42,ry:42,rot:0,   k:11}, shape:'tight circle' },
+  { n:4,  name:'Tilted Table',    par:5, biome:'highland', tee:{x:70,y:60},  cup:{x:205,y:135}, F:{rx:88,ry:52,rot:0.5, k:8},  shape:'oval, tilted +29°' },
+  { n:5,  name:'Long Valley',     par:5, biome:'autumn',   tee:{x:55,y:100}, cup:{x:220,y:105}, F:{rx:104,ry:44,rot:0,  k:7},  shape:'wide horizontal oval' },
+  { n:6,  name:'Crater',          par:4, biome:'volcanic', tee:{x:75,y:150}, cup:{x:200,y:88},  F:{rx:62,ry:62,rot:0,   k:10}, shape:'round, steep' },
+  { n:7,  name:'Pinch',           par:4, biome:'tropical', tee:{x:65,y:65},  cup:{x:210,y:130}, F:{rx:40,ry:74,rot:0,   k:9},  shape:'tall narrow slot' },
+  { n:8,  name:'The Saucer',      par:5, biome:'meadow',   tee:{x:60,y:150}, cup:{x:200,y:95},  F:{rx:98,ry:74,rot:0,   k:6},  shape:'big shallow saucer' },
+  { n:9,  name:'Rift',            par:4, biome:'slate',    tee:{x:80,y:55},  cup:{x:205,y:140}, F:{rx:34,ry:88,rot:0,   k:9},  shape:'very tall rift' },
+  { n:10, name:'Whirlpool',       par:5, biome:'tropical', tee:{x:60,y:100}, cup:{x:210,y:105}, F:{rx:66,ry:66,rot:0,   k:15}, shape:'round, very steep' },
+  { n:11, name:'The Ladle',       par:4, biome:'autumn',   tee:{x:70,y:150}, cup:{x:205,y:80},  F:{rx:86,ry:50,rot:-0.4,k:8},  shape:'oval, tilted −23°' },
+  { n:12, name:'Sidewinder',      par:5, biome:'desert',   tee:{x:55,y:70},  cup:{x:215,y:130}, F:{rx:96,ry:40,rot:0.7, k:8},  shape:'slot, tilted +40°' },
+  { n:13, name:'Sinkhole',        par:4, biome:'twilight', tee:{x:70,y:60},  cup:{x:200,y:130}, F:{rx:46,ry:46,rot:0,   k:13}, shape:'small, deep' },
+  { n:14, name:'The Amphitheater',par:5, biome:'highland', tee:{x:55,y:100}, cup:{x:205,y:105}, F:{rx:106,ry:80,rot:0,  k:6},  shape:'huge amphitheater' },
+  { n:15, name:'Gulley',          par:4, biome:'moss',     tee:{x:78,y:150}, cup:{x:205,y:85},  F:{rx:48,ry:92,rot:0,   k:8},  shape:'tall gulley' },
+  { n:16, name:'The Cauldron',    par:5, biome:'volcanic', tee:{x:60,y:95},  cup:{x:205,y:110}, F:{rx:70,ry:70,rot:0,   k:16}, shape:'round, deepest' },
+  { n:17, name:'Split Level',     par:4, biome:'tundra',   tee:{x:72,y:58},  cup:{x:205,y:135}, F:{rx:90,ry:54,rot:-0.6,k:8},  shape:'oval, tilted −34°' },
+  { n:18, name:'The Maw',         par:5, biome:'twilight', tee:{x:60,y:150}, cup:{x:200,y:88},  F:{rx:56,ry:82,rot:0.3, k:9},  shape:'tall oval, tilted +17°' },
+  { n:19, name:"Journey's End",   par:5, biome:'tropical', tee:{x:58,y:100}, cup:{x:212,y:106}, F:{rx:78,ry:68,rot:0,   k:7},  shape:'gentle finale bowl' },
+];
+
+// ---- build tiles ----
+const grid = document.getElementById('grid');
+const tiles = [];
+for (const h of HOLES) {
+  const fig = document.createElement('figure');
+  const cv = document.createElement('canvas'); cv.width = TILE_W; cv.height = TILE_H;
+  const cap = document.createElement('figcaption');
+  cap.innerHTML = '<div class="cap-top"><span class="name">' + h.n + '. ' + h.name +
+    '</span><span class="par">Par ' + h.par + '</span></div>' +
+    '<div class="shape">◍ ' + h.shape + '</div>' +
+    '<div class="biome">' + h.biome + ' green</div>';
+  fig.appendChild(cv); fig.appendChild(cap); grid.appendChild(fig);
+  tiles.push({ h, ctx: cv.getContext('2d'), st: null });
+}
+
+// ---- per-tile sim ----
+const PH = { DROP:0, TEE:1, PUTT:2, FUNNEL:3, DONE:4 };
+function resetTile(t) {
+  const h = t.h;
+  t.st = { phase: PH.DROP, tt: 0, funT: 0, reb: 0,
+    b: { x: h.tee.x, y: h.tee.y, z: DROP_H, vz: 0, vx: 0, vy: 0, squash: 0 } };
+}
+function funnelHas(F, cup, x, y) {
+  const dx = x - cup.x, dy = y - cup.y, ca = Math.cos(F.rot), sa = Math.sin(F.rot);
+  const rx0 = dx*ca + dy*sa, ry0 = -dx*sa + dy*ca;
+  return (rx0/F.rx)**2 + (ry0/F.ry)**2 < 1;
+}
+function stepTile(t, dt) {
+  const s = t.st, b = s.b, h = t.h; s.tt += dt; b.squash *= Math.exp(-10*dt);
+  if (s.phase === PH.DROP) {
+    b.z += b.vz*dt; b.vz -= RAMP_G*dt;
+    if (b.z <= 0) { b.z = 0; const im = Math.abs(b.vz);
+      if (s.reb < 3) { b.vz = im*REST; s.reb++; b.squash = Math.min(0.6, 0.15+im/900); }
+      else { b.vz = 0; b.squash = 0.35; s.phase = PH.TEE; s.tt = 0; } }
+  } else if (s.phase === PH.TEE) {
+    if (s.tt > 0.7) { const dx = h.cup.x-b.x, dy = h.cup.y-b.y, d = Math.hypot(dx,dy)||1;
+      const putt = Math.min(300, Math.max(150, d*2.6));
+      b.vx = dx/d*putt; b.vy = dy/d*putt; s.phase = PH.PUTT; s.tt = 0; }
+  } else if (s.phase === PH.PUTT || s.phase === PH.FUNNEL) {
+    s.funT += dt;
+    if (funnelHas(h.F, h.cup, b.x, b.y)) { s.phase = PH.FUNNEL;
+      b.vx += (h.cup.x-b.x)*h.F.k*dt; b.vy += (h.cup.y-b.y)*h.F.k*dt; }
+    const fr = Math.exp(-1.7*dt); b.vx *= fr; b.vy *= fr;
+    const sp = Math.hypot(b.vx,b.vy), vm = 360; if (sp>vm){ b.vx*=vm/sp; b.vy*=vm/sp; }
+    b.x += b.vx*dt; b.y += b.vy*dt;
+    const m = 14;
+    if (b.x<m){b.x=m;b.vx=Math.abs(b.vx)*.6} if (b.x>TILE_W-m){b.x=TILE_W-m;b.vx=-Math.abs(b.vx)*.6}
+    if (b.y<m){b.y=m;b.vy=Math.abs(b.vy)*.6} if (b.y>TILE_H-m){b.y=TILE_H-m;b.vy=-Math.abs(b.vy)*.6}
+    const dc = Math.hypot(h.cup.x-b.x, h.cup.y-b.y);
+    if ((dc < 9 && sp < 150) || s.funT > 4.2) { b.x = h.cup.x; b.y = h.cup.y; b.vx = b.vy = 0; s.phase = PH.DONE; s.tt = 0; }
+  } else if (s.phase === PH.DONE) {
+    if (s.tt > 1.1) resetTile(t);
+  }
+}
+
+// ---- per-tile render ----
+function drawTileFunnel(ctx, F, cup) {
+  ctx.save(); ctx.translate(cup.x, cup.y); ctx.rotate(F.rot);
+  ctx.strokeStyle = 'rgba(255,255,255,0.09)'; ctx.lineWidth = 1.2;
+  for (let i = 6; i >= 1; i--) { const k = i/6; ctx.beginPath(); ctx.ellipse(0,0,F.rx*k,F.ry*k,0,0,Math.PI*2); ctx.stroke(); }
+  ctx.restore();
+}
+function drawTee(ctx, x, y) {
+  ctx.save();
+  ctx.fillStyle = 'rgba(0,0,0,0.26)'; ctx.beginPath(); ctx.ellipse(x, y+7, 10, 4, 0, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#8b9659'; ctx.fillRect(x-8, y, 16, 6);
+  ctx.fillStyle = '#79834b'; ctx.beginPath(); ctx.ellipse(x, y+6, 8, 4, 0, 0, Math.PI*2); ctx.fill();
+  const g = ctx.createRadialGradient(x-2, y-2, 1, x, y, 8);
+  g.addColorStop(0,'#eef1d6'); g.addColorStop(1,'#bcc790'); ctx.fillStyle = g;
+  ctx.beginPath(); ctx.ellipse(x, y, 8, 5, 0, 0, Math.PI*2); ctx.fill();
+  ctx.restore();
+}
+function drawCup(ctx, cup) {
+  ctx.save();
+  const rg = ctx.createRadialGradient(cup.x, cup.y, 0, cup.x, cup.y, 12);
+  rg.addColorStop(0,'rgba(0,0,0,0.7)'); rg.addColorStop(1,'rgba(0,0,0,0)');
+  ctx.fillStyle = rg; ctx.beginPath(); ctx.arc(cup.x, cup.y, 12, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = '#111'; ctx.beginPath(); ctx.arc(cup.x, cup.y, 7, 0, Math.PI*2); ctx.fill();
+  const top = cup.y - 34; ctx.strokeStyle = '#eee'; ctx.lineWidth = 1.6;
+  ctx.beginPath(); ctx.moveTo(cup.x, cup.y-3); ctx.lineTo(cup.x, top); ctx.stroke();
+  const fl = Math.sin(performance.now()/1000*3)*2; ctx.fillStyle = '#e6483f';
+  ctx.beginPath(); ctx.moveTo(cup.x, top); ctx.lineTo(cup.x+18, top+5+fl); ctx.lineTo(cup.x, top+10); ctx.closePath(); ctx.fill();
+  ctx.restore();
+}
+function drawBall(ctx, b) {
+  const zh = b.z || 0;
+  if (zh > 0) { const sh = Math.max(0.45, 1-zh/500), al = 0.28*Math.max(0.4, 1-zh/300);
+    ctx.fillStyle = 'rgba(0,0,0,'+al.toFixed(3)+')';
+    ctx.beginPath(); ctx.ellipse(b.x, b.y+2, BALL_R*sh, BALL_R*0.55*sh, 0, 0, Math.PI*2); ctx.fill(); }
+  ctx.save(); ctx.translate(b.x, b.y - zh*0.35);
+  const asc = 1 + zh/200; ctx.scale(asc, asc);
+  const st = b.squash||0; ctx.scale(1+st*0.5, 1-st*0.35);
+  const g = ctx.createRadialGradient(-1.6,-1.8,0.5,0,0,BALL_R+1);
+  g.addColorStop(0,'#fff'); g.addColorStop(1,'#c9d2dc'); ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(0,0,BALL_R,0,Math.PI*2); ctx.fill();
+  ctx.strokeStyle = 'rgba(40,50,60,0.5)'; ctx.lineWidth = 0.8; ctx.stroke();
+  ctx.restore();
+}
+function renderTile(t) {
+  const ctx = t.ctx, h = t.h, p = PAL[h.biome], b = t.st.b;
+  const g = ctx.createLinearGradient(0,0,0,TILE_H); g.addColorStop(0,p.g[0]); g.addColorStop(1,p.g[1]);
+  ctx.fillStyle = g; ctx.fillRect(0,0,TILE_W,TILE_H);
+  ctx.globalAlpha = 0.05; ctx.fillStyle = '#fff';
+  for (let sx=0; sx<TILE_W; sx+=30) ctx.fillRect(sx,0,15,TILE_H); ctx.globalAlpha = 1;
+  // biome accent dots
+  ctx.fillStyle = p.dot; ctx.globalAlpha = 0.5;
+  for (const d of [[40,170],[260,40],[230,175],[30,40]]) { ctx.beginPath(); ctx.arc(d[0],d[1],2,0,Math.PI*2); ctx.fill(); }
+  ctx.globalAlpha = 1;
+  // border wall
+  ctx.strokeStyle = '#e9e4d0'; ctx.lineWidth = 6; ctx.lineCap = 'round';
+  ctx.strokeRect(9,9,TILE_W-18,TILE_H-18);
+  drawTileFunnel(ctx, h.F, h.cup);
+  drawCup(ctx, h.cup);
+  drawTee(ctx, h.tee.x, h.tee.y);
+  if (t.st.phase === PH.DONE) {
+    ctx.save(); ctx.beginPath(); ctx.arc(h.cup.x,h.cup.y,6,0,Math.PI*2); ctx.clip();
+    drawBall(ctx, { x:h.cup.x, y:h.cup.y, z:0, squash:0.2 }); ctx.restore();
+  } else drawBall(ctx, b);
+}
+
+// ---- shared loop ----
+for (const t of tiles) resetTile(t);
+let last = performance.now();
+function frame(ts) {
+  let dt = Math.min((ts-last)/1000, 1/30); last = ts;
+  for (const t of tiles) { stepTile(t, dt); renderTile(t); }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
