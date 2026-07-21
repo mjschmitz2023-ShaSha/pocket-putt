@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <title>Pocket Putt — Mini Golf</title>
-<link rel="stylesheet" href="style.css?v=shareux4">
+<link rel="stylesheet" href="style.css?v=portalGrav13">
 </head>
 <body>
   <div id="game-menu" class="hidden">
@@ -12,6 +12,13 @@
   </div>
   <div id="stage">
     <canvas id="game" width="800" height="500"></canvas>
+    <div id="gravity-loading" class="hidden" aria-live="polite">
+      <p id="gravity-loading-text">Computing portal gravity…</p>
+      <div class="gravity-loading-track">
+        <div id="gravity-loading-bar" class="gravity-loading-bar"></div>
+      </div>
+      <p id="gravity-loading-detail" class="gravity-loading-detail"></p>
+    </div>
 
     <div id="hud" class="hidden">
       <div class="hud-left">
@@ -167,10 +174,11 @@
     </div>
   </div>
 
-  <script src="shared.js?v=shareux4"></script>
-  <script src="share-level.js?v=shareux4"></script>
-  <script src="draw.js?v=shareux4"></script>
-  <script src="mp-recon.js?v=shareux4"></script>
-  <script src="game.js?v=shareux4"></script>
+  <script src="shared.js?v=portalGrav13"></script>
+  <script src="portal-gravity.js?v=portalGrav13"></script>
+  <script src="share-level.js?v=portalGrav13"></script>
+  <script src="draw.js?v=portalGrav13"></script>
+  <script src="mp-recon.js?v=portalGrav13"></script>
+  <script src="game.js?v=portalGrav13"></script>
 </body>
 </html>

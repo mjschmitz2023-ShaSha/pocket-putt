@@ -178,26 +178,34 @@ function ballFloatingInGravity(ball, hole) {
       return true;
     }
   }
+  // Portal dual-sample can pull without a world-side field — treat as floating so
+  // low-speed crawl drag does not cancel the mapped well (editor Test / solo).
+  if (getPortalGravityMode(hole) !== 'off') {
+    const dual = portalGravityDualSample(ball, hole);
+    if (Math.hypot(dual.ax, dual.ay) >= REST_GRAVITY_EPS) return true;
+  }
+  // Material portal bake: g may be non-zero far from any world fieldRadius.
+  if (hole && hole._portalGravityCache) {
+    const g = gravityAccelAt(ball, hole);
+    if (g.mag >= REST_GRAVITY_EPS_PORTAL) return true;
+  }
   return false;
 }
 
 /**
- * Net gravitational acceleration at the ball (same sampling as applyGravityAcceleration).
- * Used to decide whether a "stopped" ball is truly at rest or about to be yanked by a
- * moving well (e.g. moon sliding its field over a stationary ball).
- *
- * When the ball is on a planet/moon crust, that body's *radial* pull is cancelled (surface
- * normal force). Tangential pulls from *other* bodies (a passing moon) still apply — so a
- * parked ball gets dragged when the moon's well sweeps over it.
+ * World-space gravity only (no portal dual-sample). `sample` is {x,y} (ball or virtual point).
+ * When the sample is on a planet/moon crust, that body's *radial* pull is cancelled (surface
+ * normal force). Tangential pulls from *other* bodies still apply.
  */
-function gravityAccelAt(ball, hole) {
+function gravityAccelAtWorld(sample, hole) {
   let ax = 0;
   let ay = 0;
+  const sx = sample.x, sy = sample.y;
   const bodies = hole.gravityBodies || [];
   for (let i = 0; i < bodies.length; i++) {
     const b = bodies[i];
-    const dx = b.x - ball.x; // toward body
-    const dy = b.y - ball.y;
+    const dx = b.x - sx; // toward body
+    const dy = b.y - sy;
     const r = Math.hypot(dx, dy);
     if (r < 1e-6) continue;
     if (b.fieldRadius && r > b.fieldRadius) continue;
@@ -211,8 +219,8 @@ function gravityAccelAt(ball, hole) {
     let gy = (dy / r) * a;
     // On this body's crust: cancel into-surface component (normal force balances radial g).
     if (b.kind !== 'blackHole' && r <= planetContactRadius(b) + 1.5) {
-      const onx = (ball.x - b.x) / r; // outward normal
-      const ony = (ball.y - b.y) / r;
+      const onx = (sx - b.x) / r; // outward normal
+      const ony = (sy - b.y) / r;
       const into = gx * (-onx) + gy * (-ony); // accel toward body (into surface)
       if (into > 0) {
         gx -= into * (-onx);
@@ -225,8 +233,37 @@ function gravityAccelAt(ball, hole) {
   return { ax, ay, mag: Math.hypot(ax, ay) };
 }
 
+/**
+ * Net gravitational acceleration at the ball (same sampling as applyGravityAcceleration).
+ *
+ * When a portal-gravity bake is attached (hole._portalGravityCache), that field is the
+ * sole source of g — material-space mass BEM + accelerating-mouth Φ_ξ over the level
+ * period (see portal-gravity.js). Otherwise: world sample + optional dual-sample modes.
+ */
+function gravityAccelAt(ball, hole) {
+  const cache = hole && hole._portalGravityCache;
+  if (cache && cache.frames && cache.frames.length) {
+    const PG = (typeof globalThis !== 'undefined' && globalThis.PortalGravity)
+      || (typeof self !== 'undefined' && self.PortalGravity)
+      || null;
+    if (PG && typeof PG.samplePortalGravity === 'function') {
+      const tick = Math.floor(hole._orbitTick || 0);
+      const g = PG.samplePortalGravity(cache, ball.x, ball.y, tick);
+      const mag = Math.hypot(g.ax || 0, g.ay || 0);
+      return { ax: g.ax || 0, ay: g.ay || 0, mag };
+    }
+  }
+  const world = gravityAccelAtWorld(ball, hole);
+  const dual = portalGravityDualSample(ball, hole);
+  const ax = world.ax + dual.ax;
+  const ay = world.ay + dual.ay;
+  return { ax, ay, mag: Math.hypot(ax, ay) };
+}
+
 // If |g| exceeds this while "stopped", keep simulating — moon (etc.) is pulling.
 const REST_GRAVITY_EPS = 25;
+/** Lower rest band when material portal bake is active (through-portal wells are often weaker). */
+const REST_GRAVITY_EPS_PORTAL = 2.5;
 
 function ballInSand(ball, hole) {
   for (const z of hole.sand || []) {
@@ -254,7 +291,9 @@ function ballMayRestForAim(ball, hole) {
   // Floating in a field on grass: keep falling. Sand can pin you in a field (hold).
   if (ballFloatingInGravity(ball, hole) && !ballInSand(ball, hole)) return false;
   // Free grass / sand bunker: still no rest if net pull (after sand) is strong (moon yank).
-  if (effectiveGravityMag(ball, hole) >= REST_GRAVITY_EPS) return false;
+  // Portal material fields are often weaker than local Orbit wells — use a lower floor.
+  const restEps = (hole && hole._portalGravityCache) ? REST_GRAVITY_EPS_PORTAL : REST_GRAVITY_EPS;
+  if (effectiveGravityMag(ball, hole) >= restEps) return false;
   return true;
 }
 
@@ -638,6 +677,71 @@ function mapVelocityThroughPortals(vx, vy, entryAp, exitAp) {
 }
 
 /**
+ * Map a free vector (velocity-without-surface, acceleration) through portal local frames.
+ * Same basis flip as mapVelocityThroughPortals but ignores surface velocity.
+ */
+function mapVectorThroughPortal(vx, vy, entryAp, exitAp) {
+  const vn = vx * entryAp.nx + vy * entryAp.ny;
+  const vt = vx * entryAp.tx + vy * entryAp.ty;
+  return {
+    x: (-vn) * exitAp.nx + vt * exitAp.tx,
+    y: (-vn) * exitAp.ny + vt * exitAp.ty,
+  };
+}
+
+/**
+ * Map a world point from the entry aperture frame into the exit aperture frame.
+ * Preserves along-tangent offset and signed distance along face normal (Valve-style).
+ */
+function mapPointThroughPortal(x, y, entryAp, exitAp) {
+  const along = (x - entryAp.cx) * entryAp.tx + (y - entryAp.cy) * entryAp.ty;
+  const normal = (x - entryAp.cx) * entryAp.nx + (y - entryAp.cy) * entryAp.ny;
+  return {
+    x: exitAp.cx + along * exitAp.tx + normal * exitAp.nx,
+    y: exitAp.cy + along * exitAp.ty + normal * exitAp.ny,
+  };
+}
+
+// ---- Portal dual-sample gravity (prototype; default off) ----
+// Modes from portals-implementation-goal non-goals: always / SOI / LOS.
+// Runtime switch for A/B feel — not LEVEL_CODEC. Hole may override via portalGravityMode.
+const PORTAL_GRAVITY_MODES = ['off', 'always', 'soi', 'los'];
+/** Near-aperture radius for SOI mode (px). Ball must be this close to entry center. */
+const PORTAL_GRAVITY_SOI_RADIUS = 220;
+/** Max distance along face normal for LOS mode (px). */
+const PORTAL_GRAVITY_LOS_MAX = 360;
+/** Global default; overridden by hole.portalGravityMode or setPortalGravityMode. */
+let _portalGravityMode = 'off';
+
+function normalizePortalGravityMode(mode) {
+  if (mode == null || mode === '') return 'off';
+  const m = String(mode).toLowerCase().trim();
+  if (m === 'off' || m === 'none' || m === 'world' || m === '0') return 'off';
+  if (m === 'always' || m === 'on' || m === '1') return 'always';
+  if (m === 'soi' || m === 'sphere') return 'soi';
+  if (m === 'los' || m === 'lineofsight' || m === 'line-of-sight') return 'los';
+  return 'off';
+}
+
+/**
+ * Active dual-sample mode. Session (`setPortalGravityMode`) is the sole authority.
+ *
+ * hole.portalGravityMode is NOT read — it was a stale-override footgun: editor
+ * deepCloneHole / draft snapshots could keep an old mode on the hole object while
+ * the dropdown + global said something else, so switching back to "always" still
+ * simulated as soi/los/off until a full page refresh rebuilt everything.
+ * (Fixtures/tests must call setPortalGravityMode.)
+ */
+function getPortalGravityMode(/* hole */) {
+  return _portalGravityMode;
+}
+
+function setPortalGravityMode(mode) {
+  _portalGravityMode = normalizePortalGravityMode(mode);
+  return _portalGravityMode;
+}
+
+/**
  * Project ball center onto segment parametric t and signed distance along outward normal n.
  * Returns null if segment degenerate.
  */
@@ -650,6 +754,83 @@ function projectOntoAperture(ball, ap) {
   // signed distance from centerline along face normal
   const side = (ball.x - px) * ap.nx + (ball.y - py) * ap.ny;
   return { t, side, px, py };
+}
+
+/**
+ * Whether this entry aperture can contribute dual-sample gravity for the mode.
+ * Never samples from the solid back face (side < 0).
+ * Returns projection when eligible, else null (so callers can rank by distance).
+ */
+function portalGravityEligible(mode, ball, entryAp) {
+  if (mode === 'off') return null;
+  const proj = projectOntoAperture(ball, entryAp);
+  if (!proj) return null;
+  // One-sided: only the enterable half-plane (outward normal).
+  // (Earlier side > -1 let both ends of a same-room pair fire and sum toward map center.)
+  if (proj.side < 0) return null;
+
+  if (mode === 'always') return proj;
+
+  if (mode === 'soi') {
+    const dist = Math.hypot(ball.x - entryAp.cx, ball.y - entryAp.cy);
+    return dist <= PORTAL_GRAVITY_SOI_RADIUS ? proj : null;
+  }
+
+  if (mode === 'los') {
+    // Geometric view through the open aperture: on face, within width, not too far.
+    if (proj.side > PORTAL_GRAVITY_LOS_MAX) return null;
+    if (proj.t < entryAp.t0 || proj.t > entryAp.t1) return null;
+    return proj;
+  }
+  return null;
+}
+
+/**
+ * Extra gravity from sampling the other side of each portal and mapping accel back.
+ * World-only sample at the virtual point (no recursive dual-sample).
+ *
+ * Per pair, only the **strongest** eligible direction contributes (max |mapped g|).
+ * Summing both a→b and b→a double-counted when both faces open into the same room and
+ * averaged into a bogus pull toward the hole center after roaming / mode switching mid-map.
+ */
+function portalGravityDualSample(ball, hole) {
+  const mode = getPortalGravityMode(hole);
+  if (mode === 'off') return { ax: 0, ay: 0 };
+  const pairs = hole.portalPairs || [];
+  if (!pairs.length) return { ax: 0, ay: 0 };
+
+  let ax = 0, ay = 0;
+  for (let pi = 0; pi < pairs.length; pi++) {
+    const pair = pairs[pi];
+    if (!pair || !pair.a || !pair.b) continue;
+    const sides = [
+      { end: pair.a, other: pair.b },
+      { end: pair.b, other: pair.a },
+    ];
+    let bestMag = 0;
+    let bestMapped = null;
+    for (const s of sides) {
+      const entryAp = resolvePortalAperture(hole, s.end, pair.width);
+      const exitAp = resolvePortalAperture(hole, s.other, pair.width);
+      if (!entryAp || !exitAp) continue;
+      if (!portalGravityEligible(mode, ball, entryAp)) continue;
+      const virt = mapPointThroughPortal(ball.x, ball.y, entryAp, exitAp);
+      const g = gravityAccelAtWorld(virt, hole);
+      if (g.mag < 1e-12) continue;
+      // g lives in exit-room world axes; map exit → entry (swap frames).
+      const mapped = mapVectorThroughPortal(g.ax, g.ay, exitAp, entryAp);
+      const mag = Math.hypot(mapped.x, mapped.y);
+      if (mag > bestMag) {
+        bestMag = mag;
+        bestMapped = mapped;
+      }
+    }
+    if (bestMapped) {
+      ax += bestMapped.x;
+      ay += bestMapped.y;
+    }
+  }
+  return { ax, ay };
 }
 
 /**
@@ -3307,6 +3488,11 @@ function normalizeHole(raw) {
     portalPairs: [],
   };
   hole.portalPairs = normalizePortalPairs(raw.portalPairs, hole);
+  // Prototype only — not in LEVEL_CODEC. Lets tests / editor override dual-sample mode per hole.
+  if (raw.portalGravityMode != null && raw.portalGravityMode !== '') {
+    const pgm = normalizePortalGravityMode(raw.portalGravityMode);
+    if (pgm !== 'off') hole.portalGravityMode = pgm;
+  }
   delete hole._cupMagnet;
   hole._orbitTick = 0;
   return hole;
@@ -3896,11 +4082,15 @@ return {
   planetContactRadius, ballOnPlanetCrust, ballFloatingInGravity, ballMayRestForAim,
   QUASI_REST_WINDOW_S, QUASI_REST_AVG_SPEED, CRAWL_PUTT_SPEED,
   createSpeedAvgTracker, resetSpeedAvgTracker, noteSpeedSample, speedAvg, isQuasiRest, mayPuttBall,
-  ballInSand, effectiveGravityMag, gravityAccelAt, REST_GRAVITY_EPS, SAND_GRAVITY_HOLD,
+  ballInSand, effectiveGravityMag, gravityAccelAt, gravityAccelAtWorld, REST_GRAVITY_EPS, SAND_GRAVITY_HOLD,
   setMoonPoseAtTick, applyGravityAcceleration, resolvePlanetCollision, blackHoleCaptures,
   BOUNDARY_WALLS, SPACE_BOUND, SPACE_BOUNDARY_WALLS, boundaryWallsFor, HOLES, ORBIT_HOLES, COURSES,
   resolveWallCollision, getWindmillBlades,
   portalPairColors, resolvePortalHostSegment, resolvePortalAperture, mapVelocityThroughPortals,
+  mapVectorThroughPortal, mapPointThroughPortal,
+  PORTAL_GRAVITY_MODES, PORTAL_GRAVITY_SOI_RADIUS, PORTAL_GRAVITY_LOS_MAX,
+  normalizePortalGravityMode, getPortalGravityMode, setPortalGravityMode,
+  portalGravityEligible, portalGravityDualSample,
   tryPortalTeleport, carvePortalOpenings, collisionWallsForHole, normalizePortalPairs,
   createBallState, stepBallPhysics, advanceHoleObstacles, setHoleObstaclesAtTick, resetHoleObstacles,
   computeLaunchVelocity, clampDragVector, stickyLaunchFactor, stickyIndexAt, latchStickyAfterPutt,

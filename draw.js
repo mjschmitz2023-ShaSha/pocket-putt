@@ -1212,6 +1212,210 @@
     for (const b of blackHoles) drawBlackHoleOverlay(ctx, b);
   }
 
+  // ---- Gravity field visualization (game + editor test) ----
+  // Enable: ?gravvis=1 | ?gfield=1 | localStorage.ppGravVis=1 | opts.force=true
+  const _gravVisCanvas = (typeof document !== 'undefined')
+    ? document.createElement('canvas')
+    : null;
+  if (_gravVisCanvas) {
+    _gravVisCanvas.width = LOGICAL_W;
+    _gravVisCanvas.height = LOGICAL_H;
+  }
+  const _gravVisCtx = _gravVisCanvas ? _gravVisCanvas.getContext('2d') : null;
+  let _gravVisKey = '';
+  const GRAV_VIS_STEP = 16;
+
+  function gravVisEnabled(opts) {
+    if (opts && opts.force) return true;
+    try {
+      const q = new URLSearchParams(typeof location !== 'undefined' ? location.search : '');
+      const v = q.get('gravvis') || q.get('gfield');
+      if (v === '1' || v === 'true' || v === 'phi' || v === 'on') {
+        try { localStorage.setItem('ppGravVis', '1'); } catch (_) { /* ignore */ }
+        return true;
+      }
+      if (v === '0' || v === 'false' || v === 'off') {
+        try { localStorage.removeItem('ppGravVis'); } catch (_) { /* ignore */ }
+        return false;
+      }
+      if (typeof localStorage !== 'undefined' && localStorage.getItem('ppGravVis') === '1') return true;
+    } catch (_) { /* ignore */ }
+    return false;
+  }
+
+  // Persist boot URL before any room rewrite (game may call this early).
+  try {
+    const bootVis = new URLSearchParams(location.search).get('gravvis')
+      || new URLSearchParams(location.search).get('gfield');
+    if (bootVis === '1' || bootVis === 'true' || bootVis === 'phi' || bootVis === 'on') {
+      localStorage.setItem('ppGravVis', '1');
+    }
+  } catch (_) { /* ignore */ }
+
+  function gravVisPercentileRange(values, loP, hiP) {
+    const arr = [];
+    for (let i = 0; i < values.length; i++) {
+      const v = values[i];
+      if (Number.isFinite(v)) arr.push(v);
+    }
+    if (arr.length < 4) return { lo: -1, hi: 1 };
+    arr.sort((a, b) => a - b);
+    const lo = arr[Math.floor((loP / 100) * (arr.length - 1))];
+    const hi = arr[Math.floor((hiP / 100) * (arr.length - 1))];
+    if (!(hi > lo)) return { lo: arr[0], hi: arr[arr.length - 1] + 1e-6 };
+    return { lo, hi };
+  }
+
+  function getPortalGravityAPI() {
+    try {
+      if (typeof window !== 'undefined' && window.PortalGravity) return window.PortalGravity;
+    } catch (_) { /* ignore */ }
+    try {
+      if (root.PortalGravity) return root.PortalGravity;
+    } catch (_) { /* ignore */ }
+    try {
+      if (S.PortalGravity) return S.PortalGravity;
+    } catch (_) { /* ignore */ }
+    return null;
+  }
+
+  /** Draw arrow shaft + filled triangular tip along (ux,uy) of length len from origin (x,y). */
+  function strokeFieldArrow(gctx, x, y, ux, uy, len) {
+    const x0 = x - ux * 0.35;
+    const y0 = y - uy * 0.35;
+    const x1 = x + ux * 0.65;
+    const y1 = y + uy * 0.65;
+    gctx.beginPath();
+    gctx.moveTo(x0, y0);
+    gctx.lineTo(x1, y1);
+    gctx.stroke();
+    // Tip at head: triangle base perpendicular to direction
+    const mag = Math.hypot(ux, uy) || 1;
+    const dx = ux / mag;
+    const dy = uy / mag;
+    const tipLen = Math.min(7, Math.max(4, len * 0.35));
+    const tipW = tipLen * 0.55;
+    const bx = x1 - dx * tipLen;
+    const by = y1 - dy * tipLen;
+    const px = -dy * tipW;
+    const py = dx * tipW;
+    gctx.beginPath();
+    gctx.moveTo(x1, y1);
+    gctx.lineTo(bx + px, by + py);
+    gctx.lineTo(bx - px, by - py);
+    gctx.closePath();
+    gctx.fill();
+  }
+
+  /**
+   * Heatmap of log|g| + field arrows. Uses hole._portalGravityCache when present.
+   * opts.force — draw even without URL/localStorage flag (editor test mode).
+   * opts.statusExtra — optional status chip suffix.
+   */
+  function drawGravityPotentialOverlay(ctx, hole, opts) {
+    opts = opts || {};
+    if (!gravVisEnabled(opts) || !hole || !_gravVisCtx) return;
+    const cache = hole._portalGravityCache;
+    const rawTick = Math.floor(hole._orbitTick || 0);
+    const period = (cache && cache.period) || 1;
+    const tick = ((rawTick % period) + period) % period;
+    const PG = getPortalGravityAPI();
+    const hasCache = !!(cache && cache.frames && cache.frames.length);
+    const key = (hasCache ? 'c' : 'd') + '|' + (hole.name || '') + '|' + tick + '|' + period
+      + '|' + ((hole.portalPairs || []).length) + '|' + ((hole.gravityBodies || []).length);
+    if (key !== _gravVisKey) {
+      _gravVisKey = key;
+      const step = GRAV_VIS_STEP;
+      const cols = Math.ceil(LOGICAL_W / step);
+      const rows = Math.ceil(LOGICAL_H / step);
+      const phiGrid = new Float64Array(cols * rows);
+      const gGrid = new Float64Array(cols * rows * 2);
+      const magGrid = new Float64Array(cols * rows);
+
+      for (let j = 0; j < rows; j++) {
+        for (let i = 0; i < cols; i++) {
+          const x = Math.min(LOGICAL_W - 0.5, (i + 0.5) * step);
+          const y = Math.min(LOGICAL_H - 0.5, (j + 0.5) * step);
+          let phi = 0, ax = 0, ay = 0;
+          if (hasCache && PG && PG.samplePortalGravity) {
+            const s = PG.samplePortalGravity(cache, x, y, tick);
+            phi = s.phi || 0; ax = s.ax || 0; ay = s.ay || 0;
+          } else if (PG && PG.phiDirect) {
+            phi = PG.phiDirect(x, y, hole.gravityBodies || []);
+            if (PG.gDirect) {
+              const s = PG.gDirect(x, y, hole.gravityBodies || []);
+              ax = s.ax; ay = s.ay;
+            }
+          } else if (typeof S.gravityAccelAtWorld === 'function') {
+            const s = S.gravityAccelAtWorld({ x, y }, hole);
+            ax = s.ax || 0; ay = s.ay || 0;
+          }
+          const idx = j * cols + i;
+          phiGrid[idx] = phi;
+          gGrid[idx * 2] = ax;
+          gGrid[idx * 2 + 1] = ay;
+          magGrid[idx] = Math.hypot(ax, ay);
+        }
+      }
+
+      const { lo: mLo, hi: mHi } = gravVisPercentileRange(magGrid, 5, 95);
+      const logLo = Math.log1p(Math.max(0, mLo));
+      const logHi = Math.log1p(Math.max(mHi, mLo + 1e-6));
+      const logSpan = Math.max(1e-9, logHi - logLo);
+
+      _gravVisCtx.clearRect(0, 0, LOGICAL_W, LOGICAL_H);
+      for (let j = 0; j < rows; j++) {
+        for (let i = 0; i < cols; i++) {
+          const idx = j * cols + i;
+          const mag = magGrid[idx];
+          let t = (Math.log1p(mag) - logLo) / logSpan;
+          if (t < 0) t = 0;
+          if (t > 1) t = 1;
+          const r = Math.round(30 + t * 225);
+          const g = Math.round(20 + t * t * 200);
+          const b = Math.round(90 + (1 - t) * 120);
+          _gravVisCtx.fillStyle = 'rgba(' + r + ',' + g + ',' + b + ',0.55)';
+          _gravVisCtx.fillRect(i * step, j * step, step + 0.5, step + 0.5);
+        }
+      }
+
+      // Field arrows with triangular tips
+      _gravVisCtx.strokeStyle = 'rgba(255,255,255,0.92)';
+      _gravVisCtx.fillStyle = 'rgba(255,255,255,0.92)';
+      _gravVisCtx.lineWidth = 1.25;
+      _gravVisCtx.lineCap = 'round';
+      _gravVisCtx.lineJoin = 'round';
+      const astep = Math.max(step * 2, 32);
+      for (let y = astep / 2; y < LOGICAL_H; y += astep) {
+        for (let x = astep / 2; x < LOGICAL_W; x += astep) {
+          const i = Math.min(cols - 1, (x / step) | 0);
+          const j = Math.min(rows - 1, (y / step) | 0);
+          const ax = gGrid[(j * cols + i) * 2];
+          const ay = gGrid[(j * cols + i) * 2 + 1];
+          const mag = Math.hypot(ax, ay);
+          if (mag < 0.25) continue;
+          const len = Math.min(20, 4 + Math.log1p(mag) * 2.5);
+          const ux = (ax / mag) * len;
+          const uy = (ay / mag) * len;
+          strokeFieldArrow(_gravVisCtx, x, y, ux, uy, len);
+        }
+      }
+
+      _gravVisCtx.fillStyle = 'rgba(0,0,0,0.72)';
+      _gravVisCtx.fillRect(8, LOGICAL_H - 32, 380, 24);
+      _gravVisCtx.fillStyle = '#eef7ee';
+      _gravVisCtx.font = '12px sans-serif';
+      const pp = (hole.portalPairs || []).length;
+      const gb = (hole.gravityBodies || []).length;
+      let mode = hasCache
+        ? ('BEM bake T=' + period + ' phase=' + tick)
+        : ('no bake · pp=' + pp + ' gb=' + gb + ' PG=' + (PG ? 'y' : 'n'));
+      if (opts.statusExtra) mode += ' · ' + opts.statusExtra;
+      _gravVisCtx.fillText('gravvis · log|g| · ' + mode, 14, LOGICAL_H - 16);
+    }
+    ctx.drawImage(_gravVisCanvas, 0, 0);
+  }
+
   const Draw = {
     WALL_DRAW_WIDTH,
     BH_LENS,
@@ -1237,6 +1441,8 @@
     drawHoleAndFlag,
     drawPortals,
     drawHoleStatic,
+    gravVisEnabled,
+    drawGravityPotentialOverlay,
   };
 
   root.Draw = Draw;

@@ -113,3 +113,16 @@ Implement Valve-style portals for Pocket Putt per the frozen design below. Work 
 - Keep diffs focused; no drive-by refactors.  
 - If exit-offset-only ping-pongs in practice, note it — do not add cooldown unless clearly necessary and documented.  
 - Dual-sample gravity is explicitly **out of scope** for this goal.
+
+### Follow-up: portal gravity prototype (post-v1)
+
+Switchable dual-sample gravity for A/B feel (default still **off** / world-only):
+
+| Mode | Behavior |
+|------|----------|
+| `off` | World sample only (v1) |
+| `always` | Map ball through each eligible portal end, sample world g at virtual point, map accel back |
+| `soi` | Same, but only when ball is within `PORTAL_GRAVITY_SOI_RADIUS` of entry center |
+| `los` | Same, but only with geometric LOS (on enterable face, within aperture width, within `PORTAL_GRAVITY_LOS_MAX`) |
+
+**Superseded (ship):** material-space BEM bake in `portal-gravity.js` (automatic when portals + mass or moving hosts). Dual-sample modes remain in Shared for tests only (`setPortalGravityMode`, default **off**). Editor **Portal g** dropdown removed.

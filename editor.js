@@ -24,6 +24,7 @@
     clampEditorProp, clampObjectForCodec,
     PORTAL_MAX_PAIRS, PORTAL_MIN_WIDTH, PORTAL_DEFAULT_WIDTH,
     resolvePortalHostSegment, resolvePortalAperture, normalizePortalPairs, portalPairColors,
+    setPortalGravityMode,
   } = S;
 
   const SNAP = 5;
@@ -73,6 +74,8 @@
   let portalPlaceA = null;
   /** Magnet crosshair target while dragging/placing ({x,y} or null). */
   let snapIndicator = null;
+  /** Hole snapshot while Test is live (restore on Stop). Declared early so portal-g UI can stamp it. */
+  let draftSnapshot = null;
 
   function setStatus(msg, isErr) {
     statusEl.textContent = msg || '';
@@ -125,6 +128,10 @@
     setStatus('Loaded: ' + hole.name);
   }
 
+  // Ship model: material-space BEM bake (portal-gravity.js), not dual-sample modes.
+  // Keep session dual-sample off so it never double-counts with the bake.
+  if (typeof setPortalGravityMode === 'function') setPortalGravityMode('off');
+
   // ---- URL load ----
   const params = new URLSearchParams(location.search);
   const lvlParam = params.get('lvl');
@@ -157,7 +164,6 @@
     hole.par = p;
     propPar.value = String(p);
   });
-
   document.getElementById('btn-delete').addEventListener('click', () => {
     if (!selection || selection.kind === 'tee' || selection.kind === 'cup') return;
     const arr = hole[selection.kind];
@@ -1376,9 +1382,7 @@
   }
 
   // ---- Test mode ----
-  let draftSnapshot = null;
-
-  function enterTest() {
+  async function enterTest() {
     const v = validateHole(hole);
     if (!v.ok && v.error === 'over_cap') {
       setStatus(
@@ -1389,8 +1393,11 @@
     } else if (!v.ok && v.error === 'oversize') {
       setStatus('Share link too large (' + (v.size || '?') + ' > ' + (v.max || 4096) + ' chars) — remove objects', true);
     }
+    // Snapshot draft, then clone for live test. Dual-sample stays off (BEM bake is the path).
+    if (typeof setPortalGravityMode === 'function') setPortalGravityMode('off');
     draftSnapshot = deepCloneHole(hole);
     hole = deepCloneHole(hole);
+    if (typeof setPortalGravityMode === 'function') setPortalGravityMode('off');
     resetHoleObstacles(hole);
     testBall = createBallState(hole.tee);
     testState = 'AIMING';
@@ -1404,12 +1411,32 @@
     testHud.classList.remove('hidden');
     document.getElementById('btn-test').classList.add('hidden');
     document.getElementById('btn-stop-test').classList.remove('hidden');
-    setStatus('Test mode — movers freeze while aiming · stuck: quasi-rest putt or 15s respawn');
+
+    const PG = window.PortalGravity;
+    if (PG && PG.holeNeedsPortalGravityBake(hole)) {
+      setStatus('Computing portal gravity…');
+      try {
+        const cache = await PG.bakePortalGravityAsync(hole, {
+          onProgress(p) {
+            setStatus('Computing portal gravity… ' + Math.round(p * 100) + '%');
+          },
+        });
+        if (cache) hole._portalGravityCache = cache;
+      } catch (err) {
+        console.warn('portal gravity bake failed', err);
+      }
+    }
+
+    setStatus(
+      'Test mode — movers freeze while aiming · stuck: quasi-rest putt or 15s respawn'
+      + (hole._portalGravityCache ? ' · BEM bake · gravvis on' : ' · gravvis on')
+    );
   }
 
   function exitTest() {
     if (draftSnapshot) hole = draftSnapshot;
     draftSnapshot = null;
+    if (typeof setPortalGravityMode === 'function') setPortalGravityMode('off');
     mode = 'edit';
     testBall = null;
     clearGhostTrajectory();
@@ -1685,6 +1712,10 @@
       time: performance.now() / 1000,
       flagPhase: performance.now() / 1000,
     });
+    // Always show gravity field overlay in Test mode (same BEM bake as physics).
+    if (typeof D.drawGravityPotentialOverlay === 'function') {
+      D.drawGravityPotentialOverlay(ctx, hole, { force: true, statusExtra: 'editor test' });
+    }
     // trajectory
     if (trajectoryPts.length > 1 && testDrag.active) {
       ctx.strokeStyle = 'rgba(255,255,255,0.75)';

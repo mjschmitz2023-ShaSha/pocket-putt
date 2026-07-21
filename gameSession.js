@@ -6,6 +6,14 @@
 const crypto = require('crypto');
 const WebSocket = require('ws');
 const Shared = require('./shared.js');
+// Material-space portal gravity (BEM bake). Same pure-JS module as the browser.
+// Must load after Shared is on the module graph; attach for gravityAccelAt lookup.
+try {
+  global.Shared = Shared;
+  require('./portal-gravity.js');
+} catch (e) {
+  console.warn('[gameSession] portal-gravity.js failed to load', e && e.message);
+}
 
 const TICK_HZ = Shared.TICK_HZ;
 const TICK_MS = Shared.TICK_MS;
@@ -132,6 +140,14 @@ class GameSession {
     this.holeStartedAtMs = 0;
     /** Wall time W0 when hole tick 0 began (same as holeStartedAtMs at beginHole). */
     this.holeEpochMs = 0;
+    /**
+     * GRAVITY_LOADING: host baked, waiting for every connected client to report
+     * gravityBakeReady before PLAYING (sim does not advance until then).
+     * @type {Set<string>|null}
+     */
+    this.gravityBakeReady = null;
+    this.gravityBakeHoleIndex = -1;
+    this.gravityBakeStartedAtMs = 0;
     this.simTick = 0;
     this.holeEnding = false;
     this.holeEndingAtMs = 0;
@@ -367,7 +383,7 @@ class GameSession {
     };
   }
 
-  roundStatePayload() {
+  roundStatePayload(extra) {
     const hole = this.currentHoles()[this.currentHoleIndex];
     return {
       type: 'roundState',
@@ -379,12 +395,14 @@ class GameSession {
       tickHz: TICK_HZ,
       hostTimeMs: Date.now(),
       holeEpochMs: this.holeEpochMs || this.holeStartedAtMs,
+      gravityBakePending: this.state === 'GRAVITY_LOADING',
       ...this.customHoleLobbyFields(),
       // Reliable tee seed — clients must not depend solely on an unreliable resync
       // snapshot to populate Game.players (dropped resync → empty roster / vanished ball).
       balls: [...this.players.values()]
         .filter((p) => p.connected && p.ball)
         .map((p) => this.ballWire(p)),
+      ...(extra || {}),
     };
   }
 
@@ -465,9 +483,53 @@ class GameSession {
     this.hostPlayerId = next ? next.id : null;
   }
 
+  /**
+   * Sync BEM bake onto the authoritative hole so host stepBallPhysics matches clients.
+   * Only when portals + gravity bodies exist; reuses cache on the hole object.
+   */
+  ensurePortalGravityBake(hole) {
+    const PG = global.PortalGravity || (Shared && Shared.PortalGravity);
+    if (!PG || !hole || typeof PG.holeNeedsPortalGravityBake !== 'function') return;
+    if (!PG.holeNeedsPortalGravityBake(hole)) {
+      delete hole._portalGravityCache;
+      return;
+    }
+    if (hole._portalGravityCache && hole._portalGravityCache.frames && hole._portalGravityCache.frames.length) {
+      return;
+    }
+    const t0 = Date.now();
+    try {
+      const cache = PG.bakePortalGravity(hole);
+      if (cache) {
+        hole._portalGravityCache = cache;
+        // Fingerprint lets host/client log identity without shipping the whole bake.
+        if (!cache.fingerprint && typeof PG.bakeFingerprint === 'function') {
+          cache.fingerprint = PG.bakeFingerprint(cache);
+        }
+        console.log(
+          '[gameSession] portal gravity bake',
+          cache.period, 'ticks in', Date.now() - t0, 'ms',
+          cache.fingerprint || '',
+          cache.capped ? '(capped from LCM ' + (cache.rawLcm || '?') + ')' : ''
+        );
+        if (cache.capped) {
+          console.warn(
+            '[gameSession] portal gravity period capped',
+            cache.rawLcm, '→', cache.period,
+            '— host and clients use the same min(LCM, cap) so fields stay lockstep'
+          );
+        }
+      }
+    } catch (e) {
+      console.warn('[gameSession] portal gravity bake failed', e && e.message);
+      delete hole._portalGravityCache;
+    }
+  }
+
   beginHole(holeIndex) {
     this.currentHoleIndex = holeIndex;
     const hole = this.currentHoles()[holeIndex];
+    this.ensurePortalGravityBake(hole);
     Shared.resetHoleObstacles(hole);
     const roster = [...this.players.values()];
     roster.forEach((p, i) => {
@@ -502,7 +564,6 @@ class GameSession {
     this.pendingReplayFrom = null;
     this.pendingPutts = [];
     this._replaying = false;
-    this.state = 'PLAYING';
     this.lastHardTick = null;
     this.clearPathTrace('beginHole');
     this.touch();
@@ -510,13 +571,82 @@ class GameSession {
     // Seed end-of-tick-0 snapshot (tee setup) so putts at T=0 can restore.
     this.pushSnapshot();
     this.recordPathTraceHost({ sub: null, phase: 'tee' });
-    // Reliable roundState now carries tee balls; also push a hard resync for obstacles.
+    this.pendingEvents = [];
+
+    // Material portal gravity: wait for every connected client to finish BEM bake
+    // before PLAYING so host sim does not free-run ahead of unbaked clients.
+    const PG = global.PortalGravity || (Shared && Shared.PortalGravity);
+    const needsClientBake = !!(
+      PG &&
+      typeof PG.holeNeedsPortalGravityBake === 'function' &&
+      PG.holeNeedsPortalGravityBake(hole)
+    );
+    if (needsClientBake) {
+      this.state = 'GRAVITY_LOADING';
+      this.gravityBakeReady = new Set();
+      this.gravityBakeHoleIndex = holeIndex;
+      this.gravityBakeStartedAtMs = Date.now();
+      this.broadcastReliable(this.roundStatePayload());
+      console.log(
+        '[gameSession] waiting for client gravity bakes',
+        'hole', holeIndex,
+        'players', [...this.players.values()].filter((p) => p.connected).length
+      );
+    } else {
+      this.gravityBakeReady = null;
+      this.gravityBakeHoleIndex = -1;
+      this.gravityBakeStartedAtMs = 0;
+      this.state = 'PLAYING';
+      this.broadcastReliable(this.roundStatePayload());
+      this.broadcastReliable(this.clockSyncPayload());
+      this.broadcastReliable(
+        this.buildCorrection([], { reason: 'resync', includeObstacles: true, hard: true })
+      );
+    }
+  }
+
+  /**
+   * Client finished portal gravity bake for the current hole.
+   * When every connected player has reported, start PLAYING and re-stamp hole epoch.
+   */
+  handleGravityBakeReady(player, msg) {
+    if (!player || this.state !== 'GRAVITY_LOADING') return;
+    const hi = msg && typeof msg.holeIndex === 'number' ? (msg.holeIndex | 0) : this.gravityBakeHoleIndex;
+    if (hi !== this.gravityBakeHoleIndex) return;
+    if (!this.gravityBakeReady) this.gravityBakeReady = new Set();
+    this.gravityBakeReady.add(player.id);
+    this.maybeStartAfterGravityBake();
+  }
+
+  maybeStartAfterGravityBake() {
+    if (this.state !== 'GRAVITY_LOADING') return;
+    const connected = [...this.players.values()].filter((p) => p.connected);
+    if (!connected.length) return;
+    const ready = this.gravityBakeReady || new Set();
+    for (let i = 0; i < connected.length; i++) {
+      if (!ready.has(connected[i].id)) return;
+    }
+    this.finishGravityBakeStart();
+  }
+
+  finishGravityBakeStart() {
+    if (this.state !== 'GRAVITY_LOADING') return;
+    const now = Date.now();
+    // Fair shared clock: everyone starts free-run from the same W0 after bakes.
+    this.holeStartedAtMs = now;
+    this.holeEpochMs = now;
+    this.simTick = 0;
+    this.state = 'PLAYING';
+    this.gravityBakeReady = null;
+    this.gravityBakeHoleIndex = -1;
+    this.gravityBakeStartedAtMs = 0;
+    this.touch();
+    console.log('[gameSession] all clients gravity-ready — PLAYING');
     this.broadcastReliable(this.roundStatePayload());
     this.broadcastReliable(this.clockSyncPayload());
     this.broadcastReliable(
       this.buildCorrection([], { reason: 'resync', includeObstacles: true, hard: true })
     );
-    this.pendingEvents = [];
   }
 
   startNewRound() {
@@ -1456,6 +1586,18 @@ class GameSession {
     // Always drive hole-results progression even when not PLAYING.
     this.maybeEndHoleAfterPause();
     this.maybeAdvanceFromResults();
+    // Portal gravity: do not advance sim until every client has baked.
+    if (this.state === 'GRAVITY_LOADING') {
+      // Escape hatch if a client never acks (disconnect / bug).
+      if (
+        this.gravityBakeStartedAtMs &&
+        Date.now() - this.gravityBakeStartedAtMs > 60000
+      ) {
+        console.warn('[gameSession] gravity bake wait timeout — starting anyway');
+        this.finishGravityBakeStart();
+      }
+      return;
+    }
     if (this.state !== 'PLAYING') return;
     // Keepalive starvation → untrusted + force-sync (silent).
     const now = Date.now();
@@ -1491,7 +1633,7 @@ class GameSession {
       reconnectToken: player.reconnectToken,
       roomCode: this.code,
     });
-    if (this.state === 'PLAYING') {
+    if (this.state === 'PLAYING' || this.state === 'GRAVITY_LOADING') {
       const hole = this.currentHoles()[this.currentHoleIndex];
       if (!player.ball) {
         player.ball = Shared.createBallState(
@@ -1499,8 +1641,10 @@ class GameSession {
         );
       }
       this.send(player.ws, this.roundStatePayload());
-      this.send(player.ws, this.clockSyncPayload());
-      this.send(player.ws, this.buildCorrection([], { reason: 'resync', includeObstacles: true, hard: true }));
+      if (this.state === 'PLAYING') {
+        this.send(player.ws, this.clockSyncPayload());
+        this.send(player.ws, this.buildCorrection([], { reason: 'resync', includeObstacles: true, hard: true }));
+      }
     }
   }
 
@@ -1671,6 +1815,8 @@ class GameSession {
       );
     } else if (msg.type === 'clientClock') {
       this.handleClientClock(player, msg);
+    } else if (msg.type === 'gravityBakeReady') {
+      this.handleGravityBakeReady(player, msg);
     } else if (msg.type === 'putt') {
       this.handlePutt(player, msg);
     } else if (msg.type === 'pathTraceEnable') {
@@ -1691,6 +1837,8 @@ class GameSession {
     if (!player || this._destroyed) return;
     player.connected = false;
     this.ensureHost();
+    // Drop disconnected players from the bake barrier so the room can start.
+    if (this.state === 'GRAVITY_LOADING') this.maybeStartAfterGravityBake();
     this.broadcastLobbyState();
     this.touch();
   }

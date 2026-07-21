@@ -24,6 +24,7 @@ const STATIC_FILES = [
   'mp-recon.js',
   'game.js',
   'shared.js',
+  'portal-gravity.js',
   'putt.wav',
   'echoey_putt.wav',
   'putt_go_in.wav',

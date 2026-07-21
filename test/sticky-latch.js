@@ -223,7 +223,12 @@ console.log('='.repeat(48));
   const drag = { x: -100, y: 0 };
   client.applyPuttLocal(player.id, drag, null);
   const vOpt = Math.hypot(cp.vx, cp.vy);
-  session.handleMessage(player, { type: 'putt', dragVector: drag });
+  // Tick-stamped putts: missing clientTick is rejected (missing_tick).
+  session.handleMessage(player, {
+    type: 'putt',
+    dragVector: drag,
+    clientTick: session.simTick,
+  });
   const puttMsg = sock.drain().find((m) => m.type === 'puttApplied');
   assert(!!puttMsg, 'puttApplied broadcast');
   assert(

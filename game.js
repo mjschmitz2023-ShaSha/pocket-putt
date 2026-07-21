@@ -27,6 +27,8 @@ function currentHoles() {
 // ---- Game state ----
 const Game = {
   state: 'START',
+  /** True while portal gravity BEM bake is in progress (solo or MP). */
+  gravityBaking: false,
   courseIndex: 0,
   customHole: null, // normalized single hole when playing/hosting a shared custom level
   pendingCustomLvl: null, // encoded string to attach on create room
@@ -775,12 +777,50 @@ function drawBallShadow(x, y, z) {
   ctx.ellipse(x, y + 2, BALL_RADIUS * shrink, BALL_RADIUS * 0.55 * shrink, 0, 0, Math.PI * 2);
   ctx.fill();
 }
+// Grav field visualization lives in Draw (shared with editor test).
+// ?gravvis=1 | ?gfield=1 | localStorage.ppGravVis=1
+function gravVisEnabled() {
+  return !!(Draw && typeof Draw.gravVisEnabled === 'function' && Draw.gravVisEnabled());
+}
+
+function drawGravityPotentialOverlay(hole) {
+  if (!Draw || typeof Draw.drawGravityPotentialOverlay !== 'function' || !hole) return;
+  // Keep _orbitTick in sync for MP phase when present.
+  if (typeof mpSimTick === 'number' && hole._orbitTick == null) hole._orbitTick = mpSimTick;
+  const extra = portalGravityBakeStore.size
+    ? ('store=' + portalGravityBakeStore.size)
+    : '';
+  Draw.drawGravityPotentialOverlay(ctx, hole, extra ? { statusExtra: extra } : {});
+}
+
 function drawWorld() {
   const hole = currentHoles()[Game.currentHoleIndex];
+  // Lobby re-decodes strip hole._portalGravityCache; restore from store, or kick a bake.
+  if (hole) {
+    if (!hole._portalGravityCache) reattachPortalGravityBake(hole, Game.pendingCustomLvl);
+    const PG = getPortalGravityAPI();
+    if (
+      PG &&
+      typeof PG.holeNeedsPortalGravityBake === 'function' &&
+      PG.holeNeedsPortalGravityBake(hole) &&
+      !hole._portalGravityCache &&
+      !portalGravityBakeInFlight &&
+      !Game.gravityBaking
+    ) {
+      // Recovery path if mpBeginHole bake was skipped/raced.
+      Game.gravityBaking = true;
+      ensurePortalGravityBake(hole, Game.pendingCustomLvl).finally(() => {
+        Game.gravityBaking = false;
+        if (hole) reattachPortalGravityBake(hole, Game.pendingCustomLvl);
+        if (Game.customHole) reattachPortalGravityBake(Game.customHole, Game.pendingCustomLvl);
+      });
+    }
+  }
   Draw.drawHoleStatic(ctx, hole, {
     time: performance.now() / 1000,
     flagPhase: Game.flagPhase,
   });
+  drawGravityPotentialOverlay(hole);
 
   // Black-hole tracers: each ball entering a black hole's pull claims its own color.
   // Drawn BEFORE equipped cosmetic trails so it extends off the tail end of them.
@@ -858,8 +898,176 @@ function ratingLine(totalDiff) {
   return "There's always next time!";
 }
 
+// ---- Portal gravity bake (material Poisson when hole has portals + masses) ----
+const gravityLoadingEl = document.getElementById('gravity-loading');
+const gravityLoadingBar = document.getElementById('gravity-loading-bar');
+const gravityLoadingDetail = document.getElementById('gravity-loading-detail');
+const gravityLoadingText = document.getElementById('gravity-loading-text');
+/** In-flight bake token so rapid hole changes discard stale results. */
+let gravityBakeToken = 0;
+/**
+ * Bakes must not live only on the hole object: lobbyState / roundState re-decode
+ * customLvl into a fresh hole and would drop hole._portalGravityCache ("free-space only").
+ * Index the same cache under several keys so lobby re-decode still finds it.
+ */
+const portalGravityBakeStore = new Map();
+let portalGravityBakeInFlight = null;
+
+function portalGravityIdentityKey(hole) {
+  if (!hole) return '';
+  return 'id:' + (hole.name || '') +
+    '|pp:' + ((hole.portalPairs || []).length) +
+    '|gb:' + ((hole.gravityBodies || []).length) +
+    '|gt:' + ((hole.gates || []).length) +
+    '|pd:' + ((hole.pendulums || []).length);
+}
+
+function portalGravityBakeKeys(hole, lvlHint) {
+  const keys = [];
+  if (lvlHint && typeof lvlHint === 'string' && lvlHint.length) keys.push(lvlHint);
+  if (Game.pendingCustomLvl) keys.push(Game.pendingCustomLvl);
+  const id = portalGravityIdentityKey(hole);
+  if (id) keys.push(id);
+  try {
+    if (hole) keys.push('enc:' + encodeHole(hole));
+  } catch (_) { /* ignore encode failures */ }
+  return [...new Set(keys.filter(Boolean))];
+}
+
+function storePortalGravityBake(hole, cache, lvlHint) {
+  if (!cache) return;
+  if (hole) hole._portalGravityCache = cache;
+  for (const k of portalGravityBakeKeys(hole, lvlHint)) {
+    portalGravityBakeStore.set(k, cache);
+  }
+}
+
+function reattachPortalGravityBake(hole, lvlHint) {
+  if (!hole) return false;
+  if (hole._portalGravityCache && hole._portalGravityCache.frames && hole._portalGravityCache.frames.length) {
+    return true;
+  }
+  for (const k of portalGravityBakeKeys(hole, lvlHint)) {
+    if (portalGravityBakeStore.has(k)) {
+      hole._portalGravityCache = portalGravityBakeStore.get(k);
+      return true;
+    }
+  }
+  // Last resort: single-entry store (one custom hole in play)
+  if (portalGravityBakeStore.size === 1) {
+    hole._portalGravityCache = portalGravityBakeStore.values().next().value;
+    return true;
+  }
+  return false;
+}
+
+function showGravityLoading(frac, detail) {
+  if (!gravityLoadingEl) return;
+  gravityLoadingEl.classList.remove('hidden');
+  if (gravityLoadingBar) gravityLoadingBar.style.width = Math.round(Math.max(0, Math.min(1, frac)) * 100) + '%';
+  if (gravityLoadingDetail) gravityLoadingDetail.textContent = detail || '';
+}
+function hideGravityLoading() {
+  if (!gravityLoadingEl) return;
+  gravityLoadingEl.classList.add('hidden');
+  if (gravityLoadingBar) gravityLoadingBar.style.width = '0%';
+}
+
+/** Resolve PortalGravity from window/Shared (bare `PortalGravity` is unreliable). */
+function getPortalGravityAPI() {
+  try {
+    if (typeof window !== 'undefined' && window.PortalGravity) return window.PortalGravity;
+  } catch (_) { /* ignore */ }
+  try {
+    if (typeof globalThis !== 'undefined' && globalThis.PortalGravity) return globalThis.PortalGravity;
+  } catch (_) { /* ignore */ }
+  try {
+    if (window.Shared && window.Shared.PortalGravity) return window.Shared.PortalGravity;
+  } catch (_) { /* ignore */ }
+  return null;
+}
+
+/**
+ * Ensure hole._portalGravityCache is ready when portals + gravity bodies exist.
+ * Yields to the UI via PortalGravity.bakePortalGravityAsync.
+ */
+async function ensurePortalGravityBake(hole, lvlHint) {
+  const PG = getPortalGravityAPI();
+  if (!PG || !hole) {
+    if (!PG) console.warn('[gravity] PortalGravity missing — is portal-gravity.js loaded?');
+    return;
+  }
+  if (typeof PG.holeNeedsPortalGravityBake !== 'function' || !PG.holeNeedsPortalGravityBake(hole)) {
+    // Do not delete a good cache if the hole object is mid-replace with empty pairs.
+    return;
+  }
+  // Already on hole or in store.
+  if (reattachPortalGravityBake(hole, lvlHint)) return;
+  if (hole._portalGravityCache && hole._portalGravityCache.frames && hole._portalGravityCache.frames.length) {
+    storePortalGravityBake(hole, hole._portalGravityCache, lvlHint);
+    return;
+  }
+  // Coalesce concurrent bakes (roundState + draw recovery).
+  if (portalGravityBakeInFlight) {
+    await portalGravityBakeInFlight;
+    reattachPortalGravityBake(hole, lvlHint);
+    return;
+  }
+  const token = ++gravityBakeToken;
+  const period = PG.gravityPeriodTicks(hole);
+  if (gravityLoadingText) {
+    gravityLoadingText.textContent = 'Computing portal gravity…';
+  }
+  const info = PG.gravityPeriodInfo ? PG.gravityPeriodInfo(hole) : { period, rawLcm: period, capped: false };
+  let detail = info.period + ' tick period · BEM material gravity';
+  if (info.capped) detail += ' (capped from LCM ' + info.rawLcm + ')';
+  showGravityLoading(0, detail);
+  portalGravityBakeInFlight = (async () => {
+    try {
+      // Prefer async progressive bake; fall back to sync if async yields nothing.
+      let cache = await PG.bakePortalGravityAsync(hole, {
+        onProgress(p) {
+          if (token !== gravityBakeToken) return;
+          showGravityLoading(p, Math.round(p * 100) + '% · ' + info.period + ' ticks');
+        },
+      });
+      if (!cache && typeof PG.bakePortalGravity === 'function') {
+        console.warn('[gravity] async bake returned null — trying sync bake');
+        cache = PG.bakePortalGravity(hole);
+      }
+      if (token !== gravityBakeToken) return;
+      if (cache && cache.frames && cache.frames.length) {
+        storePortalGravityBake(hole, cache, lvlHint);
+        if (Game.customHole) storePortalGravityBake(Game.customHole, cache, lvlHint || Game.pendingCustomLvl);
+        if (!cache.fingerprint && typeof PG.bakeFingerprint === 'function') {
+          cache.fingerprint = PG.bakeFingerprint(cache);
+        }
+        console.log(
+          '[gravity] portal BEM bake ready',
+          cache.period, 'ticks', cache.method,
+          cache.fingerprint || '',
+          'store', portalGravityBakeStore.size,
+          cache.capped ? '(capped LCM ' + cache.rawLcm + ')' : ''
+        );
+      } else {
+        console.warn('[gravity] bake produced no cache', {
+          pairs: (hole.portalPairs || []).length,
+          bodies: (hole.gravityBodies || []).length,
+          needs: PG.holeNeedsPortalGravityBake(hole),
+        });
+      }
+    } catch (err) {
+      console.warn('portal gravity bake failed', err);
+    } finally {
+      if (token === gravityBakeToken) hideGravityLoading();
+      portalGravityBakeInFlight = null;
+    }
+  })();
+  await portalGravityBakeInFlight;
+}
+
 // ---- Game flow ----
-function loadHole(i) {
+async function loadHole(i) {
   Game.currentHoleIndex = i;
   const hole = currentHoles()[i];
   Game.strokes = 0;
@@ -870,11 +1078,21 @@ function loadHole(i) {
   resetHoleObstacles(hole);
   hud.classList.remove('hidden');
   hideAllScreens();
+  // Block aim until bake finishes so first putt uses material-space g.
+  Game.state = 'LOADING';
+  Game.gravityBaking = true;
+  updateHUD();
+  updateShareLevelButton();
+  try {
+    await ensurePortalGravityBake(hole);
+  } finally {
+    Game.gravityBaking = false;
+  }
+  if (Game.currentHoleIndex !== i) return; // navigated away
   Game.state = 'AIMING';
   resetSpeedAvgTracker(Game.speedTracker);
   resetUnsettledTimer();
   updateHUD();
-  updateShareLevelButton();
 }
 function startGame() {
   Game.scorecard = [];
@@ -1065,6 +1283,8 @@ if (btnRespawnDismiss) {
 // ---- Main loop ----
 function update(dt) {
   const hole = currentHoles()[Game.currentHoleIndex];
+  // Freeze physics while portal-gravity bake is on the loading overlay.
+  if (Game.state === 'LOADING' || Game.gravityBaking) return;
   if (MULTIPLAYER) {
     // Fixed-tick local sim (obstacles + all balls) tick-locked to the host clock.
     // Motion does not depend on a mid-flight snapshot stream.
@@ -1248,6 +1468,19 @@ function buildCustomizeUI() {
 // Multi-room relay protocol (create/join). Cosmetics + menu from main still apply.
 const MULTIPLAYER = location.protocol !== 'file:';
 const MP_PARAMS = new URLSearchParams(location.search);
+// Portal dual-sample gravity prototype: ?portalG=off|always|soi|los (default off).
+// Also localStorage.ppPortalGravity. Not a netcode field — host/client must match if used in MP.
+(function initPortalGravityMode() {
+  const S = typeof Shared !== 'undefined' ? Shared : null;
+  if (!S || typeof S.setPortalGravityMode !== 'function') return;
+  let mode = null;
+  const q = MP_PARAMS.get('portalG') || MP_PARAMS.get('portalg');
+  if (q) mode = q;
+  else {
+    try { mode = localStorage.getItem('ppPortalGravity'); } catch (_) {}
+  }
+  if (mode) S.setPortalGravityMode(mode);
+})();
 function resolveWsUrl() {
   const r = MP_PARAMS.get('relay');
   if (r) {
@@ -1266,6 +1499,8 @@ let mpPlayerId = null;
 let mpIsHost = false;
 let mpCanPutt = false;
 let mpPlaying = false;
+/** True after client BEM bake while host is still in GRAVITY_LOADING. */
+let mpAwaitingGravityGo = false;
 let mpRoomCode = null;
 // Frozen hole clock while results / lobby (hostTargetTick free-runs with wall time).
 let mpFrozenTimerMs = 0;
@@ -1670,6 +1905,8 @@ function mpApplyCustomFromLobby(msg) {
     if (d.ok) {
       Game.customHole = d.hole;
       Game.pendingCustomLvl = msg.customLvl;
+      // Re-decode drops in-memory bake; restore from store so gravvis / physics stay live.
+      reattachPortalGravityBake(Game.customHole, msg.customLvl);
     }
   } else if (msg.hasCustomHole === false) {
     // Room no longer has a custom hole — only clear if we weren't opened on a share link.
@@ -1910,12 +2147,13 @@ function mpConnect(opts = {}) {
   });
 }
 
-function mpBeginHole(msg) {
+async function mpBeginHole(msg) {
   if (msg.customLvl) {
     const d = decodeHole(msg.customLvl);
     if (d.ok) {
       Game.customHole = d.hole;
       Game.pendingCustomLvl = msg.customLvl;
+      reattachPortalGravityBake(Game.customHole, msg.customLvl);
     }
   } else if (msg.hasCustomHole === false) {
     Game.customHole = null;
@@ -1928,6 +2166,24 @@ function mpBeginHole(msg) {
     console.error('No hole for roundState', msg);
     return;
   }
+  // Same loading gate as solo: do not free-run until material gravity bake is ready.
+  Game.gravityBaking = true;
+  mpPlaying = false;
+  mpCanPutt = false;
+  gameMenuEl.classList.remove('hidden');
+  hud.classList.remove('hidden');
+  hideAllScreens();
+  setHudText(hudHole, `Hole ${msg.holeIndex + 1}/${currentHoles().length} — ${hole.name}`);
+  setHudText(hudPar, `Par ${hole.par}`);
+  await ensurePortalGravityBake(hole, msg.customLvl || Game.pendingCustomLvl);
+  // Re-bind in case lobby traffic replaced customHole during the await.
+  if (Game.customHole && Game.customHole !== hole) {
+    reattachPortalGravityBake(Game.customHole, msg.customLvl || Game.pendingCustomLvl);
+  } else {
+    reattachPortalGravityBake(hole, msg.customLvl || Game.pendingCustomLvl);
+  }
+  Game.gravityBaking = false;
+
   resetHoleObstacles(hole);
   const startTick = typeof msg.tick === 'number' ? msg.tick : 0;
   mpSimTick = startTick;
@@ -1971,23 +2227,38 @@ function mpBeginHole(msg) {
   const me = Game.players.get(mpPlayerId);
   if (me) mpSyncSelfFromPlayer(me);
   mpCanPutt = false;
-  mpPlaying = true;
-  mpStartKeepalives();
   mpFrozenTimerMs = 0;
   resetUnsettledTimer();
   resetAchvHoleCounters();
   mpInRound = true;
   if (PathTrace.enabled) PathTrace.enableHostRecording();
-  gameMenuEl.classList.remove('hidden');
-  hud.classList.remove('hidden');
-  hideAllScreens();
   setHudText(hudTotal, `Time: 0.0s`);
-  setHudText(hudHole, `Hole ${msg.holeIndex + 1}/${currentHoles().length} — ${hole.name}`);
-  setHudText(hudPar, `Par ${hole.par}`);
   // MP round does not go through loadHole — surface share control for custom holes.
   // Keep pending payload even if roundState omitted customLvl (already on client).
   if (!Game.pendingCustomLvl && msg.customLvl) Game.pendingCustomLvl = msg.customLvl;
   updateShareLevelButton();
+
+  // Host waits in GRAVITY_LOADING until every client acks bake. Tell host we are ready;
+  // free-run only after the follow-up roundState with gravityBakePending=false.
+  if (msg.gravityBakePending) {
+    mpAwaitingGravityGo = true;
+    mpPlaying = false;
+    try {
+      if (mpSocket && mpSocket.readyState === WebSocket.OPEN) {
+        mpSocket.send(JSON.stringify({
+          type: 'gravityBakeReady',
+          holeIndex: msg.holeIndex,
+        }));
+      }
+    } catch (e) {
+      console.warn('[gravity] gravityBakeReady send failed', e);
+    }
+    return;
+  }
+
+  mpAwaitingGravityGo = false;
+  mpPlaying = true;
+  mpStartKeepalives();
 }
 
 function mpNoteHostTick(tick, hostTimeMs, opts) {
@@ -3034,6 +3305,8 @@ function refreshCustomLevelPanel() {
   Game.pendingCustomLvl = lvl;
   // Do not force customHole until user chooses Play (keeps menu course select working).
   if (label) label.textContent = `Custom level: ${d.hole.name} (par ${d.hole.par})`;
+  // Warm portal-gravity bake store as soon as the share link is recognized.
+  ensurePortalGravityBake(d.hole, lvl).catch((e) => console.warn('[gravity] menu bake', e));
   updateShareLevelButton();
 }
 
@@ -3051,6 +3324,8 @@ function playCustomInRoom() {
   Game.customHole = d.hole;
   unlockAudio();
   soundClick();
+  // Start bake immediately (lobby or solo) so store is warm before the round clock runs.
+  ensurePortalGravityBake(d.hole, lvl).catch((e) => console.warn('[gravity] early bake', e));
   if (!MULTIPLAYER) {
     // Local file:// dev only — no relay.
     startGame();

@@ -52,6 +52,7 @@ const STATIC_FILES = [
   'mp-recon.js',
   'game.js',
   'shared.js',
+  'portal-gravity.js',
   'share-level.js',
   'draw.js',
   'editor.html',
