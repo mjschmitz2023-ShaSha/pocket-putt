@@ -38,7 +38,7 @@ Under lag (bidirectional proxy: ~RTT 160ms ± jitter):
 
 1. Client stamps putts with sim tick **T**; host validates and applies as of **T** via **whole-hole rewind & replay**.
 2. Concurrent / out-of-order late inputs are handled via an **append-only input log** (no corner-cutting).
-3. Trust window sized by **RTT**; **keepalives** grant/revoke trust; untrusted clocks **force-sync**.
+3. Trust window sized by **RTT**; **keepalives** are liveness (frozen-tab force-sync only); putt accept uses history bounds.
 4. Optimistic launch stays (feel); reject = silent force-sync (no special UI).
 5. Hard idle **kept as safety net** (should become no-op when healthy).
 6. Prove with 1p + `lag-proxy` + `?rbdebug=1`: idle hard `dPos ≈ 0`.
@@ -114,7 +114,12 @@ Rough healthy window: convert RTT → ticks + small jitter pad, clamp to history
 
 ### 5.2 Keepalive (client → host)
 
-Semi-regular (e.g. every **250–500ms**), not every frame:
+**Liveness only** — not a putt-accept gate. Mobile browsers (Chrome Android) throttle
+`setInterval` past ~1s even in a foreground tab; a tight wall-clock stale window
+(`~1.2s`) systematically rejected every Android putt as `untrusted` / `keepalive_stale`.
+
+Cadence: about **1s**, driven from the client **rAF loop** (not bare `setInterval`),
+plus an immediate pulse on hole start and on `visibilitychange` → visible.
 
 ```js
 {
@@ -129,10 +134,13 @@ Host tracks per player:
 
 - `lastKeepaliveTick`
 - `lastKeepaliveWall`
-- Estimated RTT / skew  
-- Trust flag  
+- Trust flag (liveness; used for frozen-tab force-sync only)
 
-**Miss 2–3 keepalives** (or frozen tab pattern) → untrusted → force-sync that client.
+Any **putt** also refreshes liveness (`noteClientAlive`).
+
+**Long silence** (~5s / several missed 1s clocks, or frozen tab) → untrusted → **one**
+force-sync for pose catch-up. Does **not** permanently reject putts; the next putt or
+`clientClock` re-trusts.
 
 ### 5.3 Monotonic floor
 
@@ -140,9 +148,9 @@ Host tracks per player:
 
 Under bidirectional lag a putt stamped at `T` routinely arrives **after** a keepalive
 stamped at `K > T` (client free-ran and sent `clientClock` while the putt was still in
-flight). Treating that as `before_keepalive` force-syncs host rest over an optimistic
+flight). Treating that as `before_keepalive` force-synced host rest over an optimistic
 coast — a hard rubber band. The history ring (`too_old`) already bounds how far back a
-putt may claim. Keepalive still gates **trust** (missed keepalives → untrusted → force-sync).
+putt may claim.
 
 ### 5.4 Putt acceptance
 
@@ -158,13 +166,14 @@ Client putt:
 
 Host accepts only if:
 
-1. Player trusted (keepalives healthy)  
-2. `T` within `[hostNow - N, hostNow]` (and not in the future past host now beyond tiny skew)  
-3. `T >= lastKeepaliveTick`  
-4. Normal gameplay rules: PLAYING, ball present, may putt (rest/quasi-rest), not floating, etc.  
-5. `T` still inside snapshot history ring  
+1. `T` within history / future queue bounds (not keepalive trust)  
+2. Normal gameplay rules: PLAYING, ball present, may putt (rest/quasi-rest), not floating, etc.  
+3. `T` still inside snapshot history ring (or queued if slightly ahead of host)
 
 Otherwise → **reject + force-sync** (no special UI).
+
+Regression: `npm run test:keepalive` (Android-style 1.5s silence, untrusted flag,
+freeze force-sync once, post-freeze putt).
 
 ---
 

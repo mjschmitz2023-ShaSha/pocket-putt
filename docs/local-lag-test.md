@@ -97,6 +97,8 @@ must be ~0 on replay while moving.
 |----------|-----------------|
 | `multi_putt_residual` | ≥3 putts; hard residual ~0 under random lag |
 | `keepalive_reorder` | putt vs newer keepalive must not `before_keepalive` |
+| **`npm run test:keepalive`** | Host unit: sparse clocks / untrusted must not reject putts; long freeze still force-syncs once |
+| **`npm run test:pw-keepalive`** | Real browser (`game.js`): force-suppress `clientClock` 1.5s/3s/5.5s then putt; Pixel+CPU cosplay. Not OS battery-saver, but the product failure mode. |
 | `varied_aims` | non-axis putts residual-match |
 | **`npm run test:e2e-clash`** | **2 clients**, multi-trial random lag, equal + asymmetric seats |
 

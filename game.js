@@ -1346,6 +1346,9 @@ function loop(ts) {
   Game.lastTime = ts;
   update(dt);
   render();
+  // Drive clientClock from the frame loop (not setInterval) so mobile throttle
+  // is tied to actual rendering, not a bare timer the OS freely clamps.
+  if (MULTIPLAYER && mpPlaying) mpMaybeSendKeepalive(false);
   requestAnimationFrame(loop);
 }
 
@@ -1514,11 +1517,17 @@ let mpHoleEpochMs = 0;
 let mpLastHostTick = 0;
 /** Client tick of the latest optimistic putt (ignore older hard snaps for self). */
 let mpLastPuttClientTick = null;
-let mpKeepaliveTimer = null;
+/** Wall time of last clientClock send (performance.now). 0 = not started. */
+let mpKeepaliveLastSentMs = 0;
 const MP_MAX_CATCH_UP = 8;
 /** Predict cap: do not free-run more than lastHostTick + N (matches host HISTORY_TICKS). */
 const MP_PREDICT_CAP_TICKS = 30;
-const MP_KEEPALIVE_MS = 333;
+/**
+ * clientClock cadence. Prefer rAF (see mpMaybeSendKeepalive) over setInterval —
+ * Android Chrome throttles timers past 1s even in a foreground tab.
+ * ~1/s is enough for frozen-tab detection and cheaper than the old 333ms blast.
+ */
+const MP_KEEPALIVE_MS = 1000;
 const MP_SOFT_ERR_PX = 10;
 const MP_HARD_ERR_PX = 80;
 const MP_ERR_DECAY_TAU = 0.12;
@@ -1878,6 +1887,43 @@ const RbDiag = {
   },
 };
 RbDiag.init();
+
+/**
+ * Headless / Playwright harness surface (only when ?rbdebug=1).
+ * Forces the failure modes real Android timer policy is hard to emulate.
+ */
+if (RbDiag.enabled) {
+  try {
+    window.MpTest = {
+      playing: () => !!mpPlaying,
+      canPutt: () => !!(mpPlaying && mpCanPutt),
+      simTick: () => mpSimTick,
+      strokes: () => {
+        const me = Game.players.get(mpPlayerId);
+        return me ? me.strokes || 0 : 0;
+      },
+      /** Same path as pointer release — optimistic local + wire putt. */
+      puttDrag(v) {
+        if (!mpPlaying || !mpSocketOpen()) return { ok: false, reason: 'not_ready' };
+        if (!v || typeof v.x !== 'number' || typeof v.y !== 'number') {
+          return { ok: false, reason: 'bad_drag' };
+        }
+        const clientTick = mpSimTick;
+        mpLastPuttClientTick = clientTick;
+        mpApplyPuttLocal(mpPlayerId, v, null, true);
+        mpSocket.send(JSON.stringify({ type: 'putt', dragVector: v, clientTick }));
+        mpCanPutt = false;
+        return { ok: true, clientTick };
+      },
+      /** Force an immediate clientClock (bypasses rAF cadence). */
+      sendKeepalive() {
+        return mpSendClientClock();
+      },
+    };
+  } catch (_) {
+    /* ignore */
+  }
+}
 
 function mpSetRelayStatus(text) {
   const el = document.getElementById('lobby-relay-status');
@@ -2315,27 +2361,46 @@ function mpOnClockSync(msg) {
   }
 }
 
+function mpSendClientClock() {
+  if (!MULTIPLAYER || !mpPlaying || !mpSocketOpen()) return false;
+  mpSocket.send(
+    JSON.stringify({
+      type: 'clientClock',
+      tick: mpSimTick,
+      clientTimeMs: Date.now(),
+      lastHostTick: mpLastHostTick,
+    })
+  );
+  mpKeepaliveLastSentMs = performance.now();
+  return true;
+}
+
+/** rAF-driven keepalive — less throttled than setInterval on mobile browsers. */
+function mpMaybeSendKeepalive(force) {
+  if (!MULTIPLAYER || !mpPlaying || !mpSocketOpen()) return;
+  const now = performance.now();
+  if (!force && mpKeepaliveLastSentMs > 0 && now - mpKeepaliveLastSentMs < MP_KEEPALIVE_MS) {
+    return;
+  }
+  mpSendClientClock();
+}
+
 function mpStartKeepalives() {
   mpStopKeepalives();
   if (!MULTIPLAYER) return;
-  mpKeepaliveTimer = setInterval(() => {
-    if (!mpPlaying || !mpSocketOpen()) return;
-    mpSocket.send(
-      JSON.stringify({
-        type: 'clientClock',
-        tick: mpSimTick,
-        clientTimeMs: Date.now(),
-        lastHostTick: mpLastHostTick,
-      })
-    );
-  }, MP_KEEPALIVE_MS);
+  // Immediate pulse so host liveness starts before the first rAF gap.
+  mpSendClientClock();
 }
 
 function mpStopKeepalives() {
-  if (mpKeepaliveTimer) {
-    clearInterval(mpKeepaliveTimer);
-    mpKeepaliveTimer = null;
-  }
+  mpKeepaliveLastSentMs = 0;
+}
+
+// Resume pulse after tab freeze / browser throttle gap (visibility API).
+if (typeof document !== 'undefined' && document.addEventListener) {
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') mpMaybeSendKeepalive(true);
+  });
 }
 
 function mpEstimatedElapsedMs() {

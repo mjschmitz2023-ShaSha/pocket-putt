@@ -62,9 +62,13 @@ function createEmptyPathTrace(code) {
 // Snapshot = end-of-tick state. Putt at clientTick T applies on restore(T), then physics T→T+1.
 const HISTORY_TICKS = 30;
 const TRUST_WINDOW_TICKS = HISTORY_TICKS;
-const KEEPALIVE_MISS_THRESHOLD = 3;
-const KEEPALIVE_EXPECT_MS = 400;
-const KEEPALIVE_STALE_MS = KEEPALIVE_MISS_THRESHOLD * KEEPALIVE_EXPECT_MS;
+// Keepalive = liveness / frozen-tab force-sync only — NOT a putt-accept gate.
+// Mobile browsers (esp. Chrome Android) throttle timers past 1s even in foreground;
+// the old 1.2s stale window rejected every Android putt as untrusted/keepalive_stale.
+// Clients aim ~1s clientClock (rAF-driven); tolerate several misses + RTT.
+const KEEPALIVE_EXPECT_MS = 1000;
+const KEEPALIVE_MISS_THRESHOLD = 5;
+const KEEPALIVE_STALE_MS = KEEPALIVE_MISS_THRESHOLD * KEEPALIVE_EXPECT_MS; // 5000
 // Max ticks a putt may be stamped in the host's future (queued until host reaches T).
 // Never clamp T down to hostNow — that guarantees a path fork / hard snap.
 const CLIENT_TICK_FUTURE_QUEUE = HISTORY_TICKS;
@@ -1268,7 +1272,8 @@ class GameSession {
   }
 
   /**
-   * Validate clientTick against trust window + keepalive floor.
+   * Validate clientTick against history / future bounds only.
+   * Keepalive liveness is NOT a putt gate (mobile timer throttle ≠ cheat).
    * @returns {{ ok: boolean, tick?: number, queue?: boolean, reason?: string }}
    * queue=true → clientTick is in the host's future; hold until host reaches T (do NOT clamp).
    */
@@ -1281,20 +1286,12 @@ class GameSession {
     if (Math.abs(T - clientTick) > 1e-3) {
       return { ok: false, reason: 'non_integer_tick' };
     }
-    // Stale keepalives revoke trust (except bootstrap before first keepalive).
-    if (player.lastKeepaliveWall > 0 && Date.now() - player.lastKeepaliveWall > KEEPALIVE_STALE_MS) {
-      player.clockTrusted = false;
-      return { ok: false, reason: 'keepalive_stale' };
-    }
-    if (player.clockTrusted === false) {
-      return { ok: false, reason: 'untrusted' };
-    }
-    // Do NOT reject T < lastKeepaliveTick.
+    // Do NOT reject for keepalive_stale / untrusted / T < lastKeepaliveTick.
+    // Keepalives only drive frozen-tab force-sync (tickDriver). Anti-cheat for putts is
+    // the history ring + future queue. Mobile setInterval throttle was falsely rejecting
+    // every Android putt once wall silence > ~1.2s.
     // Under bidirectional lag a putt stamped at T routinely arrives AFTER a keepalive
-    // stamped at K > T (client free-ran and sent clientClock while the putt was still
-    // in flight). Strict "before_keepalive" force-synced host rest over an optimistic
-    // coast — the browser rubber band with rejectReason before_keepalive.
-    // History ring (too_old) already bounds how far back a putt may claim.
+    // stamped at K > T — history ring (too_old) already bounds how far back a putt may claim.
     if (T < 0) return { ok: false, reason: 'negative' };
     // Too far in the past for history ring.
     if (T < hostNow - TRUST_WINDOW_TICKS) {
@@ -1315,14 +1312,22 @@ class GameSession {
     return { ok: true, tick: T, queue: false };
   }
 
+  /** Refresh liveness (clientClock or any putt attempt). Restores frozen-tab trust. */
+  noteClientAlive(player, tick) {
+    if (!player) return;
+    player.lastKeepaliveWall = Date.now();
+    if (typeof tick === 'number' && Number.isFinite(tick)) {
+      player.lastKeepaliveTick = Math.round(tick);
+    }
+    player.clockTrusted = true;
+  }
+
   handleClientClock(player, msg) {
     if (!player || this.state !== 'PLAYING') return;
     const tick = typeof msg.tick === 'number' ? Math.round(msg.tick) : null;
     if (tick == null || !Number.isFinite(tick)) return;
-    player.lastKeepaliveTick = tick;
-    player.lastKeepaliveWall = Date.now();
+    this.noteClientAlive(player, tick);
     if (typeof msg.lastHostTick === 'number') player.lastHostTickSeen = msg.lastHostTick;
-    player.clockTrusted = true;
   }
 
   /**
@@ -1479,7 +1484,12 @@ class GameSession {
       return;
     }
 
+    // Putt itself proves the tab is alive (Android may have throttled clientClock).
     const clientTickRaw = msg.clientTick;
+    this.noteClientAlive(
+      player,
+      typeof clientTickRaw === 'number' ? clientTickRaw : null
+    );
     const check = this.validateClientTick(player, clientTickRaw);
     if (!check.ok) {
       this.forceSyncPlayer(player, check.reason || 'bad_tick');
@@ -1599,14 +1609,15 @@ class GameSession {
       return;
     }
     if (this.state !== 'PLAYING') return;
-    // Keepalive starvation → untrusted + force-sync (silent).
+    // Keepalive starvation → frozen-tab force-sync (silent). Does NOT reject putts;
+    // a later putt/clientClock re-trusts via noteClientAlive.
     const now = Date.now();
     for (const p of this.players.values()) {
       if (!p.connected) continue;
       if (p.lastKeepaliveWall > 0 && now - p.lastKeepaliveWall > KEEPALIVE_STALE_MS) {
         if (p.clockTrusted !== false) {
           p.clockTrusted = false;
-          this.forceSyncPlayer(p);
+          this.forceSyncPlayer(p, 'keepalive_stale');
         }
       }
     }
@@ -1867,4 +1878,6 @@ module.exports = {
   HISTORY_TICKS,
   TRUST_WINDOW_TICKS,
   KEEPALIVE_STALE_MS,
+  KEEPALIVE_EXPECT_MS,
+  KEEPALIVE_MISS_THRESHOLD,
 };
