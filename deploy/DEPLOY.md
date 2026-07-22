@@ -15,8 +15,10 @@ Mirrors Chess101’s relay deploy layout (`render.yaml` + this guide).
 No separate static site. Friends only need the public URL — they do **not** download the repo.
 
 ```
-https://pocket-putt-server.onrender.com/
+https://www.pocketputt.net/
 ```
+
+(`pocketputt.net` redirects to `www`. The old `*.onrender.com` free subdomain is blocked.)
 
 1. Open the URL  
 2. **Create Room** → share the link (`/?room=ABCDEF`) or the code  
@@ -73,10 +75,10 @@ In the Render dashboard, set the service **branch = `main`**, start command **`n
 ### Verify
 
 ```bash
-curl -sS https://pocket-putt-server.onrender.com/health
+curl -sS https://www.pocketputt.net/health
 # OK
 
-curl -sS -o /dev/null -w "%{http_code}\n" https://pocket-putt-server.onrender.com/
+curl -sS -o /dev/null -w "%{http_code}\n" https://www.pocketputt.net/
 # 200  (game HTML)
 ```
 
