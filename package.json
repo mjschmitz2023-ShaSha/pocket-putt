@@ -39,6 +39,7 @@
     "test:e2e-clash": "node test/e2e-lag-proxy-clash.js",
     "test:keepalive": "node test/keepalive-trust.js",
     "test:pw-keepalive": "node test/playwright-keepalive.js",
+    "test:perf-draw": "node test/perf-draw.js",
     "test:water-drop": "node test/water-drop-sync.js",
     "test:client-clash": "node test/client-ball-clash.js",
     "test:putt-superposition": "node test/putt-superposition.js",

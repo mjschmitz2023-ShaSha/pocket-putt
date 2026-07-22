@@ -122,22 +122,12 @@
   }
 
   function nearBlackHole(x, y, hole) {
-    for (const b of hole.gravityBodies || []) {
-      if (b.kind !== 'blackHole') continue;
-      if (Math.hypot(x - b.x, y - b.y) <= blackHolePullRadius(b)) return true;
-    }
-    return false;
+    return blackHoleProximityFast(x, y, hole) > 0;
   }
 
   /** 0 at the pull edge → 1 at the black-hole center (max over all BHs; 0 if none). */
   function blackHoleProximity(x, y, hole) {
-    let best = 0;
-    for (const b of hole.gravityBodies || []) {
-      if (b.kind !== 'blackHole') continue;
-      const p = 1 - Math.hypot(x - b.x, y - b.y) / blackHolePullRadius(b);
-      if (p > best) best = p;
-    }
-    return Math.max(0, Math.min(1, best));
+    return blackHoleProximityFast(x, y, hole);
   }
 
   // One color per interaction: a global cursor starts at a random seed in [1,1000]
@@ -156,23 +146,47 @@
     const pts = obj && obj._bhTrail;
     const c = obj && obj._bhColor;
     if (!pts || pts.length < 2 || !c) return;
-    ctx.save();
+    const prevCap = ctx.lineCap;
     ctx.lineCap = 'round';
     const n = pts.length;
+    const cr = c[0];
+    const cg = c[1];
+    const cb = c[2];
+    // Same look as per-segment strokes; avoid save/restore + string alloc churn.
     for (let i = 1; i < n; i++) {
       const frac = i / (n - 1); // 0 = tail, 1 = head
-      // Proximity scale (captured per point): gradual fade-in at the pull edge,
-      // ramping hard near the horizon — reads as acceleration, keeps far trails quiet.
       const prox = pts[i].prox != null ? pts[i].prox : 0.5;
       const proxScale = 0.12 + 0.88 * Math.pow(prox, 1.6);
-      ctx.strokeStyle = 'rgba(' + c[0] + ',' + c[1] + ',' + c[2] + ',' + ((0.15 + 0.85 * frac) * proxScale).toFixed(3) + ')';
+      const a = (0.15 + 0.85 * frac) * proxScale;
+      ctx.strokeStyle = 'rgba(' + cr + ',' + cg + ',' + cb + ',' + a + ')';
       ctx.lineWidth = (1 + 2.2 * frac) * (0.7 + 0.5 * prox);
       ctx.beginPath();
       ctx.moveTo(pts[i - 1].x, pts[i - 1].y);
       ctx.lineTo(pts[i].x, pts[i].y);
       ctx.stroke();
     }
-    ctx.restore();
+    ctx.lineCap = prevCap;
+  }
+
+  /**
+   * One pass: max BH proximity in [0,1] (0 = outside all pulls).
+   * Replaces separate nearBlackHole + blackHoleProximity scans.
+   */
+  function blackHoleProximityFast(x, y, hole) {
+    let best = 0;
+    const bodies = hole.gravityBodies || [];
+    for (let bi = 0; bi < bodies.length; bi++) {
+      const b = bodies[bi];
+      if (b.kind !== 'blackHole') continue;
+      const pr = blackHolePullRadius(b);
+      const dx = x - b.x;
+      const dy = y - b.y;
+      const d2 = dx * dx + dy * dy;
+      if (d2 >= pr * pr) continue;
+      const p = 1 - Math.sqrt(d2) / pr;
+      if (p > best) best = p;
+    }
+    return best > 0 ? (best > 1 ? 1 : best) : 0;
   }
 
   /**
@@ -180,12 +194,13 @@
    * A fresh interaction (no active trail) claims the next palette color.
    */
   function updateTracerTrail(obj, x, y, hole, maxLen) {
-    if (nearBlackHole(x, y, hole)) {
+    const prox = blackHoleProximityFast(x, y, hole);
+    if (prox > 0) {
       if (!obj._bhTrail) obj._bhTrail = [];
       if (obj._bhTrail.length === 0) obj._bhColor = claimTracerColor();
       const last = obj._bhTrail[obj._bhTrail.length - 1];
-      if (!last || Math.hypot(x - last.x, y - last.y) > 1.2) {
-        obj._bhTrail.push({ x, y, prox: blackHoleProximity(x, y, hole) });
+      if (!last || (x - last.x) * (x - last.x) + (y - last.y) * (y - last.y) > 1.44) {
+        obj._bhTrail.push({ x, y, prox });
         if (obj._bhTrail.length > maxLen) obj._bhTrail.shift();
       }
     } else if (obj._bhTrail && obj._bhTrail.length) {
@@ -222,21 +237,36 @@
 
   function stepSpace(space, hole, dt) {
     const bodies = hole.gravityBodies || [];
-    for (const p of space.debris) {
+    const bodyN = bodies.length;
+    // Skip BH tracer work when the hole has no black holes (common on planet-only holes).
+    let hasBH = false;
+    for (let bi = 0; bi < bodyN; bi++) {
+      if (bodies[bi].kind === 'blackHole') {
+        hasBH = true;
+        break;
+      }
+    }
+    const maxSp = SPACE.maxSpeed;
+    const gScale = GRAVITY_G * SPACE.gravityScale;
+    for (let pi = 0; pi < space.debris.length; pi++) {
+      const p = space.debris[pi];
       let ax = 0;
       let ay = 0;
       let eaten = false;
-      for (const b of bodies) {
+      for (let bi = 0; bi < bodyN; bi++) {
+        const b = bodies[bi];
         const dx = b.x - p.x;
         const dy = b.y - p.y;
-        const r = Math.hypot(dx, dy);
-        if (r < b.radius + p.r + 1) {
+        const r2 = dx * dx + dy * dy;
+        const eatR = b.radius + p.r + 1;
+        if (r2 < eatR * eatR) {
           eaten = true;
           break;
         }
-        const a = (GRAVITY_G * b.mass * SPACE.gravityScale) / (r * r);
-        ax += (dx / r) * a;
-        ay += (dy / r) * a;
+        // a = G m / r² along unit vector = G m / r³ * (dx,dy)
+        const invR3 = gScale * b.mass / (r2 * Math.sqrt(r2));
+        ax += dx * invR3;
+        ay += dy * invR3;
       }
       if (eaten) {
         spawnSpaceDebris(p, hole, p.kind);
@@ -244,14 +274,15 @@
       }
       p.vx += ax * dt;
       p.vy += ay * dt;
-      const sp = Math.hypot(p.vx, p.vy);
-      if (sp > SPACE.maxSpeed) {
-        p.vx *= SPACE.maxSpeed / sp;
-        p.vy *= SPACE.maxSpeed / sp;
+      const sp2 = p.vx * p.vx + p.vy * p.vy;
+      if (sp2 > maxSp * maxSp) {
+        const inv = maxSp / Math.sqrt(sp2);
+        p.vx *= inv;
+        p.vy *= inv;
       }
       p.x += p.vx * dt;
       p.y += p.vy * dt;
-      updateTracerTrail(p, p.x, p.y, hole, 26);
+      if (hasBH) updateTracerTrail(p, p.x, p.y, hole, 26);
       const m = 60;
       if (p.x < -m || p.x > LOGICAL_W + m || p.y < -m || p.y > LOGICAL_H + m) {
         spawnSpaceDebris(p, hole, p.kind);
@@ -282,6 +313,38 @@
     return space;
   }
 
+  // Static space plate: black void + two nebulae (never animate). Built once.
+  let _spacePlateCanvas = null;
+  function getSpacePlate() {
+    if (_spacePlateCanvas) return _spacePlateCanvas;
+    if (typeof document === 'undefined') return null;
+    const c = document.createElement('canvas');
+    c.width = LOGICAL_W;
+    c.height = LOGICAL_H;
+    const g = c.getContext('2d');
+    if (!g) return null;
+    g.fillStyle = '#04060c';
+    g.fillRect(0, 0, LOGICAL_W, LOGICAL_H);
+    let neb = g.createRadialGradient(
+      LOGICAL_W * 0.72, LOGICAL_H * 0.25, 20,
+      LOGICAL_W * 0.72, LOGICAL_H * 0.25, 340
+    );
+    neb.addColorStop(0, 'rgba(96,72,160,0.10)');
+    neb.addColorStop(1, 'rgba(96,72,160,0)');
+    g.fillStyle = neb;
+    g.fillRect(0, 0, LOGICAL_W, LOGICAL_H);
+    neb = g.createRadialGradient(
+      LOGICAL_W * 0.2, LOGICAL_H * 0.8, 20,
+      LOGICAL_W * 0.2, LOGICAL_H * 0.8, 300
+    );
+    neb.addColorStop(0, 'rgba(40,110,150,0.08)');
+    neb.addColorStop(1, 'rgba(40,110,150,0)');
+    g.fillStyle = neb;
+    g.fillRect(0, 0, LOGICAL_W, LOGICAL_H);
+    _spacePlateCanvas = c;
+    return c;
+  }
+
   function drawSpace(ctx, hole, timeSec) {
     const t = timeSec != null ? timeSec : nowSec();
     if (!hole._space) hole._space = initSpace(hole);
@@ -290,38 +353,48 @@
     space.lastT = t;
     if (dt > 0) stepSpace(space, hole, dt);
 
-    ctx.fillStyle = '#04060c';
-    ctx.fillRect(0, 0, LOGICAL_W, LOGICAL_H);
-    let neb = ctx.createRadialGradient(LOGICAL_W * 0.72, LOGICAL_H * 0.25, 20, LOGICAL_W * 0.72, LOGICAL_H * 0.25, 340);
-    neb.addColorStop(0, 'rgba(96,72,160,0.10)');
-    neb.addColorStop(1, 'rgba(96,72,160,0)');
-    ctx.fillStyle = neb;
-    ctx.fillRect(0, 0, LOGICAL_W, LOGICAL_H);
-    neb = ctx.createRadialGradient(LOGICAL_W * 0.2, LOGICAL_H * 0.8, 20, LOGICAL_W * 0.2, LOGICAL_H * 0.8, 300);
-    neb.addColorStop(0, 'rgba(40,110,150,0.08)');
-    neb.addColorStop(1, 'rgba(40,110,150,0)');
-    ctx.fillStyle = neb;
-    ctx.fillRect(0, 0, LOGICAL_W, LOGICAL_H);
+    const plate = getSpacePlate();
+    if (plate) ctx.drawImage(plate, 0, 0);
+    else {
+      // Node / no-document fallback — same look as the plate.
+      ctx.fillStyle = '#04060c';
+      ctx.fillRect(0, 0, LOGICAL_W, LOGICAL_H);
+    }
 
-    for (const s of space.stars) {
-      const a = Math.max(0, Math.min(1, s.base + Math.sin(t * s.w + s.ph) * s.amp));
-      ctx.fillStyle = 'rgba(255,255,255,' + a.toFixed(3) + ')';
+    // Twinkle: one white style + globalAlpha (no per-star rgba string alloc).
+    ctx.fillStyle = '#ffffff';
+    const stars = space.stars;
+    for (let i = 0; i < stars.length; i++) {
+      const s = stars[i];
+      let a = s.base + Math.sin(t * s.w + s.ph) * s.amp;
+      if (a < 0) a = 0;
+      else if (a > 1) a = 1;
+      ctx.globalAlpha = a;
       ctx.beginPath();
       ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
       ctx.fill();
     }
+    ctx.globalAlpha = 1;
 
     // Tracers for debris being pulled into a black hole (under the debris dots) —
     // each interaction wears its own claimed palette color.
-    for (const p of space.debris) drawTracerTrail(ctx, p);
+    const debris = space.debris;
+    for (let i = 0; i < debris.length; i++) drawTracerTrail(ctx, debris[i]);
 
-    for (const p of space.debris) {
-      if (p.kind === 'dust') {
-        ctx.fillStyle = 'rgba(200,210,230,0.5)';
-        ctx.beginPath();
-        ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
-        ctx.fill();
-      } else if (p.kind === 'comet') {
+    // Dust: shared style. Comets / planetoids: same look, less state thrash.
+    ctx.fillStyle = 'rgba(200,210,230,0.5)';
+    for (let i = 0; i < debris.length; i++) {
+      const p = debris[i];
+      if (p.kind !== 'dust') continue;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    const prevCap = ctx.lineCap;
+    ctx.lineCap = 'round';
+    for (let i = 0; i < debris.length; i++) {
+      const p = debris[i];
+      if (p.kind === 'comet') {
         const sp = Math.hypot(p.vx, p.vy) || 1;
         const tail = Math.min(46, 10 + sp * 0.18);
         const tx = p.x - (p.vx / sp) * tail;
@@ -331,7 +404,6 @@
         grad.addColorStop(1, 'rgba(180,220,255,0)');
         ctx.strokeStyle = grad;
         ctx.lineWidth = p.r * 1.6;
-        ctx.lineCap = 'round';
         ctx.beginPath();
         ctx.moveTo(p.x, p.y);
         ctx.lineTo(tx, ty);
@@ -340,8 +412,10 @@
         ctx.beginPath();
         ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
         ctx.fill();
-      } else {
-        const g = ctx.createRadialGradient(p.x - p.r * 0.35, p.y - p.r * 0.35, p.r * 0.2, p.x, p.y, p.r);
+      } else if (p.kind === 'planetoid') {
+        const g = ctx.createRadialGradient(
+          p.x - p.r * 0.35, p.y - p.r * 0.35, p.r * 0.2, p.x, p.y, p.r
+        );
         g.addColorStop(0, p.c1);
         g.addColorStop(1, p.c2);
         ctx.fillStyle = g;
@@ -350,6 +424,7 @@
         ctx.fill();
       }
     }
+    ctx.lineCap = prevCap;
   }
 
   function drawSandZone(ctx, z, space) {
@@ -944,32 +1019,103 @@
     ctx.stroke();
   }
 
-  function sampleBilinearRGBA(data, w, h, x, y) {
-    x = Math.max(0, Math.min(w - 1.001, x));
-    y = Math.max(0, Math.min(h - 1.001, y));
+  /**
+   * Bilinear sample into d[di..di+3] (no intermediate array alloc).
+   * Same math as sampleBilinearRGBA.
+   */
+  function sampleBilinearInto(data, w, h, x, y, d, di) {
+    if (x < 0) x = 0;
+    else if (x > w - 1.001) x = w - 1.001;
+    if (y < 0) y = 0;
+    else if (y > h - 1.001) y = h - 1.001;
     const x0 = x | 0;
     const y0 = y | 0;
     const x1 = x0 + 1;
     const y1 = y0 + 1;
     const fx = x - x0;
     const fy = y - y0;
+    const ifx = 1 - fx;
+    const ify = 1 - fy;
+    const w00 = ifx * ify;
+    const w10 = fx * ify;
+    const w01 = ifx * fy;
+    const w11 = fx * fy;
     const i00 = (y0 * w + x0) * 4;
     const i10 = (y0 * w + x1) * 4;
     const i01 = (y1 * w + x0) * 4;
     const i11 = (y1 * w + x1) * 4;
-    const ifx = 1 - fx;
-    const ify = 1 - fy;
-    return [
-      data[i00] * ifx * ify + data[i10] * fx * ify + data[i01] * ifx * fy + data[i11] * fx * fy,
-      data[i00 + 1] * ifx * ify + data[i10 + 1] * fx * ify + data[i01 + 1] * ifx * fy + data[i11 + 1] * fx * fy,
-      data[i00 + 2] * ifx * ify + data[i10 + 2] * fx * ify + data[i01 + 2] * ifx * fy + data[i11 + 2] * fx * fy,
-      data[i00 + 3] * ifx * ify + data[i10 + 3] * fx * ify + data[i01 + 3] * ifx * fy + data[i11 + 3] * fx * fy,
-    ];
+    d[di] = data[i00] * w00 + data[i10] * w10 + data[i01] * w01 + data[i11] * w11;
+    d[di + 1] = data[i00 + 1] * w00 + data[i10 + 1] * w10 + data[i01 + 1] * w01 + data[i11 + 1] * w11;
+    d[di + 2] = data[i00 + 2] * w00 + data[i10 + 2] * w10 + data[i01 + 2] * w01 + data[i11 + 2] * w11;
+    d[di + 3] = data[i00 + 3] * w00 + data[i10 + 3] * w10 + data[i01 + 3] * w01 + data[i11 + 3] * w11;
+  }
+
+  function sampleBilinearRGBA(data, w, h, x, y) {
+    const tmp = [0, 0, 0, 0];
+    sampleBilinearInto(data, w, h, x, y, tmp, 0);
+    return tmp;
+  }
+
+  // Reused warp destination buffer (getImageData still allocates src each frame).
+  const _lensDst = { w: 0, h: 0, img: null };
+  // Radial scale LUT: scale[r] for integer r in [0, ceil(rOut)] at current dpr.
+  // Exact lens formula precomputed once per dpr — same pixels, far less per-frame math.
+  let _lensScaleLut = null;
+  let _lensLutDpr = 0;
+  let _lensLutRs = 0;
+  let _lensLutROut = 0;
+
+  function ensureLensScaleLut(dpr) {
+    const rs = BH_LENS.rsLogical * dpr;
+    const rOut = BH_LENS.rOutLogical * dpr;
+    if (
+      _lensScaleLut &&
+      _lensLutDpr === dpr &&
+      _lensLutRs === rs &&
+      _lensLutROut === rOut
+    ) {
+      return { lut: _lensScaleLut, rs, rOut };
+    }
+    const lensK = BH_LENS.lensK;
+    const fallPow = BH_LENS.fallPow;
+    const denMin = BH_LENS.denMin;
+    const mix = BH_LENS.mix;
+    const n = Math.ceil(rOut) + 3;
+    const lut = new Float32Array(n);
+    const invBand = 1 / (rOut - rs);
+    const kRs = lensK * rs;
+    const rOutCap = rOut * 0.998;
+    for (let ri = 0; ri < n; ri++) {
+      // Sample at pixel-center radii (matches px = x0+i+0.5 style continuous r).
+      const r = ri + 0.5;
+      if (r < rs || r < 1e-4) {
+        lut[ri] = -1; // event horizon → black
+        continue;
+      }
+      if (r >= rOut) {
+        lut[ri] = 0; // outside → copy
+        continue;
+      }
+      const fall = 1 - (r - rs) * invBand;
+      const fallClamped = fall > 0 ? fall : 0;
+      const den = 1 - kRs / r;
+      const schwarz = r / (den > denMin ? den : denMin);
+      let rSrc = r + (schwarz - r) * mix * Math.pow(fallClamped, fallPow);
+      if (rSrc < r) rSrc = r;
+      if (rSrc > rOutCap) rSrc = rOutCap;
+      lut[ri] = rSrc / r;
+    }
+    _lensScaleLut = lut;
+    _lensLutDpr = dpr;
+    _lensLutRs = rs;
+    _lensLutROut = rOut;
+    return { lut, rs, rOut };
   }
 
   /**
    * Approach B: screen-space gravitational lens.
    * getImageData is in device pixels; scale by buffer/logical ratio (or opts.dpr).
+   * Hot path: radial scale LUT + reused dst buffer + inlined bilinear (same visual).
    */
   function warpBlackHoleLens(ctx, body, opts) {
     opts = opts || {};
@@ -981,12 +1127,7 @@
     }
     const cx = body.x * dpr;
     const cy = body.y * dpr;
-    const rs = BH_LENS.rsLogical * dpr;
-    const rOut = BH_LENS.rOutLogical * dpr;
-    const lensK = BH_LENS.lensK;
-    const fallPow = BH_LENS.fallPow;
-    const denMin = BH_LENS.denMin;
-    const mix = BH_LENS.mix;
+    const { lut, rs, rOut } = ensureLensScaleLut(dpr);
 
     const pad = Math.ceil(rOut) + 2;
     const x0 = Math.max(0, Math.floor(cx - pad));
@@ -1003,27 +1144,35 @@
     } catch (err) {
       return;
     }
-    const dst = ctx.createImageData(w, h);
+    if (!_lensDst.img || _lensDst.w !== w || _lensDst.h !== h) {
+      _lensDst.img = ctx.createImageData(w, h);
+      _lensDst.w = w;
+      _lensDst.h = h;
+    }
     const s = src.data;
-    const d = dst.data;
+    const d = _lensDst.img.data;
+    const rs2 = rs * rs;
+    const rOut2 = rOut * rOut;
+    const lutMax = lut.length - 1;
 
     for (let j = 0; j < h; j++) {
+      const py = y0 + j + 0.5;
+      const dy = py - cy;
+      const row = j * w;
       for (let i = 0; i < w; i++) {
-        const di = (j * w + i) * 4;
+        const di = (row + i) * 4;
         const px = x0 + i + 0.5;
-        const py = y0 + j + 0.5;
         const dx = px - cx;
-        const dy = py - cy;
-        const r = Math.hypot(dx, dy);
+        const r2 = dx * dx + dy * dy;
 
-        if (r < rs) {
+        if (r2 < rs2) {
           d[di] = 0;
           d[di + 1] = 0;
           d[di + 2] = 0;
           d[di + 3] = 255;
           continue;
         }
-        if (r >= rOut || r < 1e-4) {
+        if (r2 >= rOut2) {
           d[di] = s[di];
           d[di + 1] = s[di + 1];
           d[di + 2] = s[di + 2];
@@ -1031,22 +1180,31 @@
           continue;
         }
 
-        const fall = 1 - (r - rs) / (rOut - rs);
-        const schwarz = r / Math.max(denMin, 1 - (lensK * rs) / r);
-        let rSrc = r + (schwarz - r) * mix * Math.pow(Math.max(0, fall), fallPow);
-        rSrc = Math.min(Math.max(rSrc, r), rOut * 0.998);
-
-        const scale = rSrc / r;
-        const sx = cx + dx * scale - x0;
-        const sy = cy + dy * scale - y0;
-        const rgba = sampleBilinearRGBA(s, w, h, sx, sy);
-        d[di] = rgba[0];
-        d[di + 1] = rgba[1];
-        d[di + 2] = rgba[2];
-        d[di + 3] = rgba[3];
+        const r = Math.sqrt(r2);
+        // LUT is indexed by floor(r - 0.5) so entry ri models radius ri+0.5.
+        let ri = (r - 0.5) | 0;
+        if (ri < 0) ri = 0;
+        if (ri > lutMax) ri = lutMax;
+        const scale = lut[ri];
+        if (scale <= 0) {
+          // 0 = outside copy, -1 = horizon (should be rare after rs2 check)
+          if (scale < 0) {
+            d[di] = 0;
+            d[di + 1] = 0;
+            d[di + 2] = 0;
+            d[di + 3] = 255;
+          } else {
+            d[di] = s[di];
+            d[di + 1] = s[di + 1];
+            d[di + 2] = s[di + 2];
+            d[di + 3] = s[di + 3];
+          }
+          continue;
+        }
+        sampleBilinearInto(s, w, h, cx + dx * scale - x0, cy + dy * scale - y0, d, di);
       }
     }
-    ctx.putImageData(dst, x0, y0);
+    ctx.putImageData(_lensDst.img, x0, y0);
   }
 
   function drawBlackHoleOverlay(ctx, body) {
@@ -1056,16 +1214,18 @@
     ctx.beginPath();
     ctx.arc(body.x, body.y, rs * 1.18, 0, Math.PI * 2);
     ctx.fill();
-    // Photon ring hugging the shadow — white-hot, with a faint warm bloom.
-    ctx.save();
-    ctx.shadowColor = 'rgba(255,190,110,0.9)';
-    ctx.shadowBlur = 6;
+    // Photon ring: soft bloom without canvas shadowBlur (very expensive on mobile GPUs).
+    // Two stacked strokes approximate the old shadowBlur:6 warm glow.
+    ctx.strokeStyle = 'rgba(255,190,110,0.35)';
+    ctx.lineWidth = 5;
+    ctx.beginPath();
+    ctx.arc(body.x, body.y, rs * 1.32, 0, Math.PI * 2);
+    ctx.stroke();
     ctx.strokeStyle = 'rgba(255,244,224,0.95)';
     ctx.lineWidth = 1.6;
     ctx.beginPath();
     ctx.arc(body.x, body.y, rs * 1.32, 0, Math.PI * 2);
     ctx.stroke();
-    ctx.restore();
     // Faint secondary lensed image of the ring.
     ctx.strokeStyle = 'rgba(255,200,150,0.3)';
     ctx.lineWidth = 0.8;
@@ -1147,17 +1307,17 @@
     ctx.fill();
     if (space) {
       // A dark cup vanishes on a black sky — ring the outside edge so it always reads.
-      // Soft white drop shadow under the ring keeps it from getting lost in the debris field.
-      ctx.save();
-      ctx.shadowColor = 'rgba(255,255,255,0.75)';
-      ctx.shadowBlur = 5;
-      ctx.shadowOffsetY = 2;
+      // Soft halo without shadowBlur (blur is a known mobile GPU tax).
+      ctx.strokeStyle = 'rgba(255,255,255,0.28)';
+      ctx.lineWidth = 4;
+      ctx.beginPath();
+      ctx.arc(x, y + 1.2, hole.cup.radius + 1, 0, Math.PI * 2);
+      ctx.stroke();
       ctx.strokeStyle = 'rgba(255,255,255,0.9)';
       ctx.lineWidth = 1.5;
       ctx.beginPath();
       ctx.arc(x, y, hole.cup.radius + 1, 0, Math.PI * 2);
       ctx.stroke();
-      ctx.restore();
     }
 
     const stickTop = y - 46;
@@ -1210,6 +1370,148 @@
     const blackHoles = (hole.gravityBodies || []).filter((b) => b.kind === 'blackHole');
     for (const b of blackHoles) warpBlackHoleLens(ctx, b, opts);
     for (const b of blackHoles) drawBlackHoleOverlay(ctx, b);
+  }
+
+  /**
+   * Timed variant of drawHoleStatic for perf-draw harness / ?drawperf diagnostics.
+   * Same paint order and visuals; returns stage ms (and percent of total).
+   *
+   * Stages:
+   *   backdrop   — grass OR full space (step + plate + stars + tracers + debris)
+   *   zones      — sand/water/sticky/boost/ramps
+   *   bodies     — planets/moons/BH accretion (pre-lens)
+   *   geometry   — boundary, walls, windmills, pendulums, gates, portals
+   *   cup        — hole + flag
+   *   lens_warp  — getImageData + per-pixel warp (usually the heavy hit)
+   *   lens_overlay — horizon + photon ring after warp
+   *   total
+   *
+   * When space: also space_step, space_paint (backdrop split).
+   */
+  function profileDrawHoleStatic(ctx, hole, opts) {
+    opts = opts || {};
+    const now =
+      typeof performance !== 'undefined' && performance.now
+        ? () => performance.now()
+        : () => Date.now();
+    const stages = Object.create(null);
+    let markT = now();
+    function mark(name) {
+      const t1 = now();
+      stages[name] = (stages[name] || 0) + (t1 - markT);
+      markT = t1;
+    }
+
+    const t0 = markT;
+    const t = nowSec(opts);
+    const flagPhase = opts.flagPhase != null ? opts.flagPhase : 0;
+    const space = (hole.gravityBodies || []).length > 0;
+
+    if (space) {
+      // Split step vs paint: step first, then drawSpace with lastT already at t so dt=0.
+      if (!hole._space) hole._space = initSpace(hole);
+      const sp = hole._space;
+      const dt = sp.lastT == null ? 0 : Math.min(Math.max(t - sp.lastT, 0), SPACE.maxDt);
+      if (dt > 0) stepSpace(sp, hole, dt);
+      sp.lastT = t;
+      mark('space_step');
+      drawSpace(ctx, hole, t); // paint only (dt≈0)
+      mark('space_paint');
+      stages.backdrop = (stages.space_step || 0) + (stages.space_paint || 0);
+    } else {
+      drawGrass(ctx);
+      mark('backdrop');
+    }
+
+    for (const z of hole.sand || []) drawSandZone(ctx, z, space);
+    for (const z of hole.water || []) drawWaterZone(ctx, z, t);
+    for (const z of hole.sticky || []) drawStickyZone(ctx, z, t);
+    for (const z of hole.boost || []) drawBoostZone(ctx, z, t);
+    for (const z of hole.ramps || []) drawRampZone(ctx, z);
+    mark('zones');
+
+    for (const b of hole.gravityBodies || []) drawGravityBody(ctx, b, t);
+    mark('bodies');
+
+    drawBoundary(ctx);
+    for (const w of hole.walls || []) drawWallSegment(ctx, w, space);
+    for (const wm of hole.windmills || []) drawWindmill(ctx, wm);
+    for (const p of hole.pendulums || []) drawPendulum(ctx, p);
+    for (const g of hole.gates || []) drawSlidingGate(ctx, g);
+    drawPortals(ctx, hole);
+    mark('geometry');
+
+    drawHoleAndFlag(ctx, hole, flagPhase, space);
+    mark('cup');
+
+    const blackHoles = (hole.gravityBodies || []).filter((b) => b.kind === 'blackHole');
+    for (const b of blackHoles) warpBlackHoleLens(ctx, b, opts);
+    mark('lens_warp');
+    for (const b of blackHoles) drawBlackHoleOverlay(ctx, b);
+    mark('lens_overlay');
+
+    stages.total = now() - t0;
+    stages.blackHoleCount = blackHoles.length;
+    stages.space = space ? 1 : 0;
+    stages.gravityBodyCount = (hole.gravityBodies || []).length;
+    return stages;
+  }
+
+  /** Aggregate many profile samples: mean ms + % of mean total per stage. */
+  function summarizeDrawProfile(samples) {
+    const stageNames = [
+      'space_step',
+      'space_paint',
+      'backdrop',
+      'zones',
+      'bodies',
+      'geometry',
+      'cup',
+      'lens_warp',
+      'lens_overlay',
+      'total',
+    ];
+    const acc = Object.create(null);
+    const counts = Object.create(null);
+    for (let i = 0; i < samples.length; i++) {
+      const s = samples[i];
+      for (let k = 0; k < stageNames.length; k++) {
+        const name = stageNames[k];
+        if (s[name] == null) continue;
+        acc[name] = (acc[name] || 0) + s[name];
+        counts[name] = (counts[name] || 0) + 1;
+      }
+    }
+    const mean = Object.create(null);
+    for (const name of stageNames) {
+      if (!counts[name]) continue;
+      mean[name] = acc[name] / counts[name];
+    }
+    const total = mean.total || 0;
+    const pct = Object.create(null);
+    for (const name of stageNames) {
+      if (mean[name] == null || name === 'total') continue;
+      pct[name] = total > 0 ? (100 * mean[name]) / total : 0;
+    }
+    // Rank leaf stages only (avoid double-counting backdrop = space_step + space_paint).
+    const hasSpaceSplit = mean.space_step != null || mean.space_paint != null;
+    const ranked = Object.keys(mean)
+      .filter((n) => {
+        if (n === 'total' || n === 'space' || n.endsWith('Count')) return false;
+        if (hasSpaceSplit && n === 'backdrop') return false;
+        if (!hasSpaceSplit && (n === 'space_step' || n === 'space_paint')) return false;
+        return true;
+      })
+      .map((n) => ({ stage: n, ms: mean[n], pct: pct[n] || 0 }))
+      .sort((a, b) => b.ms - a.ms);
+    return {
+      frames: samples.length,
+      meanMs: mean,
+      pctOfTotal: pct,
+      ranked,
+      budget60fps: 1000 / 60,
+      fracOfFrame: total > 0 ? total / (1000 / 60) : 0,
+    };
   }
 
   // ---- Gravity field visualization (game + editor test) ----
@@ -1441,6 +1743,8 @@
     drawHoleAndFlag,
     drawPortals,
     drawHoleStatic,
+    profileDrawHoleStatic,
+    summarizeDrawProfile,
     gravVisEnabled,
     drawGravityPotentialOverlay,
   };

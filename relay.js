@@ -62,6 +62,7 @@ const STATIC_FILES = [
   'editor.css',
   'path-trace.html',
   'path-trace-viewer.js',
+  'perf-draw.html',
   'putt.wav',
   'echoey_putt.wav',
   'putt_go_in.wav',

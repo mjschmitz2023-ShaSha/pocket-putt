@@ -1779,6 +1779,7 @@ if (PathTrace.enabled) {
 // ---- Rubber-band detector (observe only — never changes physics) ----
 // Enable: ?rbdebug=1  or  localStorage.ppRbDebug = '1'
 // Live RTT lag for realism must come from lag-proxy.js (bidirectional), not here.
+// When enabled, [RB] lines also mirror to an on-screen panel (mobile-friendly).
 function mpRbDebugEnabled() {
   const q = MP_PARAMS.get('rbdebug');
   if (q === '0' || q === 'false') return false;
@@ -1793,15 +1794,119 @@ const RbDiag = {
   softIgnoredMoving: 0,
   puttResyncs: 0, // self puttApplied re-applied pose after already coasting
   events: [],
+  panel: null,
+  logEl: null,
+  maxScreenLines: 80,
   init() {
     this.enabled = mpRbDebugEnabled();
     if (!this.enabled) return;
     try { window.RbDiag = this; } catch (_) {}
-    console.info(
-      '[RB] rubber-band detector ON — hard snaps while moving are the signal. ' +
-      'For realistic lag use lag-proxy (npm run lag-proxy), not one-way client delay. ' +
-      'Dump: RbDiag.summary()'
+    this.ensurePanel();
+    this.log(
+      'detector_on',
+      'hard snaps while moving = rubber band; putt rejects show rejectReason. Dump: RbDiag.summary()'
     );
+  },
+  ensurePanel() {
+    if (this.panel || typeof document === 'undefined') return;
+    const panel = document.createElement('div');
+    panel.id = 'rb-debug-panel';
+    panel.setAttribute('aria-live', 'polite');
+    panel.innerHTML =
+      '<div class="rb-debug-head">' +
+      '<span class="rb-debug-title">RB debug</span>' +
+      '<span class="rb-debug-hint">?rbdebug=1</span>' +
+      '<button type="button" class="rb-debug-btn" data-rb="clear">Clear</button>' +
+      '<button type="button" class="rb-debug-btn" data-rb="copy">Copy</button>' +
+      '<button type="button" class="rb-debug-btn" data-rb="min">Hide</button>' +
+      '</div>' +
+      '<div class="rb-debug-log" id="rb-debug-log"></div>';
+    document.body.appendChild(panel);
+    this.panel = panel;
+    this.logEl = panel.querySelector('#rb-debug-log');
+    panel.addEventListener('click', (e) => {
+      const btn = e.target && e.target.closest && e.target.closest('[data-rb]');
+      if (!btn) return;
+      const act = btn.getAttribute('data-rb');
+      if (act === 'clear') {
+        if (this.logEl) this.logEl.textContent = '';
+        this.log('cleared', '');
+      } else if (act === 'copy') {
+        const text = this.logEl ? this.logEl.innerText : '';
+        const done = () => this.log('copied', (text.length || 0) + ' chars');
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(done).catch(() => {
+            try {
+              const ta = document.createElement('textarea');
+              ta.value = text;
+              document.body.appendChild(ta);
+              ta.select();
+              document.execCommand('copy');
+              ta.remove();
+              done();
+            } catch (_) {
+              this.log('copy_failed', '');
+            }
+          });
+        }
+      } else if (act === 'min') {
+        panel.classList.toggle('rb-debug-collapsed');
+        btn.textContent = panel.classList.contains('rb-debug-collapsed') ? 'Show' : 'Hide';
+      }
+    });
+  },
+  _fmtPayload(data) {
+    if (data == null || data === '') return '';
+    if (typeof data === 'string') return data;
+    try {
+      // Compact single-line JSON for phone screens.
+      return JSON.stringify(data);
+    } catch (_) {
+      return String(data);
+    }
+  },
+  /**
+   * Console + on-screen. Always mirrors to console; screen only when enabled.
+   * @param {string} tag
+   * @param {object|string|null} data
+   */
+  log(tag, data) {
+    try {
+      if (data !== undefined && data !== '') console.info('[RB] ' + tag, data);
+      else console.info('[RB] ' + tag);
+    } catch (_) {}
+    if (!this.enabled) return;
+    this.ensurePanel();
+    if (!this.logEl) return;
+    const line = document.createElement('div');
+    line.className = 'rb-debug-line';
+    const rej =
+      data && typeof data === 'object' && data.rejectReason
+        ? String(data.rejectReason)
+        : '';
+    if (
+      rej ||
+      tag === 'force_sync_or_resync' ||
+      tag === 'hard_snap_while_moving' ||
+      tag === 'putt_resync'
+    ) {
+      line.classList.add('rb-debug-hot');
+    }
+    const t = new Date();
+    const ts =
+      String(t.getHours()).padStart(2, '0') +
+      ':' +
+      String(t.getMinutes()).padStart(2, '0') +
+      ':' +
+      String(t.getSeconds()).padStart(2, '0');
+    const payload = this._fmtPayload(data);
+    const rejBit = rej ? ' ★ ' + rej : '';
+    line.textContent = ts + ' ' + tag + rejBit + (payload ? ' ' + payload : '');
+    this.logEl.appendChild(line);
+    while (this.logEl.childNodes.length > this.maxScreenLines) {
+      this.logEl.removeChild(this.logEl.firstChild);
+    }
+    this.logEl.scrollTop = this.logEl.scrollHeight;
   },
   _push(ev) {
     this.events.push(ev);
@@ -1853,10 +1958,10 @@ const RbDiag = {
     if (moving && dPos >= 0.5 && meta.applied !== false) {
       this.hardMoving++;
       this._push(ev);
-      console.info('[RB] hard_snap_while_moving', ev);
+      this.log('hard_snap_while_moving', ev);
     } else if (dPos >= 2) {
       this._push(ev);
-      console.info('[RB] hard_snap', ev);
+      this.log('hard_snap', ev);
     }
   },
   notePuttResync(info) {
@@ -1864,7 +1969,7 @@ const RbDiag = {
     this.puttResyncs++;
     const ev = { t: performance.now(), kind: 'putt_resync', ...info };
     this._push(ev);
-    console.info('[RB] putt_resync (re-applied puttApplied pose)', ev);
+    this.log('putt_resync', ev);
   },
   summary() {
     const out = {
@@ -1874,7 +1979,7 @@ const RbDiag = {
       puttResyncs: this.puttResyncs,
       recent: this.events.slice(-20),
     };
-    console.info('[RB] summary', out);
+    this.log('summary', out);
     return out;
   },
   reset() {
@@ -1883,7 +1988,8 @@ const RbDiag = {
     this.softIgnoredMoving = 0;
     this.puttResyncs = 0;
     this.events = [];
-    console.info('[RB] counters reset');
+    if (this.logEl) this.logEl.textContent = '';
+    this.log('counters_reset', '');
   },
 };
 RbDiag.init();
@@ -2967,20 +3073,19 @@ function mpApplyCorrection(msg) {
         rejectReason: msg.rejectReason,
       });
       if (vis.pathCatchup || vis.dPos > 3) {
-        try {
-          console.info('[RB] path_mismatch_after_resim', {
-            reason,
-            sampleTick: tick,
-            clientTickBefore,
-            stepsGoal,
-            stepsRun,
-            hitCap,
-            dPos: Math.round(vis.dPos * 10) / 10,
-            dV: Math.round(vis.dV * 10) / 10,
-            pathSamples: path ? path.length : 0,
-            pathCatchup: vis.pathCatchup,
-          });
-        } catch (_) {}
+        RbDiag.log('path_mismatch_after_resim', {
+          reason,
+          sampleTick: tick,
+          clientTickBefore,
+          stepsGoal,
+          stepsRun,
+          hitCap,
+          dPos: Math.round(vis.dPos * 10) / 10,
+          dV: Math.round(vis.dV * 10) / 10,
+          pathSamples: path ? path.length : 0,
+          pathCatchup: vis.pathCatchup,
+          rejectReason: msg.rejectReason || null,
+        });
       }
     }
   }
@@ -2992,14 +3097,12 @@ function mpApplyCorrection(msg) {
     mpStartVisualPath(p, b.path);
   }
   if (msg.rejectReason || reason === 'resync') {
-    try {
-      console.info('[RB] force_sync_or_resync', {
-        rejectReason: msg.rejectReason || null,
-        tick,
-        reason,
-        clientTick: clientTickBefore,
-      });
-    } catch (_) {}
+    RbDiag.log('force_sync_or_resync', {
+      rejectReason: msg.rejectReason || null,
+      tick,
+      reason,
+      clientTick: clientTickBefore,
+    });
   }
 
   // Hard already seeded poses (+ resim). Events are juice only — no second authority.

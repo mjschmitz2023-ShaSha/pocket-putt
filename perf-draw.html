@@ -1,0 +1,573 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Draw perf harness — Pocket Putt</title>
+<style>
+  :root {
+    --bg: #0e1218;
+    --panel: #171d26;
+    --text: #e8eef6;
+    --muted: #8b9bb0;
+    --accent: #7eb8ff;
+    --border: #2a3444;
+    --ok: #5dca8a;
+    --warn: #e6b84d;
+    --bad: #e86a6a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+  }
+  header {
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border);
+  }
+  header h1 { margin: 0 0 6px; font-size: 18px; }
+  header p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.45; max-width: 72em; }
+  .layout {
+    display: grid;
+    grid-template-columns: minmax(280px, 360px) 1fr;
+    min-height: calc(100vh - 90px);
+  }
+  @media (max-width: 900px) {
+    .layout { grid-template-columns: 1fr; }
+  }
+  aside {
+    border-right: 1px solid var(--border);
+    background: var(--panel);
+    padding: 14px 16px 28px;
+    overflow: auto;
+  }
+  .stage-wrap {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 16px;
+    gap: 12px;
+    background: #080a0e;
+  }
+  canvas {
+    border-radius: 8px;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.5);
+    max-width: 100%;
+    height: auto;
+    background: #111;
+  }
+  label.row {
+    display: block;
+    margin-bottom: 12px;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  label.row strong { color: var(--text); }
+  select, input[type="number"] {
+    width: 100%;
+    margin-top: 4px;
+    background: #0e131a;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 13px;
+  }
+  .checks label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--text);
+    font-size: 13px;
+    margin-bottom: 8px;
+  }
+  button {
+    appearance: none;
+    border: 0;
+    border-radius: 8px;
+    background: var(--accent);
+    color: #0b1220;
+    font-weight: 700;
+    font-size: 13px;
+    padding: 10px 14px;
+    cursor: pointer;
+    width: 100%;
+    margin-bottom: 8px;
+  }
+  button.secondary {
+    background: #2a3548;
+    color: var(--text);
+  }
+  button:disabled { opacity: 0.5; cursor: wait; }
+  #status {
+    font-size: 12px;
+    color: var(--muted);
+    min-height: 1.4em;
+    margin: 8px 0 12px;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+  }
+  th, td {
+    text-align: left;
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  th { color: var(--muted); font-weight: 600; }
+  td.num { text-align: right; }
+  tr.hot td { color: var(--bad); font-weight: 600; }
+  tr.warm td { color: var(--warn); }
+  .summary {
+    background: #0e131a;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 13px;
+    line-height: 1.5;
+    margin-bottom: 14px;
+  }
+  .summary .big {
+    font-size: 22px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+  }
+  .bar {
+    height: 8px;
+    background: #1a2230;
+    border-radius: 4px;
+    overflow: hidden;
+    margin-top: 4px;
+  }
+  .bar > i {
+    display: block;
+    height: 100%;
+    background: linear-gradient(90deg, #3d7dd6, #e86a6a);
+    width: 0;
+  }
+  pre#jsonOut {
+    font-size: 10px;
+    color: var(--muted);
+    background: #0a0d12;
+    border-radius: 6px;
+    padding: 8px;
+    max-height: 180px;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+</style>
+</head>
+<body>
+  <header>
+    <h1>Draw performance harness</h1>
+    <p>
+      Times the real <code>Draw.profileDrawHoleStatic</code> path (same order as the game).
+      Compare classic grass vs Orbit space, and see how much of a 60&nbsp;fps frame the viz spends —
+      especially black-hole <code>lens_warp</code> (GPU readback + per-pixel warp).
+    </p>
+  </header>
+  <div class="layout">
+    <aside>
+      <label class="row">Course / hole
+        <select id="holeSelect"></select>
+      </label>
+      <label class="row">Device pixel ratio (canvas buffer)
+        <select id="dprSelect">
+          <option value="1">1×</option>
+          <option value="1.5">1.5×</option>
+          <option value="2" selected>2×</option>
+          <option value="2.5">2.5×</option>
+          <option value="3">3× (heavy phones)</option>
+        </select>
+      </label>
+      <label class="row">Frames to sample
+        <input id="framesInput" type="number" min="10" max="600" value="90">
+      </label>
+      <label class="row">Warmup frames (discarded)
+        <input id="warmupInput" type="number" min="0" max="120" value="15">
+      </label>
+      <div class="checks">
+        <label><input type="checkbox" id="chkLive" checked> Live preview while sampling</label>
+        <label><input type="checkbox" id="chkCompare"> Also bench classic grass baseline (same geometry, no gravity bodies)</label>
+      </div>
+      <button id="btnRun">Run benchmark</button>
+      <button id="btnRunAll" class="secondary">Bench suite (classic + Orbit planet + Orbit BH)</button>
+      <div id="status"></div>
+      <div class="summary" id="summary">
+        <div>Mean draw / frame</div>
+        <div class="big" id="meanTotal">—</div>
+        <div id="budgetLine" style="color:var(--muted);font-size:12px">of 16.67 ms (60 fps)</div>
+        <div class="bar"><i id="budgetBar"></i></div>
+        <div id="deltaLine" style="margin-top:8px;color:var(--muted);font-size:12px"></div>
+      </div>
+      <table>
+        <thead>
+          <tr><th>Stage</th><th class="num">ms</th><th class="num">%</th></tr>
+        </thead>
+        <tbody id="stageBody">
+          <tr><td colspan="3" style="color:var(--muted)">Run a benchmark…</td></tr>
+        </tbody>
+      </table>
+      <p style="color:var(--muted);font-size:11px;margin-top:14px">
+        Raw JSON (also <code>window.__drawPerfLast</code>):
+      </p>
+      <pre id="jsonOut">{}</pre>
+    </aside>
+    <div class="stage-wrap">
+      <canvas id="c" width="800" height="500"></canvas>
+      <div style="color:var(--muted);font-size:12px" id="canvasMeta"></div>
+    </div>
+  </div>
+
+  <script src="shared.js"></script>
+  <script src="draw.js"></script>
+  <script>
+(function () {
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  const holeSelect = document.getElementById('holeSelect');
+  const dprSelect = document.getElementById('dprSelect');
+  const framesInput = document.getElementById('framesInput');
+  const warmupInput = document.getElementById('warmupInput');
+  const statusEl = document.getElementById('status');
+  const stageBody = document.getElementById('stageBody');
+  const meanTotalEl = document.getElementById('meanTotal');
+  const budgetLine = document.getElementById('budgetLine');
+  const budgetBar = document.getElementById('budgetBar');
+  const deltaLine = document.getElementById('deltaLine');
+  const jsonOut = document.getElementById('jsonOut');
+  const canvasMeta = document.getElementById('canvasMeta');
+
+  const S = window.Shared;
+  const D = window.Draw;
+  const LW = S.LOGICAL_W;
+  const LH = S.LOGICAL_H;
+
+  function deepCloneHole(h) {
+    return JSON.parse(JSON.stringify(h));
+  }
+
+  function listHoles() {
+    const out = [];
+    (S.COURSES || []).forEach((course, ci) => {
+      (course.holes || []).forEach((hole, hi) => {
+        const gb = hole.gravityBodies || [];
+        const bh = gb.filter((b) => b.kind === 'blackHole').length;
+        const tag = gb.length
+          ? (bh ? ' [space+BH×' + bh + ']' : ' [space]')
+          : ' [grass]';
+        out.push({
+          id: course.id + ':' + hi,
+          label: course.name + ' · H' + (hi + 1) + ' ' + (hole.name || '') + tag,
+          courseIndex: ci,
+          holeIndex: hi,
+          hole,
+        });
+      });
+    });
+    return out;
+  }
+
+  const holes = listHoles();
+  // Prefer an Orbit BH hole as default for interesting breakdown.
+  let defaultIdx = holes.findIndex((h) => (h.hole.gravityBodies || []).some((b) => b.kind === 'blackHole'));
+  if (defaultIdx < 0) defaultIdx = holes.findIndex((h) => (h.hole.gravityBodies || []).length);
+  if (defaultIdx < 0) defaultIdx = 0;
+  holes.forEach((h, i) => {
+    const opt = document.createElement('option');
+    opt.value = String(i);
+    opt.textContent = h.label;
+    if (i === defaultIdx) opt.selected = true;
+    holeSelect.appendChild(opt);
+  });
+
+  function setDpr(dpr) {
+    canvas.width = Math.round(LW * dpr);
+    canvas.height = Math.round(LH * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    canvasMeta.textContent =
+      'buffer ' + canvas.width + '×' + canvas.height +
+      ' (logical ' + LW + '×' + LH + ' @ dpr ' + dpr + ')';
+  }
+
+  function selectedHole() {
+    const entry = holes[Number(holeSelect.value) || 0];
+    const hole = deepCloneHole(entry.hole);
+    // Fresh space state per run so init cost is in first warmup frames.
+    delete hole._space;
+    S.resetHoleObstacles && S.resetHoleObstacles(hole);
+    return { entry, hole };
+  }
+
+  function grassClone(hole) {
+    const h = deepCloneHole(hole);
+    h.gravityBodies = [];
+    delete h._space;
+    return h;
+  }
+
+  function sleep(ms) {
+    return new Promise((r) => setTimeout(r, ms));
+  }
+
+  /**
+   * Run N profiled frames. Yields to rAF so the browser paints / doesn't freeze.
+   */
+  async function sampleHole(hole, opts) {
+    const frames = opts.frames;
+    const warmup = opts.warmup;
+    const dpr = opts.dpr;
+    const live = opts.live;
+    const samples = [];
+    const tWall0 = performance.now();
+
+    setDpr(dpr);
+    // Warmup (discard) — includes initSpace pre-roll on first drawSpace.
+    for (let i = 0; i < warmup; i++) {
+      const t = performance.now() / 1000;
+      D.profileDrawHoleStatic(ctx, hole, { time: t, flagPhase: t, dpr, canvas });
+      if (live && i % 3 === 0) await sleep(0);
+    }
+
+    for (let i = 0; i < frames; i++) {
+      const t = performance.now() / 1000;
+      const s = D.profileDrawHoleStatic(ctx, hole, { time: t, flagPhase: t, dpr, canvas });
+      samples.push(s);
+      if (live && i % 2 === 0) await new Promise((r) => requestAnimationFrame(r));
+    }
+
+    const wallMs = performance.now() - tWall0;
+    const summary = D.summarizeDrawProfile(samples);
+    return {
+      samples,
+      summary,
+      wallMs,
+      dpr,
+      meta: {
+        gravityBodies: (hole.gravityBodies || []).length,
+        blackHoles: (hole.gravityBodies || []).filter((b) => b.kind === 'blackHole').length,
+        space: (hole.gravityBodies || []).length > 0,
+      },
+    };
+  }
+
+  function renderReport(result, compare) {
+    const s = result.summary;
+    const mean = s.meanMs.total || 0;
+    meanTotalEl.textContent = mean.toFixed(2) + ' ms';
+    const frac = s.fracOfFrame || 0;
+    budgetLine.textContent =
+      mean.toFixed(2) + ' ms · ' + (frac * 100).toFixed(0) + '% of 16.67 ms frame' +
+      (frac > 1 ? '  ⚠ over budget alone' : frac > 0.5 ? '  (half frame+)' : '');
+    budgetBar.style.width = Math.min(100, frac * 100) + '%';
+    budgetBar.style.background =
+      frac > 1 ? 'var(--bad)' : frac > 0.5 ? 'var(--warn)' : 'var(--ok)';
+
+    if (compare && compare.summary) {
+      const cMean = compare.summary.meanMs.total || 0;
+      const delta = mean - cMean;
+      deltaLine.textContent =
+        'vs grass baseline: ' +
+        (delta >= 0 ? '+' : '') + delta.toFixed(2) + ' ms (' +
+        (cMean > 0 ? ((delta / cMean) * 100).toFixed(0) : '∞') + '% more)';
+    } else {
+      deltaLine.textContent = result.meta.space
+        ? 'Space hole — run with “classic grass baseline” to quantify backdrop tax.'
+        : 'Grass hole (no space backdrop / lens).';
+    }
+
+    const ranked = s.ranked || [];
+    if (!ranked.length) {
+      stageBody.innerHTML = '<tr><td colspan="3">No stages</td></tr>';
+    } else {
+      stageBody.innerHTML = ranked
+        .map((r, i) => {
+          const cls = i === 0 && r.pct > 35 ? 'hot' : r.pct > 15 ? 'warm' : '';
+          return (
+            '<tr class="' + cls + '">' +
+            '<td>' + r.stage + '</td>' +
+            '<td class="num">' + r.ms.toFixed(3) + '</td>' +
+            '<td class="num">' + r.pct.toFixed(1) + '%</td>' +
+            '</tr>'
+          );
+        })
+        .join('');
+    }
+
+    const payload = {
+      at: new Date().toISOString(),
+      ua: navigator.userAgent,
+      dpr: result.dpr,
+      frames: s.frames,
+      wallMs: result.wallMs,
+      meta: result.meta,
+      meanMs: s.meanMs,
+      pctOfTotal: s.pctOfTotal,
+      ranked: s.ranked,
+      fracOfFrame60: s.fracOfFrame,
+      compareGrass: compare
+        ? {
+            meanMs: compare.summary.meanMs,
+            ranked: compare.summary.ranked,
+            deltaMs: mean - (compare.summary.meanMs.total || 0),
+          }
+        : null,
+    };
+    window.__drawPerfLast = payload;
+    jsonOut.textContent = JSON.stringify(payload, null, 2);
+    return payload;
+  }
+
+  async function runOne() {
+    const btn = document.getElementById('btnRun');
+    const btnAll = document.getElementById('btnRunAll');
+    btn.disabled = true;
+    btnAll.disabled = true;
+    statusEl.textContent = 'Sampling…';
+    try {
+      const dpr = Number(dprSelect.value) || 2;
+      const frames = Math.max(10, Number(framesInput.value) || 90);
+      const warmup = Math.max(0, Number(warmupInput.value) || 15);
+      const live = document.getElementById('chkLive').checked;
+      const doCompare = document.getElementById('chkCompare').checked;
+      const { entry, hole } = selectedHole();
+
+      statusEl.textContent = 'Warmup + sample: ' + entry.label;
+      const result = await sampleHole(hole, { frames, warmup, dpr, live });
+      let compare = null;
+      if (doCompare && (hole.gravityBodies || []).length) {
+        statusEl.textContent = 'Grass baseline…';
+        compare = await sampleHole(grassClone(hole), { frames, warmup, dpr, live: false });
+      }
+      renderReport(result, compare);
+      statusEl.textContent =
+        'Done · ' + frames + ' frames · wall ' + result.wallMs.toFixed(0) + ' ms · top: ' +
+        ((result.summary.ranked[0] && result.summary.ranked[0].stage) || '—');
+    } catch (e) {
+      statusEl.textContent = 'Error: ' + (e && e.message ? e.message : e);
+      console.error(e);
+    } finally {
+      btn.disabled = false;
+      btnAll.disabled = false;
+    }
+  }
+
+  async function runSuite() {
+    const btn = document.getElementById('btnRun');
+    const btnAll = document.getElementById('btnRunAll');
+    btn.disabled = true;
+    btnAll.disabled = true;
+    const dpr = Number(dprSelect.value) || 2;
+    const frames = Math.max(20, Number(framesInput.value) || 90);
+    const warmup = Math.max(0, Number(warmupInput.value) || 15);
+    const suite = [];
+
+    function pick(pred, fallback) {
+      const i = holes.findIndex(pred);
+      return holes[i >= 0 ? i : fallback];
+    }
+
+    const classic = pick((h) => !(h.hole.gravityBodies || []).length, 0);
+    const orbitPlanet = pick(
+      (h) =>
+        (h.hole.gravityBodies || []).length > 0 &&
+        !(h.hole.gravityBodies || []).some((b) => b.kind === 'blackHole'),
+      defaultIdx
+    );
+    const orbitBh = pick(
+      (h) => (h.hole.gravityBodies || []).some((b) => b.kind === 'blackHole'),
+      defaultIdx
+    );
+
+    const cases = [
+      { name: 'classic_grass', entry: classic },
+      { name: 'orbit_space_no_bh', entry: orbitPlanet },
+      { name: 'orbit_space_with_bh', entry: orbitBh },
+    ];
+
+    try {
+      for (const c of cases) {
+        statusEl.textContent = 'Suite: ' + c.name + '…';
+        const hole = deepCloneHole(c.entry.hole);
+        delete hole._space;
+        S.resetHoleObstacles && S.resetHoleObstacles(hole);
+        const result = await sampleHole(hole, { frames, warmup, dpr, live: false });
+        suite.push({
+          name: c.name,
+          label: c.entry.label,
+          meanMs: result.summary.meanMs,
+          ranked: result.summary.ranked,
+          fracOfFrame60: result.summary.fracOfFrame,
+          meta: result.meta,
+        });
+      }
+      // Show the BH case in the UI as the detailed view.
+      const bh = suite.find((s) => s.name === 'orbit_space_with_bh') || suite[suite.length - 1];
+      const grass = suite.find((s) => s.name === 'classic_grass');
+      // Re-sample BH once into the canvas with full report structure
+      const bhEntry = orbitBh;
+      const bhHole = deepCloneHole(bhEntry.hole);
+      delete bhHole._space;
+      const detailed = await sampleHole(bhHole, { frames, warmup, dpr, live: false });
+      const compare = grass
+        ? {
+            summary: {
+              meanMs: grass.meanMs,
+              ranked: grass.ranked,
+              frames,
+              fracOfFrame: grass.fracOfFrame60,
+            },
+          }
+        : null;
+      const payload = renderReport(detailed, compare);
+      payload.suite = suite;
+      // Deltas relative to grass
+      if (grass) {
+        payload.suiteDeltas = suite.map((s) => ({
+          name: s.name,
+          meanTotalMs: s.meanMs.total,
+          deltaVsGrassMs: s.meanMs.total - grass.meanMs.total,
+          topStage: s.ranked[0] || null,
+        }));
+      }
+      window.__drawPerfLast = payload;
+      jsonOut.textContent = JSON.stringify(payload, null, 2);
+      statusEl.textContent =
+        'Suite done · grass ' +
+        (grass ? grass.meanMs.total.toFixed(2) : '?') +
+        ' ms → BH ' +
+        (bh ? bh.meanMs.total.toFixed(2) : '?') +
+        ' ms';
+    } catch (e) {
+      statusEl.textContent = 'Suite error: ' + (e && e.message ? e.message : e);
+      console.error(e);
+    } finally {
+      btn.disabled = false;
+      btnAll.disabled = false;
+    }
+  }
+
+  document.getElementById('btnRun').addEventListener('click', runOne);
+  document.getElementById('btnRunAll').addEventListener('click', runSuite);
+
+  // Auto-run once so the page is useful immediately / for headless capture.
+  setDpr(Number(dprSelect.value) || 2);
+  if (new URLSearchParams(location.search).get('autorun') === 'suite') {
+    runSuite();
+  } else if (new URLSearchParams(location.search).get('autorun') !== '0') {
+    runOne();
+  }
+
+  // Headless helper
+  window.__drawPerfRun = runOne;
+  window.__drawPerfRunSuite = runSuite;
+})();
+  </script>
+</body>
+</html>
