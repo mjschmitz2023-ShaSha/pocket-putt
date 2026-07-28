@@ -446,11 +446,9 @@ function runScenarioFixed(scenario) {
   for (const msg of clientSock.drain()) {
     if (msg.type === 'roundState') {
       client.onRoundState(msg);
-      client.holeEpochMs = 0; // match synthetic host epoch
       client.noteHostTick(typeof msg.tick === 'number' ? msg.tick : 0, wallMs);
     } else if (msg.type === 'clockSync') {
       client.onClockSync(msg, wallMs);
-      client.holeEpochMs = 0;
     } else if (msg.type === 'snapshot') {
       client.onSnapshot(msg, wallMs);
     }

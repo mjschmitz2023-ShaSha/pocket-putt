@@ -15,8 +15,6 @@ const TICK_HZ = Shared.TICK_HZ;
 const TICK_DT = Shared.TICK_DT;
 const PHYSICS_SUBTICKS = 4;
 const MAX_CATCH_UP = 8;
-/** Match host HISTORY_TICKS / client MP_PREDICT_CAP_TICKS. */
-const PREDICT_CAP_TICKS = 30;
 const SOFT_ERR_PX = 10;
 const HARD_ERR_PX = 80;
 const ERR_DECAY_TAU = 0.12;
@@ -37,9 +35,8 @@ class ClientModel {
     this.playing = false;
     this.simTick = 0;
     this.hostTick = 0;
-    this.hostTickAtMs = 0; // harness wall clock when hostTick was observed
+    this.hostTickAtMs = null; // harness wall clock when hostTick was observed
     this.lastHostTick = 0;
-    this.holeEpochMs = 0;
     /** @type {number|null} sim tick stamped on latest optimistic self putt */
     this.lastPuttClientTick = null;
     this.players = new Map();
@@ -74,31 +71,38 @@ class ClientModel {
   }
 
   noteHostTick(tick, wallMs) {
-    // Monotonic: puttApplied carries the putt tick (past), not host-now — never rewind
-    // the free-run base or the client freezes / forks mid-coast.
-    if (typeof tick !== 'number') return;
-    if (tick < this.hostTick) return;
+    // Anchor ratchet: adopt a sample only if it implies a calendar at or ahead
+    // of the current extrapolation — a slower-delivered sample (jitter) must not
+    // drag the calendar back by its extra latency. puttApplied carries the putt
+    // tick (past), not host-now — never rewind the free-run base.
+    if (typeof tick !== 'number' || wallMs == null) return;
+    if (tick > this.lastHostTick) this.lastHostTick = tick;
+    if (this.hostTickAtMs != null) {
+      const extrapolated =
+        this.hostTick + ((wallMs - this.hostTickAtMs) / 1000) * TICK_HZ;
+      if (tick < extrapolated) return;
+    }
     this.hostTick = tick;
     this.hostTickAtMs = wallMs;
-    this.lastHostTick = tick;
   }
 
   hostTargetTick(wallMs) {
-    // Shared hole epoch (game.js / host tickDriver). holeEpochMs === 0 is valid
-    // synthetic origin used by the rubberband harness.
-    if (typeof this.holeEpochMs === 'number' && Number.isFinite(this.holeEpochMs)) {
-      if (this.holeEpochMs === 0 || wallMs >= this.holeEpochMs - 5000) {
-        return Math.max(0, Math.floor((wallMs - this.holeEpochMs) / (1000 / TICK_HZ)));
-      }
-    }
-    return Math.floor(this.hostTick + ((wallMs - this.hostTickAtMs) / 1000) * TICK_HZ);
+    // Skew-free calendar (game.js law): last adopted host sample + locally
+    // elapsed time. NEVER floor((wall - hostHoleEpoch) / TICK_MS) — that
+    // compares wall clocks across machines, and device clock skew beyond the
+    // ±TRUST_WINDOW (±500ms) rejects every putt (too_old / too_far_future).
+    // Only real sample latency may consume trust-window budget.
+    if (this.hostTickAtMs == null) return this.simTick; // no sample yet — hold
+    return Math.max(
+      0,
+      Math.floor(this.hostTick + ((wallMs - this.hostTickAtMs) / 1000) * TICK_HZ)
+    );
   }
 
   onClockSync(msg, wallMs) {
     if (!msg) return;
     const tick = typeof msg.tick === 'number' ? msg.tick : 0;
     this.noteHostTick(tick, wallMs != null ? wallMs : this.hostTickAtMs);
-    if (typeof msg.holeEpochMs === 'number') this.holeEpochMs = msg.holeEpochMs;
     if (this.playing && typeof msg.tick === 'number') {
       this.simTick = msg.tick;
       Shared.setHoleObstaclesAtTick(this.hole(), this.simTick);
@@ -123,8 +127,11 @@ class ClientModel {
     Shared.resetHoleObstacles(hole);
     const startTick = typeof msg.tick === 'number' ? msg.tick : 0;
     this.simTick = startTick;
-    this.noteHostTick(startTick, 0);
-    if (typeof msg.holeEpochMs === 'number') this.holeEpochMs = msg.holeEpochMs;
+    // New hole = new tick domain: drop the anchor so the caller's next
+    // noteHostTick adopts unconditionally (ratchet must not span holes).
+    this.hostTick = startTick;
+    this.hostTickAtMs = null;
+    this.lastHostTick = startTick;
     Shared.setHoleObstaclesAtTick(hole, startTick);
     this.playing = true;
     for (const b of msg.balls || []) {
@@ -360,6 +367,9 @@ class ClientModel {
       me && !me.holedOut && Math.hypot(me.vx || 0, me.vy || 0) >= STOP;
     // Soft = juice only (docs/mp-hard-truth-sync.md).
     if (!hard) return;
+    // Hard corrections are host-time samples — refresh the calendar anchor
+    // (mirrors game.js mpApplyCorrection → mpNoteHostTick).
+    if (wallMs != null) this.noteHostTick(tick, wallMs);
     // Causality (mirror game.js): hard that cannot include our unconfirmed putt.
     const hostMe = (msg.balls || []).find((b) => b.id === this.playerId);
     const idleHostBehindPutt =
@@ -615,8 +625,13 @@ class ClientModel {
     // Free-run from last host sample (coast model has no mid-flight snaps).
     // Trust window is enforced on host putt acceptance, not by freezing local coast.
     const target = this.hostTargetTick(wallMs);
+    // Scale the per-frame catch-up cap with elapsed time (game.js uses the
+    // real frame gap): a low-fps client (long frames) must still sustain
+    // TICK_HZ or its stamps go stale (too_old) while a 60fps client keeps the
+    // same 8-tick jank guard. Bounded at 90 — long pauses resolve via resync.
+    const cap = Math.max(MAX_CATCH_UP, Math.min(Math.ceil(dt * TICK_HZ) + 2, 90));
     let steps = 0;
-    while (this.simTick < target && steps < MAX_CATCH_UP) {
+    while (this.simTick < target && steps < cap) {
       this.stepOneTick();
       steps++;
     }
@@ -682,6 +697,5 @@ module.exports = {
   SOFT_ERR_PX,
   HARD_ERR_PX,
   PHYSICS_SUBTICKS,
-  PREDICT_CAP_TICKS,
   TICK_HZ,
 };

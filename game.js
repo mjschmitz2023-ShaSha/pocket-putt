@@ -1510,18 +1510,17 @@ let mpFrozenTimerMs = 0;
 // Local sim tick (integer). Host clock sample drives how far we may advance.
 let mpSimTick = 0;
 let mpHostTick = 0;
-let mpHostTickAt = 0;
-/** Hole epoch W0 (host wall time at tick 0) — keepalives / diagnostics. */
-let mpHoleEpochMs = 0;
+/** performance.now() when mpHostTick was adopted; null = no host sample yet. */
+let mpHostTickAt = null;
 /** lastHostTick reported on keepalives (last adopted host tick). */
 let mpLastHostTick = 0;
 /** Client tick of the latest optimistic putt (ignore older hard snaps for self). */
 let mpLastPuttClientTick = null;
 /** Wall time of last clientClock send (performance.now). 0 = not started. */
 let mpKeepaliveLastSentMs = 0;
+/** performance.now() of the last mpUpdateLocalSim call (real frame gap for catch-up). */
+let mpSimUpdateAt = null;
 const MP_MAX_CATCH_UP = 8;
-/** Predict cap: do not free-run more than lastHostTick + N (matches host HISTORY_TICKS). */
-const MP_PREDICT_CAP_TICKS = 30;
 /**
  * clientClock cadence. Prefer rAF (see mpMaybeSendKeepalive) over setInterval —
  * Android Chrome throttles timers past 1s even in a foreground tab.
@@ -2343,14 +2342,11 @@ async function mpBeginHole(msg) {
   // Dogfood (rarer/other_extra): lastPutt=4986 made sampleTick 0/1 look "stale" and
   // ignore legitimate resync/idle for the entire next hole → free-run desync + water snaps.
   mpLastPuttClientTick = null;
+  // New hole = new tick domain: re-anchor unconditionally (ratchet must not
+  // span holes).
   mpHostTick = startTick;
   mpHostTickAt = performance.now();
   mpLastHostTick = startTick;
-  if (typeof msg.holeEpochMs === 'number' && Number.isFinite(msg.holeEpochMs)) {
-    mpHoleEpochMs = msg.holeEpochMs;
-  } else if (typeof msg.hostTimeMs === 'number' && Number.isFinite(msg.hostTimeMs)) {
-    mpHoleEpochMs = msg.hostTimeMs - startTick * TICK_MS;
-  }
   setHoleObstaclesAtTick(hole, startTick);
   // Seed balls from reliable roundState so a dropped resync snapshot can't leave an
   // empty roster (ball "disappears" until the next idle correction).
@@ -2413,52 +2409,46 @@ async function mpBeginHole(msg) {
   mpStartKeepalives();
 }
 
-function mpNoteHostTick(tick, hostTimeMs, opts) {
-  // Monotonic host sample. puttApplied is stamped at putt tick (past) — callers must
-  // not pass that as a live sample or we re-anchor W0 as if the putt were "now".
+function mpNoteHostTick(tick) {
+  // Host-time sample (hard corrections / clockSync only — puttApplied is stamped
+  // at the putt tick, in the past; anchoring on it would rewind the calendar).
+  // Anchor ratchet: adopt only samples at/ahead of the current extrapolation so
+  // a slower-delivered sample (network jitter) cannot drag the calendar back by
+  // its extra latency.
   if (typeof tick !== 'number') return;
-  if (tick < mpHostTick) return;
-  mpHostTick = tick;
-  mpHostTickAt = performance.now();
-  mpLastHostTick = tick;
-  // Prefer fixed hole epoch from the wire (same W0 host used in tickDriver).
-  // Never invent W0 from (hostTimeMs - puttTick): puttApplied/juice use present wall
-  // with a past tick and would race the client ahead of the host.
-  if (opts && typeof opts.holeEpochMs === 'number' && Number.isFinite(opts.holeEpochMs)) {
-    mpHoleEpochMs = opts.holeEpochMs;
-  } else if (typeof hostTimeMs === 'number' && Number.isFinite(hostTimeMs) && !(opts && opts.skipEpoch)) {
-    mpHoleEpochMs = hostTimeMs - tick * TICK_MS;
-  } else if (mpHoleEpochMs > 0) {
-    const ideal = Math.floor((Date.now() - mpHoleEpochMs) / TICK_MS);
-    if (ideal > tick + 2) {
-      mpHoleEpochMs = Date.now() - tick * TICK_MS;
-    }
+  if (tick > mpLastHostTick) mpLastHostTick = tick;
+  const nowT = performance.now();
+  if (mpHostTickAt != null) {
+    const extrapolated = mpHostTick + ((nowT - mpHostTickAt) / 1000) * TICK_HZ;
+    if (tick < extrapolated) return;
   }
+  mpHostTick = tick;
+  mpHostTickAt = nowT;
 }
 
 /**
- * Shared hole calendar: same formula as host tickDriver
- *   wallTarget = floor((Date.now() - holeEpochMs) / TICK_MS)
- * Not "last snapshot + blind extrapolation" (that races the host under lag).
+ * Skew-free host calendar: last adopted host tick sample + locally elapsed
+ * MONOTONIC time. NEVER floor((Date.now() - holeEpochMs) / TICK_MS) — the wire
+ * epoch is in the HOST's wall-clock frame, so that formula bakes device clock
+ * skew (routinely >500ms on Android) into every putt stamp; outside the host
+ * trust window (±TRUST_WINDOW_TICKS ≈ ±500ms) every putt force-syncs with
+ * too_old / too_far_future — the "first putt works, rest rubber-band" bug.
+ * Anchor extrapolation is rate-true (performance.now drift is ppm-level); its
+ * only error is the anchor sample's one-way latency, which is real network
+ * truth. Regression: test/clock-skew-putt.js.
  */
 function mpHostTargetTick() {
-  if (mpHoleEpochMs > 0) {
-    return Math.max(0, Math.floor((Date.now() - mpHoleEpochMs) / TICK_MS));
-  }
-  // Fallback before first clockSync
-  return Math.floor(mpHostTick + ((performance.now() - mpHostTickAt) / 1000) * TICK_HZ);
+  if (mpHostTickAt == null) return mpSimTick; // no host sample yet — hold
+  return Math.max(
+    0,
+    Math.floor(mpHostTick + ((performance.now() - mpHostTickAt) / 1000) * TICK_HZ)
+  );
 }
 
 function mpOnClockSync(msg) {
   if (!msg) return;
   const tick = typeof msg.tick === 'number' ? msg.tick : 0;
-  if (typeof msg.holeEpochMs === 'number' && Number.isFinite(msg.holeEpochMs)) {
-    mpHoleEpochMs = msg.holeEpochMs;
-  } else if (typeof msg.hostTimeMs === 'number' && Number.isFinite(msg.hostTimeMs)) {
-    // Derive W0: at hostTimeMs, sim was `tick`
-    mpHoleEpochMs = msg.hostTimeMs - tick * TICK_MS;
-  }
-  mpNoteHostTick(tick, msg.hostTimeMs);
+  mpNoteHostTick(tick);
   // Mid-hole join / resync: adopt host tick + obstacle clock when playing.
   if (mpPlaying && typeof msg.tick === 'number') {
     mpSimTick = msg.tick;
@@ -2712,9 +2702,6 @@ function mpOnPuttApplied(msg) {
   // puttApplied = confirmed input juice (+ optional remote launch for prediction).
   // State truth remains hard replay (seed@H → resim). No single-ball "aging" hacks —
   // free-run is only the shared mpUpdateLocalSim path for the whole world.
-  if (typeof msg.holeEpochMs === 'number' && Number.isFinite(msg.holeEpochMs)) {
-    mpHoleEpochMs = msg.holeEpochMs;
-  }
   const puttTick = typeof msg.tick === 'number' ? msg.tick : null;
   const isSelf = msg.playerId === mpPlayerId;
   let p = Game.players.get(msg.playerId);
@@ -2923,10 +2910,19 @@ function mpUpdateLocalSim(dt) {
     setHudText(hudTotal, `Time: ${(mpFrozenTimerMs / 1000).toFixed(1)}s`);
     return;
   }
-  // Shared epoch calendar (same as host): floor((now - W0) / TICK_MS).
+  // Host calendar from anchored monotonic extrapolation (see mpHostTargetTick).
   const targetTick = mpHostTargetTick();
+  // Scale the per-frame catch-up cap with REAL elapsed time (loop() clamps dt
+  // to 1/30 — useless here): a low-fps client must still sustain TICK_HZ or
+  // its putt stamps go stale (too_old), while a 60fps client keeps the same
+  // 8-tick jank guard. Bounded at 90 so a long pause (backgrounded tab) never
+  // triggers a huge synchronous burst — those resolve via host resync adopt.
+  const nowGap = performance.now();
+  const frameGapS = mpSimUpdateAt == null ? dt : (nowGap - mpSimUpdateAt) / 1000;
+  mpSimUpdateAt = nowGap;
+  const capSteps = Math.max(MP_MAX_CATCH_UP, Math.min(Math.ceil(frameGapS * TICK_HZ) + 2, 90));
   let steps = 0;
-  while (mpSimTick < targetTick && steps < MP_MAX_CATCH_UP) {
+  while (mpSimTick < targetTick && steps < capSteps) {
     mpStepOneTick();
     steps++;
   }
@@ -2996,7 +2992,7 @@ function mpApplyCorrection(msg) {
     });
   }
 
-  mpNoteHostTick(tick, msg.hostTimeMs, { holeEpochMs: msg.holeEpochMs });
+  mpNoteHostTick(tick);
 
   if (msg.obstacles) {
     msg.obstacles.windmillAngles.forEach((a, i) => { if (hole.windmills[i]) hole.windmills[i].angle = a; });
