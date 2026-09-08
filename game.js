@@ -967,11 +967,42 @@ function getPortalGravityAPI() {
   return null;
 }
 
+let portalGravityBakeInFlightHole = null;
+/** Scoreboard prefetch runs quiet; hole start can reveal the bar at current %. */
+let portalGravityBakeShowUi = false;
+let portalGravityBakeProgress = 0;
+let portalGravityBakeDetail = '';
+
+function nextPortalGravityHole() {
+  const holes = currentHoles();
+  const next = Game.currentHoleIndex + 1;
+  if (next >= holes.length) return null;
+  return holes[next];
+}
+
+function prefetchNextHoleGravityBake() {
+  const hole = nextPortalGravityHole();
+  if (!hole) return;
+  ensurePortalGravityBake(hole, Game.pendingCustomLvl, { quiet: true }).catch((e) => {
+    console.warn('[gravity] prefetch bake', e);
+  });
+}
+
+function revealGravityLoadingProgress() {
+  portalGravityBakeShowUi = true;
+  if (portalGravityBakeInFlight) {
+    showGravityLoading(portalGravityBakeProgress, portalGravityBakeDetail);
+  }
+}
+
 /**
  * Ensure hole._portalGravityCache is ready when portals + gravity bodies exist.
- * Yields to the UI via PortalGravity.bakePortalGravityAsync.
+ * Yields via bakePortalGravityAsync. `quiet: true` bakes without the overlay
+ * (scoreboard prefetch); a later non-quiet call reveals the bar at current %.
  */
-async function ensurePortalGravityBake(hole, lvlHint) {
+async function ensurePortalGravityBake(hole, lvlHint, opts) {
+  opts = opts || {};
+  const quiet = !!opts.quiet;
   const PG = getPortalGravityAPI();
   if (!PG || !hole) {
     if (!PG) console.warn('[gravity] PortalGravity missing — is portal-gravity.js loaded?');
@@ -987,11 +1018,16 @@ async function ensurePortalGravityBake(hole, lvlHint) {
     storePortalGravityBake(hole, hole._portalGravityCache, lvlHint);
     return;
   }
-  // Coalesce concurrent bakes (roundState + draw recovery).
+  // Coalesce concurrent bakes (scoreboard prefetch + roundState / draw recovery).
   if (portalGravityBakeInFlight) {
+    if (portalGravityBakeInFlightHole === hole) {
+      if (!quiet) revealGravityLoadingProgress();
+      await portalGravityBakeInFlight;
+      reattachPortalGravityBake(hole, lvlHint);
+      return;
+    }
     await portalGravityBakeInFlight;
-    reattachPortalGravityBake(hole, lvlHint);
-    return;
+    if (reattachPortalGravityBake(hole, lvlHint)) return;
   }
   const token = ++gravityBakeToken;
   const period = PG.gravityPeriodTicks(hole);
@@ -1001,20 +1037,23 @@ async function ensurePortalGravityBake(hole, lvlHint) {
   const info = PG.gravityPeriodInfo ? PG.gravityPeriodInfo(hole) : { period, rawLcm: period, capped: false };
   let detail = info.period + ' tick period · BEM material gravity';
   if (info.capped) detail += ' (capped from LCM ' + info.rawLcm + ')';
-  showGravityLoading(0, detail);
+  portalGravityBakeShowUi = !quiet;
+  portalGravityBakeProgress = 0;
+  portalGravityBakeDetail = detail;
+  if (!quiet) showGravityLoading(0, detail);
+  portalGravityBakeInFlightHole = hole;
   portalGravityBakeInFlight = (async () => {
     try {
-      // Prefer async progressive bake; fall back to sync if async yields nothing.
-      let cache = await PG.bakePortalGravityAsync(hole, {
+      const cache = await PG.bakePortalGravityAsync(hole, {
         onProgress(p) {
           if (token !== gravityBakeToken) return;
-          showGravityLoading(p, Math.round(p * 100) + '% · ' + info.period + ' ticks');
+          portalGravityBakeProgress = p;
+          portalGravityBakeDetail = Math.round(p * 100) + '% · ' + info.period + ' ticks';
+          if (portalGravityBakeShowUi) {
+            showGravityLoading(p, portalGravityBakeDetail);
+          }
         },
       });
-      if (!cache && typeof PG.bakePortalGravity === 'function') {
-        console.warn('[gravity] async bake returned null — trying sync bake');
-        cache = PG.bakePortalGravity(hole);
-      }
       if (token !== gravityBakeToken) return;
       if (cache && cache.frames && cache.frames.length) {
         storePortalGravityBake(hole, cache, lvlHint);
@@ -1041,6 +1080,7 @@ async function ensurePortalGravityBake(hole, lvlHint) {
     } finally {
       if (token === gravityBakeToken) hideGravityLoading();
       portalGravityBakeInFlight = null;
+      portalGravityBakeInFlightHole = null;
     }
   })();
   await portalGravityBakeInFlight;
@@ -1098,6 +1138,7 @@ function onHoleComplete() {
   resetUnsettledTimer();
   showScreen('screen-hole-complete');
   updateShareLevelButton();
+  prefetchNextHoleGravityBake();
 }
 function showRoundComplete() {
   const tbody = document.getElementById('scorecard-body');
@@ -2101,22 +2142,92 @@ function mpRenderLobby(msg) {
     const dotBg = p.special ? SPECIAL_SWATCH_CSS[p.special] : `hsl(${p.hue},85%,55%)`;
     const dot = `<span class="hue-dot" style="color:hsl(${p.hue},85%,55%);background:${dotBg}"></span>`;
     const hostTag = p.isHost ? '<span class="host-tag">Host</span>' : '';
-    li.innerHTML = `${dot}<span>${p.name}</span>${hostTag}`;
+    const canKick = mpIsHost && p.id !== mpPlayerId;
+    const kickBtn = canKick
+      ? `<button type="button" class="btn-small btn-danger lobby-kick" data-kick-id="${p.id}">Kick</button>`
+      : '';
+    li.innerHTML = `${dot}<span>${p.name}</span>${hostTag}${kickBtn}`;
     list.appendChild(li);
   }
   const startBtn = document.getElementById('btn-start-round');
   const waitingText = document.getElementById('lobby-waiting-text');
   startBtn.classList.toggle('hidden', !mpIsHost);
   waitingText.classList.toggle('hidden', mpIsHost);
+  mpRenderInGameKickList(msg.players);
 }
 
 let mpConnectGeneration = 0;
 let mpPendingAction = null; // { type: 'create' } | { type: 'join', code }
+let mpKicked = false;
+const RECONNECT_STORE = 'pocketPuttReconnect';
+
+function mpReadReconnectCreds() {
+  try {
+    const raw = sessionStorage.getItem(RECONNECT_STORE);
+    if (!raw) return null;
+    const o = JSON.parse(raw);
+    if (!o || !o.room || !o.token) return null;
+    return { room: String(o.room).toUpperCase(), token: String(o.token) };
+  } catch {
+    return null;
+  }
+}
+
+function mpWriteReconnectCreds(room, token) {
+  if (!room || !token) return;
+  try {
+    sessionStorage.setItem(RECONNECT_STORE, JSON.stringify({
+      room: String(room).toUpperCase(),
+      token: String(token),
+    }));
+  } catch { /* private mode */ }
+}
+
+function mpSyncRoomUrl(code) {
+  if (!code) return;
+  try {
+    MP_PARAMS.set('room', code);
+    if (typeof history !== 'undefined' && history.replaceState) {
+      const u = new URL(location.href);
+      if ((u.searchParams.get('room') || '').toUpperCase() !== code) {
+        u.searchParams.set('room', code);
+        history.replaceState(null, '', u.pathname + u.search + u.hash);
+      }
+    }
+  } catch { /* ignore */ }
+}
+
+function mpRememberSession(room, token) {
+  if (room) {
+    mpRoomCode = room;
+    mpSyncRoomUrl(room);
+  }
+  if (room && token) mpWriteReconnectCreds(room, token);
+}
+
+function mpHandshakeJoin(code, name) {
+  const creds = mpReadReconnectCreds();
+  if (creds && creds.room === code && creds.token) {
+    mpSocket.send(JSON.stringify({
+      type: 'relay_reconnect',
+      room_code: code,
+      token: creds.token,
+      player_name: name || 'Player',
+    }));
+    return;
+  }
+  mpSocket.send(JSON.stringify({
+    type: 'relay_join',
+    room_code: code,
+    player_name: name || 'Player',
+  }));
+}
 
 function mpClearRoomCreds() {
-  // Room membership is session-only — never persist codes/tokens across visits.
-  // Stale localStorage keys from older builds are scrubbed here too.
+  // Session token is for refresh-resume of *this* tab in *this* room only.
+  // Stale localStorage keys from older builds are still scrubbed.
   try {
+    sessionStorage.removeItem(RECONNECT_STORE);
     localStorage.removeItem('pocketPuttRoomCode');
     localStorage.removeItem('pocketPuttReconnectToken');
   } catch { /* private mode */ }
@@ -2166,19 +2277,20 @@ function mpConnect(opts = {}) {
 
     if (skipAutoRejoin) return;
 
-    // Deep link: https://host/?room=ABCDEF — join that room once.
-    // Never rejoin from localStorage (removed): it stole focus from custom level links.
-    if (queryRoom && !hasCustomLevel) {
+    // Deep link: https://host/?room=ABCDEF — resume this tab's player if we have
+    // a token for that room, otherwise join as a new guest. Never auto-join from
+    // storage when the URL has no matching ?room= (that stole custom-level links).
+    if (queryRoom && !hasCustomLevel && !mpKicked) {
       mpSetRelayStatus(`Joining ${queryRoom}…`);
-      mpSocket.send(JSON.stringify({
-        type: 'relay_join',
-        room_code: queryRoom,
-        player_name: savedName || 'Player',
-      }));
+      mpHandshakeJoin(queryRoom, savedName || 'Player');
     }
   });
   mpSocket.addEventListener('close', () => {
     if (gen !== mpConnectGeneration) return;
+    if (mpKicked) {
+      mpSetRelayStatus('The host removed you from the room.');
+      return;
+    }
     mpSetRelayStatus('Disconnected — click Create or Join to reconnect.');
   });
   mpSocket.addEventListener('error', () => {
@@ -2199,21 +2311,61 @@ function mpConnect(opts = {}) {
       };
       // Stale room must not block a fresh create on the same socket.
       if (msg.code === 'room_not_found' || msg.code === 'bad_token') {
+        const queryRoom = (MP_PARAMS.get('room') || '').trim().toUpperCase();
+        const hadToken = !!mpReadReconnectCreds();
         mpClearRoomCreds();
+        // Expired reconnect token: join as a new guest instead of duplicating a slot
+        // only when we still have the room in the URL and were not kicked.
+        if (
+          msg.code === 'bad_token' &&
+          hadToken &&
+          queryRoom &&
+          !mpKicked &&
+          !mpPlayerId &&
+          mpSocketOpen()
+        ) {
+          mpHandshakeJoin(queryRoom, localStorage.getItem('pocketPuttName') || 'Player');
+          return;
+        }
       }
       mpSetRelayStatus(hints[msg.code] || `Error: ${msg.code || 'unknown'}`);
       return;
     }
     if (msg.type === 'relay_created' || msg.type === 'relay_reconnected') {
-      mpRoomCode = msg.room_code || null;
-      // Intentionally not writing room codes/tokens to localStorage.
+      mpKicked = false;
+      mpRememberSession(msg.room_code || null, msg.token || null);
       mpSetRelayStatus(msg.room_code ? `In room ${msg.room_code}` : '');
       return;
     }
+    if (msg.type === 'kicked') {
+      mpKicked = true;
+      mpClearRoomCreds();
+      mpPlayerId = null;
+      mpIsHost = false;
+      mpInRound = false;
+      mpPlaying = false;
+      mpStopKeepalives();
+      mpCanPutt = false;
+      Game.players.clear();
+      const menu = document.getElementById('game-menu');
+      if (menu) menu.classList.add('hidden');
+      hud.classList.add('hidden');
+      document.getElementById('lobby-join').classList.remove('hidden');
+      document.getElementById('lobby-joined').classList.add('hidden');
+      showScreen('screen-lobby');
+      mpSetRelayStatus('The host removed you from the room.');
+      return;
+    }
+    if (msg.type === 'playerRemoved') {
+      if (msg.playerId && Game.players.has(msg.playerId)) Game.players.delete(msg.playerId);
+      mpRenderInGameKickList();
+      return;
+    }
     if (msg.type === 'welcome') {
+      mpKicked = false;
       mpPlayerId = msg.playerId;
       mpIsHost = msg.isHost;
-      if (msg.roomCode) mpRoomCode = msg.roomCode;
+      mpRememberSession(msg.roomCode || mpRoomCode, msg.reconnectToken || null);
       document.getElementById('lobby-join').classList.add('hidden');
       document.getElementById('lobby-joined').classList.remove('hidden');
       const rename = document.getElementById('lobby-rename-input');
@@ -2263,7 +2415,9 @@ function mpConnect(opts = {}) {
       mpPlaying = false;
       mpStopKeepalives();
       mpFrozenTimerMs = mpEstimatedElapsedMs();
+      if (typeof msg.holeIndex === 'number') Game.currentHoleIndex = msg.holeIndex;
       mpRenderHoleResults(msg);
+      prefetchNextHoleGravityBake();
     } else if (msg.type === 'finalResults') {
       mpPlaying = false;
       mpStopKeepalives();
@@ -3225,6 +3379,7 @@ function mpHandleEvent(ev, hole, opts) {
 function mpDoCreateRoom() {
   const name = mpLobbyName();
   localStorage.setItem('pocketPuttName', name);
+  mpKicked = false;
   mpClearRoomCreds();
   mpSetRelayStatus('Creating room…');
   mpSocket.send(JSON.stringify({ type: 'relay_create', player_name: name }));
@@ -3233,9 +3388,41 @@ function mpDoCreateRoom() {
 function mpDoJoinRoom(code) {
   const name = mpLobbyName();
   localStorage.setItem('pocketPuttName', name);
-  mpRoomCode = null; // joining a new code; in-memory only
+  const creds = mpReadReconnectCreds();
+  if (!creds || creds.room !== code) mpClearRoomCreds();
+  mpKicked = false;
   mpSetRelayStatus(`Joining ${code}…`);
-  mpSocket.send(JSON.stringify({ type: 'relay_join', room_code: code, player_name: name }));
+  mpHandshakeJoin(code, name);
+}
+
+function mpSendKick(playerId) {
+  if (!mpIsHost || !playerId || playerId === mpPlayerId || !mpSocketOpen()) return;
+  mpSocket.send(JSON.stringify({ type: 'kick', playerId }));
+}
+
+function mpRenderInGameKickList(players) {
+  const el = document.getElementById('ingame-kick-list');
+  if (!el) return;
+  const roster = players || [...Game.players.values()].map((p) => ({
+    id: p.id,
+    name: p.name,
+    isHost: !!p.isHost,
+  }));
+  if (!MULTIPLAYER || !mpIsHost) {
+    el.classList.add('hidden');
+    el.innerHTML = '';
+    return;
+  }
+  const others = roster.filter((p) => p.id && p.id !== mpPlayerId);
+  if (!others.length) {
+    el.classList.add('hidden');
+    el.innerHTML = '';
+    return;
+  }
+  el.classList.remove('hidden');
+  el.innerHTML = others.map((p) => (
+    `<button type="button" class="btn-small btn-danger lobby-kick" data-kick-id="${p.id}">Kick ${p.name || 'player'}</button>`
+  )).join('');
 }
 
 function mpSendCreateRoom() {
@@ -3289,6 +3476,16 @@ if (btnJoinRoom) {
     mpSendJoinRoom();
   });
 }
+function mpOnKickClick(e) {
+  const btn = e.target && e.target.closest && e.target.closest('[data-kick-id]');
+  if (!btn) return;
+  e.preventDefault();
+  mpSendKick(btn.getAttribute('data-kick-id'));
+}
+const lobbyPlayerList = document.getElementById('lobby-player-list');
+if (lobbyPlayerList) lobbyPlayerList.addEventListener('click', mpOnKickClick);
+const inGameKickList = document.getElementById('ingame-kick-list');
+if (inGameKickList) inGameKickList.addEventListener('click', mpOnKickClick);
 const gameMenuEl = document.getElementById('game-menu');
 let mpInRound = false;
 document.getElementById('btn-menu-restart').addEventListener('click', () => {

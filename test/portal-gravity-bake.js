@@ -343,6 +343,18 @@ test('sample phi available for visualization', () => {
     assert.strictEqual(cache.fingerprint, sync.fingerprint);
     passed++;
     console.log('ok async BEM bake resolves + fingerprint lockstep');
+
+    const seen = [];
+    const prog = await PG.bakePortalGravityAsync(acceleratingPortalFixture(), {
+      maxPeriod: 4,
+      onProgress(p) { seen.push(p); },
+    });
+    assert.ok(prog && prog.frames.length === 4);
+    assert.ok(seen.length >= 4, 'progress ticks=' + seen.length);
+    assert.ok(seen[0] < 1, 'first progress is not already done');
+    assert.ok(seen[seen.length - 1] >= 1 - 1e-9, 'last progress is complete');
+    passed++;
+    console.log('ok async bake reports progress while it runs');
   } catch (e) {
     console.error('FAIL async bake', e && e.message ? e.message : e);
     process.exitCode = 1;

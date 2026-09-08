@@ -761,7 +761,8 @@
 
     return new Promise((resolve) => {
       function stepChunk() {
-        const end = Math.min(period, t + 1); // 1 period-tick per frame (BEM is heavier)
+        // One physics tick per frame so the loading bar can paint.
+        const end = Math.min(period, t + 1);
         while (t < end) {
           setHoleObstaclesAtTick(work, t);
           const mouths = buildMouthAccelSources(work, t, period);

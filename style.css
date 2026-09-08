@@ -18,8 +18,20 @@ html, body {
 
 #game-menu {
   display: flex;
+  flex-wrap: wrap;
   gap: 10px;
   margin-bottom: 12px;
+}
+
+#ingame-kick-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  width: 100%;
+}
+
+#ingame-kick-list.hidden {
+  display: none;
 }
 
 .btn-danger {
@@ -271,6 +283,7 @@ canvas#game {
 .screen {
   position: absolute;
   inset: 0;
+  z-index: 20;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -488,6 +501,12 @@ button:active {
   letter-spacing: 0.4px;
   text-transform: uppercase;
   opacity: 0.6;
+}
+
+#lobby-player-list .lobby-kick {
+  margin-left: auto;
+  padding: 2px 8px;
+  font-size: 11px;
 }
 
 #lobby-waiting-text {
@@ -752,6 +771,7 @@ a.btn-small:visited {
   display: flex;
   align-items: center;
   gap: 8px;
+}
 
 /* Custom level share link panel (start screen) */
 #custom-level-panel {

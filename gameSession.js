@@ -152,6 +152,9 @@ class GameSession {
     this.gravityBakeReady = null;
     this.gravityBakeHoleIndex = -1;
     this.gravityBakeStartedAtMs = 0;
+    this.hostGravityBakePending = false;
+    this._gravityBakeGen = 0;
+    this._gravityBakeHole = null;
     this.simTick = 0;
     this.holeEnding = false;
     this.holeEndingAtMs = 0;
@@ -493,41 +496,53 @@ class GameSession {
    */
   ensurePortalGravityBake(hole) {
     const PG = global.PortalGravity || (Shared && Shared.PortalGravity);
-    if (!PG || !hole || typeof PG.holeNeedsPortalGravityBake !== 'function') return;
+    if (!PG || !hole || typeof PG.holeNeedsPortalGravityBake !== 'function') {
+      this.hostGravityBakePending = false;
+      return;
+    }
     if (!PG.holeNeedsPortalGravityBake(hole)) {
       delete hole._portalGravityCache;
+      this.hostGravityBakePending = false;
       return;
     }
     if (hole._portalGravityCache && hole._portalGravityCache.frames && hole._portalGravityCache.frames.length) {
+      this.hostGravityBakePending = false;
       return;
     }
+    if (this.hostGravityBakePending && this._gravityBakeHole === hole) return;
+    const gen = ++this._gravityBakeGen;
+    this._gravityBakeHole = hole;
+    this.hostGravityBakePending = true;
     const t0 = Date.now();
-    try {
-      const cache = PG.bakePortalGravity(hole);
-      if (cache) {
+    const bake = typeof PG.bakePortalGravityAsync === 'function'
+      ? PG.bakePortalGravityAsync(hole)
+      : Promise.resolve(PG.bakePortalGravity(hole));
+    bake.then((cache) => {
+      if (gen !== this._gravityBakeGen || this._destroyed) return;
+      if (cache && cache.frames && cache.frames.length) {
         hole._portalGravityCache = cache;
-        // Fingerprint lets host/client log identity without shipping the whole bake.
         if (!cache.fingerprint && typeof PG.bakeFingerprint === 'function') {
           cache.fingerprint = PG.bakeFingerprint(cache);
         }
         console.log(
           '[gameSession] portal gravity bake',
-          cache.period, 'ticks in', Date.now() - t0, 'ms',
+          cache.period, 'ticks',
+          'stride', cache.stride || 1,
+          'frames', cache.frames.length,
+          'in', Date.now() - t0, 'ms',
           cache.fingerprint || '',
           cache.capped ? '(capped from LCM ' + (cache.rawLcm || '?') + ')' : ''
         );
-        if (cache.capped) {
-          console.warn(
-            '[gameSession] portal gravity period capped',
-            cache.rawLcm, '→', cache.period,
-            '— host and clients use the same min(LCM, cap) so fields stay lockstep'
-          );
-        }
       }
-    } catch (e) {
+      this.hostGravityBakePending = false;
+      this.maybeStartAfterGravityBake();
+    }).catch((e) => {
+      if (gen !== this._gravityBakeGen || this._destroyed) return;
       console.warn('[gameSession] portal gravity bake failed', e && e.message);
       delete hole._portalGravityCache;
-    }
+      this.hostGravityBakePending = false;
+      this.maybeStartAfterGravityBake();
+    });
   }
 
   beginHole(holeIndex) {
@@ -624,6 +639,7 @@ class GameSession {
 
   maybeStartAfterGravityBake() {
     if (this.state !== 'GRAVITY_LOADING') return;
+    if (this.hostGravityBakePending) return;
     const connected = [...this.players.values()].filter((p) => p.connected);
     if (!connected.length) return;
     const ready = this.gravityBakeReady || new Set();
@@ -644,6 +660,7 @@ class GameSession {
     this.gravityBakeReady = null;
     this.gravityBakeHoleIndex = -1;
     this.gravityBakeStartedAtMs = 0;
+    this.hostGravityBakePending = false;
     this.touch();
     console.log('[gameSession] all clients gravity-ready — PLAYING');
     this.broadcastReliable(this.roundStatePayload());
@@ -712,8 +729,16 @@ class GameSession {
       results,
       standings: this._standingsSnapshot,
     });
+    this.prefetchNextHoleGravityBake();
     // Next-hole / final advancement is driven by tickDriver wall clock (not setTimeout),
     // so free-tier freezes or a blocked event loop can't drop the transition forever.
+  }
+
+  prefetchNextHoleGravityBake() {
+    const next = this.currentHoleIndex + 1;
+    const holes = this.currentHoles();
+    if (next >= holes.length) return;
+    this.ensurePortalGravityBake(holes[next]);
   }
 
   /** Advance HOLE_RESULTS → next hole or FINAL_RESULTS once the results delay has elapsed. */
@@ -1787,6 +1812,8 @@ class GameSession {
         this.broadcast({ type: 'notice', text: `${player.name} restarted the game` });
         this.startNewRound();
       }
+    } else if (msg.type === 'kick') {
+      this.kickPlayer(player, msg.playerId);
     } else if (msg.type === 'endGame') {
       if (this.state !== 'WAITING_FOR_PLAYERS') {
         this.state = 'WAITING_FOR_PLAYERS';
@@ -1846,12 +1873,47 @@ class GameSession {
 
   onDisconnect(player) {
     if (!player || this._destroyed) return;
+    if (!this.players.has(player.id)) return;
     player.connected = false;
     this.ensureHost();
     // Drop disconnected players from the bake barrier so the room can start.
     if (this.state === 'GRAVITY_LOADING') this.maybeStartAfterGravityBake();
     this.broadcastLobbyState();
     this.touch();
+  }
+
+  /**
+   * Host-only: drop a player from the room. Their reconnect token dies with the
+   * slot, so a refresh cannot reclaim it — they would have to join as a new guest.
+   */
+  kickPlayer(host, targetId) {
+    if (!host || host.id !== this.hostPlayerId) return { ok: false, error: 'not_host' };
+    if (!targetId || targetId === host.id) return { ok: false, error: 'bad_target' };
+    const target = this.players.get(targetId);
+    if (!target) return { ok: false, error: 'not_found' };
+    const name = target.name;
+    this.players.delete(target.id);
+    if (this.gravityBakeReady) this.gravityBakeReady.delete(target.id);
+    this.send(target.ws, { type: 'kicked', reason: 'host' });
+    try {
+      if (target.ws && target.ws.readyState === WebSocket.OPEN) target.ws.close();
+    } catch {
+      /* ignore */
+    }
+    target.ws = null;
+    target.connected = false;
+    this.ensureHost();
+    this.broadcast({ type: 'playerRemoved', playerId: target.id, name, reason: 'host' });
+    this.broadcast({ type: 'notice', text: `${name} was removed` });
+    this.broadcastLobbyState();
+    if (this.state === 'PLAYING') {
+      this.broadcastReliable(
+        this.buildCorrection([], { reason: 'kick', includeObstacles: true, hard: true })
+      );
+    }
+    if (this.state === 'GRAVITY_LOADING') this.maybeStartAfterGravityBake();
+    this.touch();
+    return { ok: true, playerId: target.id, name };
   }
 
   destroy() {
