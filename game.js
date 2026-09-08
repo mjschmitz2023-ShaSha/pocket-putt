@@ -9,7 +9,7 @@ const {
   MAX_DRAG_DIST, MIN_DRAG_DIST, POWER_MULTIPLIER, MAX_LAUNCH_SPEED, BOOST_MAX_SPEED, BOUND,
   COURSES,
   createBallState, stepBallPhysics, advanceHoleObstacles, setHoleObstaclesAtTick, resetHoleObstacles,
-  computeLaunchVelocity, clampDragVector, stickyLaunchFactor, stickyIndexAt, latchStickyAfterPutt,
+  pullbackFromOrigin, computeLaunchVelocity, clampDragVector, stickyLaunchFactor, stickyIndexAt, latchStickyAfterPutt,
   markWetFromWater, noteWetPutt, ballMayRestForAim, zoneBounds, waterDropPointFor,
   waterDropIndexFor, waterWaveFrontAt, stepWaterFloat, WATER_FLOAT_TICKS, WATER_FLOAT_CARRY,
   createSpeedAvgTracker, resetSpeedAvgTracker, noteSpeedSample, isQuasiRest, mayPuttBall,
@@ -38,7 +38,7 @@ const Game = {
   scorecard: [],
   ball: createBallState({ x: 0, y: 0 }),
   trail: [],
-  drag: { active: false, pointerVec: { x: 0, y: 0 } },
+  drag: { active: false, pointerVec: { x: 0, y: 0 }, origin: { x: 0, y: 0 } },
   particles: [],
   hazardTimer: 0,
   flagPhase: 0,
@@ -624,56 +624,36 @@ function drawBall() {
   ctx.fill();
   ctx.restore();
 }
-function powerColor(power) {
-  if (power < 0.33) return '#8be07c';
-  if (power < 0.66) return '#f4d548';
-  return '#f4543f';
-}
 function powerLabelText(power) {
   if (power < 0.33) return 'Gentle';
   if (power < 0.66) return 'Firm';
   if (power < 0.9) return 'Strong';
   return 'MAX POWER!';
 }
+function aimBallPos() {
+  if (MULTIPLAYER) {
+    const me = Game.players.get(mpPlayerId);
+    if (me) {
+      return {
+        x: me.rx != null ? me.rx : me.x,
+        y: me.ry != null ? me.ry : me.y,
+      };
+    }
+  }
+  return { x: Game.ball.x, y: Game.ball.y };
+}
 function drawAimLine() {
-  const b = Game.ball;
-  const v = Game.drag.pointerVec;
-  const len = Math.hypot(v.x, v.y);
-  const power = Math.min(len / MAX_DRAG_DIST, 1);
-  const color = powerColor(power);
-
-  ctx.strokeStyle = 'rgba(255,255,255,0.5)';
-  ctx.lineWidth = 2;
-  ctx.setLineDash([4, 4]);
-  ctx.beginPath();
-  ctx.moveTo(b.x, b.y);
-  ctx.lineTo(b.x + v.x, b.y + v.y);
-  ctx.stroke();
-  ctx.setLineDash([]);
-
-  const dirX = -v.x / (len || 1), dirY = -v.y / (len || 1);
-  const indicatorLen = 30 + power * 90;
-  const tipX = b.x + dirX * indicatorLen, tipY = b.y + dirY * indicatorLen;
-  ctx.strokeStyle = color;
-  ctx.lineWidth = 3;
-  ctx.beginPath();
-  ctx.moveTo(b.x, b.y);
-  ctx.lineTo(tipX, tipY);
-  ctx.stroke();
-  const ah = 8, ang = Math.atan2(dirY, dirX);
-  ctx.fillStyle = color;
-  ctx.beginPath();
-  ctx.moveTo(tipX, tipY);
-  ctx.lineTo(tipX - ah * Math.cos(ang - 0.4), tipY - ah * Math.sin(ang - 0.4));
-  ctx.lineTo(tipX - ah * Math.cos(ang + 0.4), tipY - ah * Math.sin(ang + 0.4));
-  ctx.closePath();
-  ctx.fill();
-
+  const ballPos = aimBallPos();
+  const overlay = Draw.drawPuttAimOverlay(ctx, ballPos, Game.drag.pointerVec);
+  if (!overlay || overlay.len < 0.5) {
+    powerLabelEl.classList.add('hidden');
+    return;
+  }
   powerLabelEl.classList.remove('hidden');
-  powerLabelEl.style.left = (b.x / LOGICAL_W) * 100 + '%';
-  powerLabelEl.style.top = (b.y / LOGICAL_H) * 100 + '%';
-  powerLabelEl.style.color = color;
-  powerLabelEl.textContent = powerLabelText(power);
+  powerLabelEl.style.left = (ballPos.x / LOGICAL_W) * 100 + '%';
+  powerLabelEl.style.top = (ballPos.y / LOGICAL_H) * 100 + '%';
+  powerLabelEl.style.color = overlay.color;
+  powerLabelEl.textContent = powerLabelText(overlay.power);
 }
 function drawMultiplayerBall(b, isSelf) {
   const bx = b.rx, by = b.ry;
@@ -1156,17 +1136,12 @@ function handlePointerDown(x, y) {
     Game.state = 'AIMING';
   }
   Game.drag.active = true;
+  Game.drag.origin = { x, y };
   Game.drag.pointerVec = { x: 0, y: 0 };
 }
 function handlePointerMove(x, y) {
   if (!Game.drag.active) return;
-  let vx = x - Game.ball.x, vy = y - Game.ball.y;
-  const len = Math.hypot(vx, vy);
-  if (len > MAX_DRAG_DIST) {
-    vx = (vx / len) * MAX_DRAG_DIST;
-    vy = (vy / len) * MAX_DRAG_DIST;
-  }
-  Game.drag.pointerVec = { x: vx, y: vy };
+  Game.drag.pointerVec = pullbackFromOrigin(Game.drag.origin, { x, y });
 }
 function launchBall(dragLen, pointerVec) {
   Game.ball.firedBoosts = new Set();

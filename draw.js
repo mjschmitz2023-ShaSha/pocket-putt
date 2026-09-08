@@ -6,6 +6,7 @@
   const S = root.Shared || {};
   const LOGICAL_W = S.LOGICAL_W || 800;
   const LOGICAL_H = S.LOGICAL_H || 500;
+  const MAX_DRAG_DIST = S.MAX_DRAG_DIST || 150;
   const BOUNDARY_WALLS = S.BOUNDARY_WALLS || [];
   const BOUND = S.BOUND || { left: 20, top: 20, right: 780, bottom: 480 };
   const zoneBounds = S.zoneBounds || function (z) {
@@ -1718,6 +1719,48 @@
     ctx.drawImage(_gravVisCanvas, 0, 0);
   }
 
+  /** Gentle / Firm / Strong aim colors (force arrow). */
+  function powerColor(power) {
+    if (power < 0.33) return '#8be07c';
+    if (power < 0.66) return '#f4d548';
+    return '#f4543f';
+  }
+
+  /**
+   * Power-colored force arrow off the live ball. pointerVec is pull-back
+   * (see Shared.pullbackFromOrigin). Returns { power, color, len } for HUD labels.
+   */
+  function drawPuttAimOverlay(ctx, ballPos, pointerVec) {
+    const bx = ballPos.x, by = ballPos.y;
+    const v = pointerVec || { x: 0, y: 0 };
+    const len = Math.hypot(v.x, v.y);
+    const power = Math.min(len / MAX_DRAG_DIST, 1);
+    const color = powerColor(power);
+    if (!(len > 0.5) || !Number.isFinite(len)) return { power, color, len: len || 0 };
+
+    const dirX = -v.x / len, dirY = -v.y / len;
+    const indicatorLen = 30 + power * 90;
+    const tipX = bx + dirX * indicatorLen, tipY = by + dirY * indicatorLen;
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(bx, by);
+    ctx.lineTo(tipX, tipY);
+    ctx.stroke();
+    const ah = 8, ang = Math.atan2(dirY, dirX);
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.moveTo(tipX, tipY);
+    ctx.lineTo(tipX - ah * Math.cos(ang - 0.4), tipY - ah * Math.sin(ang - 0.4));
+    ctx.lineTo(tipX - ah * Math.cos(ang + 0.4), tipY - ah * Math.sin(ang + 0.4));
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+
+    return { power, color, len };
+  }
+
   const Draw = {
     WALL_DRAW_WIDTH,
     BH_LENS,
@@ -1747,6 +1790,8 @@
     summarizeDrawProfile,
     gravVisEnabled,
     drawGravityPotentialOverlay,
+    powerColor,
+    drawPuttAimOverlay,
   };
 
   root.Draw = Draw;

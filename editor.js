@@ -11,7 +11,7 @@
     wall, sandRect, waterRect, boostRect, rampRect, stickyRect,
     pendulum, slidingGate, planet, blackHole, moon,
     createBallState, stepBallPhysics, advanceHoleObstacles, resetHoleObstacles,
-    computeLaunchVelocity, clampDragVector, stickyLaunchFactor, latchStickyAfterPutt, noteWetPutt,
+    pullbackFromOrigin, computeLaunchVelocity, clampDragVector, stickyLaunchFactor, latchStickyAfterPutt, noteWetPutt,
     markWetFromWater, ballMayRestForAim, cupHasGravity,
     createSpeedAvgTracker, resetSpeedAvgTracker, noteSpeedSample, isQuasiRest, mayPuttBall,
     speedAvg, QUASI_REST_WINDOW_S,
@@ -49,7 +49,7 @@
   let testBall = null;
   let testState = 'AIMING';
   let testStrokes = 0;
-  let testDrag = { active: false, pointerVec: { x: 0, y: 0 } };
+  let testDrag = { active: false, pointerVec: { x: 0, y: 0 }, origin: { x: 0, y: 0 } };
   let trajectoryPts = [];
   /** Progressive ghost sim; same aim key continues across frames until natural end. */
   let ghostSim = null;
@@ -1402,7 +1402,7 @@
     testBall = createBallState(hole.tee);
     testState = 'AIMING';
     testStrokes = 0;
-    testDrag = { active: false, pointerVec: { x: 0, y: 0 } };
+    testDrag = { active: false, pointerVec: { x: 0, y: 0 }, origin: { x: 0, y: 0 } };
     testSpeedTracker = createSpeedAvgTracker();
     clearGhostTrajectory();
     testPhysAcc = 0;
@@ -1497,26 +1497,19 @@
   function handleTestPointerDown(p) {
     if (!testBall) return false;
     if (!mayPuttBall(testBall, hole, testSpeedTracker)) return false;
-    // Grab near the ball (same whether resting or crawling).
-    if (Math.hypot(p.x - testBall.x, p.y - testBall.y) > 48) return false;
     // Interrupt BALL_MOVING crawl / quasi-rest: freeze and enter aim.
     testBall.vx = 0;
     testBall.vy = 0;
     testState = 'AIMING';
     testDrag.active = true;
+    testDrag.origin = { x: p.x, y: p.y };
     testDrag.pointerVec = { x: 0, y: 0 };
     hideEditorRespawn();
     return true;
   }
   function handleTestPointerMove(p) {
     if (!testDrag.active) return;
-    let vx = p.x - testBall.x, vy = p.y - testBall.y;
-    const len = Math.hypot(vx, vy);
-    if (len > MAX_DRAG_DIST) {
-      vx = (vx / len) * MAX_DRAG_DIST;
-      vy = (vy / len) * MAX_DRAG_DIST;
-    }
-    testDrag.pointerVec = { x: vx, y: vy };
+    testDrag.pointerVec = pullbackFromOrigin(testDrag.origin, p);
     updateTrajectory();
   }
   function handleTestPointerUp() {
@@ -1740,21 +1733,6 @@
       ctx.stroke();
       ctx.setLineDash([]);
     }
-    // aim arrow
-    if (testDrag.active) {
-      const v = testDrag.pointerVec;
-      const len = Math.hypot(v.x, v.y) || 1;
-      const dirX = -v.x / len, dirY = -v.y / len;
-      const power = Math.min(len / MAX_DRAG_DIST, 1);
-      const tipX = testBall.x + dirX * (30 + power * 90);
-      const tipY = testBall.y + dirY * (30 + power * 90);
-      ctx.strokeStyle = power < 0.33 ? '#8be07c' : power < 0.66 ? '#f4d548' : '#f4543f';
-      ctx.lineWidth = 3;
-      ctx.beginPath();
-      ctx.moveTo(testBall.x, testBall.y);
-      ctx.lineTo(tipX, tipY);
-      ctx.stroke();
-    }
     // ball
     ctx.fillStyle = '#f4f4f4';
     ctx.beginPath();
@@ -1762,6 +1740,9 @@
     ctx.fill();
     ctx.strokeStyle = 'rgba(0,0,0,0.4)';
     ctx.stroke();
+    if (testDrag.active && typeof D.drawPuttAimOverlay === 'function') {
+      D.drawPuttAimOverlay(ctx, testBall, testDrag.pointerVec);
+    }
   }
 
   function loop(ts) {

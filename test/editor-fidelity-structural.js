@@ -160,6 +160,13 @@ function main() {
   // --- no localSolo in game.js ---
   assert.ok(!/\blocalSolo\b/.test(gameSrc), 'game.js must not contain localSolo');
 
+  assert.ok(/pullbackFromOrigin/.test(gameSrc), 'game.js measures aim pullback from click origin');
+  assert.ok(/pullbackFromOrigin/.test(editorSrc), 'editor.js measures aim pullback from click origin');
+  assert.ok(
+    !/hypot\(\s*p\.x\s*-\s*testBall\.x/.test(editorSrc),
+    'editor Test aim is not limited to a grab radius around the ball'
+  );
+
   console.log('editor-fidelity-structural: OK');
 }
 

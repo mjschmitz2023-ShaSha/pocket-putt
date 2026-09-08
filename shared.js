@@ -2841,7 +2841,21 @@ function stickyLaunchFactor(ball, hole) {
   return stickyIndexAt(ball, hole) >= 0 ? STICKY_LAUNCH_FACTOR : 1;
 }
 
-// Given a raw drag vector (pull-back from the ball), returns the launch velocity. Shared so
+// Pull-back from an aim origin (pointer-down) to the pointer, clamped to MAX_DRAG_DIST.
+// The resulting vector is applied to the live ball.
+function pullbackFromOrigin(origin, pointer) {
+  if (!origin || !pointer) return { x: 0, y: 0 };
+  let vx = pointer.x - origin.x, vy = pointer.y - origin.y;
+  const len = Math.hypot(vx, vy);
+  if (!Number.isFinite(len) || len === 0) return { x: 0, y: 0 };
+  if (len > MAX_DRAG_DIST) {
+    vx = (vx / len) * MAX_DRAG_DIST;
+    vy = (vy / len) * MAX_DRAG_DIST;
+  }
+  return { x: vx, y: vy };
+}
+
+// Given a raw drag vector (pull-back from the aim origin), returns the launch velocity. Shared so
 // the server can independently (and authoritatively) recompute it from a client's raw drag
 // rather than ever trusting a client-sent speed.
 function computeLaunchVelocity(pointerVec) {
@@ -4093,7 +4107,7 @@ return {
   portalGravityEligible, portalGravityDualSample,
   tryPortalTeleport, carvePortalOpenings, collisionWallsForHole, normalizePortalPairs,
   createBallState, stepBallPhysics, advanceHoleObstacles, setHoleObstaclesAtTick, resetHoleObstacles,
-  computeLaunchVelocity, clampDragVector, stickyLaunchFactor, stickyIndexAt, latchStickyAfterPutt,
+  pullbackFromOrigin, computeLaunchVelocity, clampDragVector, stickyLaunchFactor, stickyIndexAt, latchStickyAfterPutt,
   markWetFromWater, noteWetPutt,
   resolveBallBallCollision, teePositionFor, waterDropPointFor, waterDropIndexFor,
   WATER_WAVE, WATER_FLOAT_TICKS, WATER_FLOAT_DRIFT, WATER_FLOAT_CARRY,

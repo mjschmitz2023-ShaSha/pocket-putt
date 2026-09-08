@@ -16,7 +16,7 @@ const {
   blankHole, createBallState, planet, ballMayRestForAim, mayPuttBall,
   createSpeedAvgTracker, noteSpeedSample, isQuasiRest, computeLaunchVelocity,
   stepBallPhysics, STOP_THRESHOLD, CRAWL_PUTT_SPEED, BALL_RADIUS,
-  MAX_DRAG_DIST, clampDragVector, TICK_DT,
+  MAX_DRAG_DIST, clampDragVector, pullbackFromOrigin, TICK_DT,
 } = Shared;
 
 let passed = 0;
@@ -182,6 +182,22 @@ test('editor contract: launch from low speed overwrites velocity', () => {
   ball.vx = launch.vx;
   ball.vy = launch.vy;
   assert.ok(ball.vx > 100, 'putt launch replaces crawl velocity');
+});
+
+test('pullbackFromOrigin measures from the click origin, not the live ball', () => {
+  const origin = { x: 400, y: 80 };
+  const pointer = { x: 400, y: 80 + 90 };
+  const v = pullbackFromOrigin(origin, pointer);
+  assert.strictEqual(v.x, 0);
+  assert.strictEqual(v.y, 90);
+  const launch = computeLaunchVelocity(v);
+  assert.ok(launch.vy < 0, 'pull-back +y launches the live ball toward -y');
+});
+
+test('pullbackFromOrigin clamps to MAX_DRAG_DIST', () => {
+  const v = pullbackFromOrigin({ x: 0, y: 0 }, { x: 400, y: 0 });
+  assert.ok(Math.abs(v.x - MAX_DRAG_DIST) < 1e-9);
+  assert.ok(Math.abs(v.y) < 1e-9);
 });
 
 if (!process.exitCode) console.log('crawl-putt: ' + passed + ' passed');

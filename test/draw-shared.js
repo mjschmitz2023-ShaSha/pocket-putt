@@ -90,9 +90,26 @@ function main() {
     assert.strictEqual(Draw.WALL_DRAW_WIDTH, 10, 'WALL_DRAW_WIDTH === 10');
     assert.ok(typeof Draw.drawHoleStatic === 'function', 'Draw.drawHoleStatic is a function');
     console.log('draw.js require() OK (node)');
+    assert.strictEqual(typeof Draw.drawPuttAimOverlay, 'function', 'Draw.drawPuttAimOverlay is a function');
+    assert.strictEqual(typeof Draw.powerColor, 'function', 'Draw.powerColor is a function');
+    assert.strictEqual(Draw.powerColor(0.1), '#8be07c', 'powerColor gentle');
+    assert.strictEqual(Draw.powerColor(0.5), '#f4d548', 'powerColor firm');
+    assert.strictEqual(Draw.powerColor(0.9), '#f4543f', 'powerColor strong');
+    assert.doesNotThrow(
+      () => Draw.drawPuttAimOverlay(
+        { save() {}, restore() {}, beginPath() {}, moveTo() {}, lineTo() {}, stroke() {}, fill() {}, closePath() {} },
+        { x: 90, y: 250 },
+        { x: 40, y: 60 }
+      ),
+      'drawPuttAimOverlay does not throw'
+    );
+    console.log('draw-shared: putt aim overlay OK');
   } catch (e) {
     console.log('draw.js require() skipped or failed (browser-only ok):', e.message);
   }
+
+  assert.ok(/Draw\.drawPuttAimOverlay/.test(gameSrc), 'game.js uses Draw.drawPuttAimOverlay');
+  assert.ok(/Draw\.drawPuttAimOverlay|D\.drawPuttAimOverlay/.test(editorSrc), 'editor.js uses Draw.drawPuttAimOverlay');
 
   console.log('draw-shared: OK');
 }
