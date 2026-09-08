@@ -4078,6 +4078,98 @@ function deepCloneHole(hole) {
   return normalizeHole(JSON.parse(JSON.stringify(hole)));
 }
 
+/** Scale that covers the viewport (may crop the world). */
+function viewCoverScale(viewW, viewH, worldW, worldH) {
+  if (!(viewW > 0) || !(viewH > 0) || !(worldW > 0) || !(worldH > 0)) return 1;
+  return Math.max(viewW / worldW, viewH / worldH);
+}
+
+/** Scale that fits the whole world (may letterbox). */
+function viewContainScale(viewW, viewH, worldW, worldH) {
+  if (!(viewW > 0) || !(viewH > 0) || !(worldW > 0) || !(worldH > 0)) return 1;
+  return Math.min(viewW / worldW, viewH / worldH);
+}
+
+/** Camera scale so the ball is `diameterPx` CSS pixels across. */
+function viewBallScale(diameterPx, ballRadius) {
+  const d = (ballRadius > 0 ? ballRadius : 7) * 2;
+  if (!(diameterPx > 0) || !(d > 0)) return 1;
+  return diameterPx / d;
+}
+
+/** Fit the world in the view with padding, never larger than 1 (old 800×500 card). */
+function viewFitScale(viewW, viewH, worldW, worldH, pad) {
+  pad = pad > 0 ? pad : 0;
+  const vw = Math.max(1, viewW - pad * 2);
+  const vh = Math.max(1, viewH - pad * 2);
+  return Math.min(1, viewContainScale(vw, vh, worldW, worldH));
+}
+
+/** Keep the visible rect inside the world when the view is smaller than the world. */
+function viewClampCenter(cx, cy, scale, viewW, viewH, worldW, worldH) {
+  const visW = viewW / scale;
+  const visH = viewH / scale;
+  let x = cx, y = cy;
+  if (!(visW > 0) || visW >= worldW) x = worldW / 2;
+  else x = Math.min(worldW - visW / 2, Math.max(visW / 2, cx));
+  if (!(visH > 0) || visH >= worldH) y = worldH / 2;
+  else y = Math.min(worldH - visH / 2, Math.max(visH / 2, cy));
+  return { x, y };
+}
+
+function viewScreenToWorld(sx, sy, cam) {
+  const s = cam.scale || 1;
+  return {
+    x: cam.x + (sx - cam.viewW / 2) / s,
+    y: cam.y + (sy - cam.viewH / 2) / s,
+  };
+}
+
+function viewWorldToScreen(wx, wy, cam) {
+  const s = cam.scale || 1;
+  return {
+    x: (wx - cam.x) * s + cam.viewW / 2,
+    y: (wy - cam.y) * s + cam.viewH / 2,
+  };
+}
+
+/**
+ * Project an off-rect point onto the rectangle edge along the ray from (cx,cy).
+ * Returns null if (sx,sy) is already inside the rect.
+ */
+function viewClampToRectEdge(sx, sy, x0, y0, x1, y1, cx, cy) {
+  if (!(x1 > x0) || !(y1 > y0)) return null;
+  if (sx >= x0 && sx <= x1 && sy >= y0 && sy <= y1) return null;
+  const dx = sx - cx, dy = sy - cy;
+  let bestT = Infinity, hx = sx, hy = sy;
+  const consider = (t, x, y) => {
+    if (!(t > 1e-9) || t >= bestT) return;
+    if (x < x0 - 1e-6 || x > x1 + 1e-6 || y < y0 - 1e-6 || y > y1 + 1e-6) return;
+    bestT = t;
+    hx = x;
+    hy = y;
+  };
+  if (Math.abs(dx) > 1e-9) {
+    let t = (x0 - cx) / dx;
+    consider(t, x0, cy + dy * t);
+    t = (x1 - cx) / dx;
+    consider(t, x1, cy + dy * t);
+  }
+  if (Math.abs(dy) > 1e-9) {
+    let t = (y0 - cy) / dy;
+    consider(t, cx + dx * t, y0);
+    t = (y1 - cy) / dy;
+    consider(t, cx + dx * t, y1);
+  }
+  if (!Number.isFinite(bestT)) {
+    return {
+      x: Math.min(x1, Math.max(x0, sx)),
+      y: Math.min(y1, Math.max(y0, sy)),
+    };
+  }
+  return { x: hx, y: hy };
+}
+
 return {
   TICK_HZ, TICK_DT, TICK_MS, tickToElapsedMs, elapsedMsToTick,
   LOGICAL_W, LOGICAL_H, BALL_RADIUS, FRICTION_GRASS, FRICTION_SAND, SAND_GRAVITY_HOLD, STOP_THRESHOLD,
@@ -4106,6 +4198,8 @@ return {
   normalizePortalGravityMode, getPortalGravityMode, setPortalGravityMode,
   portalGravityEligible, portalGravityDualSample,
   tryPortalTeleport, carvePortalOpenings, collisionWallsForHole, normalizePortalPairs,
+  viewCoverScale, viewContainScale, viewFitScale, viewBallScale, viewClampCenter, viewScreenToWorld, viewWorldToScreen,
+  viewClampToRectEdge,
   createBallState, stepBallPhysics, advanceHoleObstacles, setHoleObstaclesAtTick, resetHoleObstacles,
   pullbackFromOrigin, computeLaunchVelocity, clampDragVector, stickyLaunchFactor, stickyIndexAt, latchStickyAfterPutt,
   markWetFromWater, noteWetPutt,

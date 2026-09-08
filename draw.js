@@ -1123,11 +1123,22 @@
     const canvas = opts.canvas || ctx.canvas;
     if (!canvas) return;
     let dpr = opts.dpr;
+    let ox = 0, oy = 0;
+    if (typeof ctx.getTransform === 'function') {
+      try {
+        const m = ctx.getTransform();
+        if (m && m.a) {
+          if (dpr == null) dpr = m.a;
+          ox = m.e || 0;
+          oy = m.f || 0;
+        }
+      } catch (_) { /* node stubs */ }
+    }
     if (dpr == null) {
       dpr = canvas.width / LOGICAL_W || 1;
     }
-    const cx = body.x * dpr;
-    const cy = body.y * dpr;
+    const cx = body.x * dpr + ox;
+    const cy = body.y * dpr + oy;
     const { lut, rs, rOut } = ensureLensScaleLut(dpr);
 
     const pad = Math.ceil(rOut) + 2;

@@ -14,6 +14,8 @@ const {
   waterDropIndexFor, waterWaveFrontAt, stepWaterFloat, WATER_FLOAT_TICKS, WATER_FLOAT_CARRY,
   createSpeedAvgTracker, resetSpeedAvgTracker, noteSpeedSample, isQuasiRest, mayPuttBall,
   teePositionFor, resolveBallBallCollision,
+  viewFitScale, viewBallScale, viewClampCenter, viewScreenToWorld, viewWorldToScreen,
+  viewClampToRectEdge,
   decodeHole, encodeHole, normalizeHole, blankHole,
 } = window.Shared;
 // Must match gameSession PHYSICS_SUBTICKS — same dt schedule keeps sticky latch deterministic.
@@ -187,22 +189,361 @@ function updateRespawnOffer(dt) {
   }
 }
 
-function setupCanvasDPR() {
+/** On-screen ball size while following (CSS pixels across). */
+const VIEW_BALL_DIAMETER_PX = 18;
+
+const View = {
+  cssW: LOGICAL_W,
+  cssH: LOGICAL_H,
+  x: LOGICAL_W / 2,
+  y: LOGICAL_H / 2,
+  scale: 1,
+  overview: false,
+  snapped: false,
+};
+
+function cameraBallPos() {
+  return aimBallPos();
+}
+
+const HOLE_BOARD_RADIUS = 10;
+
+function cameraPad() {
+  const m = Math.min(View.cssW, View.cssH);
+  return Math.max(56, m * 0.1);
+}
+
+function followScale() {
+  return Math.max(0.05, viewBallScale(VIEW_BALL_DIAMETER_PX, BALL_RADIUS));
+}
+
+/** True when follow-zoom already frames the entire hole — zoom-out would only add margin. */
+function followZoomShowsWholeHole() {
+  const s = followScale();
+  return LOGICAL_W * s <= View.cssW + 0.5 && LOGICAL_H * s <= View.cssH + 0.5;
+}
+
+function cameraTarget() {
+  const fit = Math.max(0.05, viewFitScale(View.cssW, View.cssH, LOGICAL_W, LOGICAL_H, cameraPad()));
+  const scale = View.overview ? fit : followScale();
+  const ball = cameraBallPos();
+  const follow = View.overview ? { x: LOGICAL_W / 2, y: LOGICAL_H / 2 } : ball;
+  const clamped = viewClampCenter(follow.x, follow.y, scale, View.cssW, View.cssH, LOGICAL_W, LOGICAL_H);
+  return { x: clamped.x, y: clamped.y, scale };
+}
+
+function drawHoleBoard(space) {
+  const r = HOLE_BOARD_RADIUS;
+  const path = Draw && typeof Draw.roundRectPath === 'function'
+    ? (c) => Draw.roundRectPath(c, 0, 0, LOGICAL_W, LOGICAL_H, r)
+    : (c) => { c.beginPath(); c.rect(0, 0, LOGICAL_W, LOGICAL_H); };
+  ctx.save();
+  ctx.shadowColor = 'rgba(0,0,0,0.55)';
+  ctx.shadowBlur = 36;
+  ctx.shadowOffsetY = 10;
+  ctx.fillStyle = space ? '#05060a' : '#3a7d44';
+  path(ctx);
+  ctx.fill();
+  ctx.restore();
+  ctx.save();
+  path(ctx);
+  ctx.clip();
+  drawWorld();
+  ctx.restore();
+  ctx.save();
+  ctx.strokeStyle = space ? 'rgba(180,200,220,0.22)' : 'rgba(0,0,0,0.38)';
+  ctx.lineWidth = 2;
+  path(ctx);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function resizeView() {
   const dpr = window.devicePixelRatio || 1;
-  canvas.width = LOGICAL_W * dpr;
-  canvas.height = LOGICAL_H * dpr;
-  canvas.style.width = LOGICAL_W + 'px';
-  canvas.style.height = LOGICAL_H + 'px';
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const w = Math.max(1, stage.clientWidth || LOGICAL_W);
+  const h = Math.max(1, stage.clientHeight || LOGICAL_H);
+  View.cssW = w;
+  View.cssH = h;
+  const bw = Math.max(1, Math.round(w * dpr));
+  const bh = Math.max(1, Math.round(h * dpr));
+  if (canvas.width !== bw || canvas.height !== bh) {
+    canvas.width = bw;
+    canvas.height = bh;
+  }
+  canvas.style.width = '100%';
+  canvas.style.height = '100%';
 }
-function fitStage() {
-  const margin = 40;
-  const scale = Math.min(1, (window.innerWidth - margin) / LOGICAL_W, (window.innerHeight - margin) / LOGICAL_H);
-  stage.style.transform = `scale(${scale})`;
+
+function updateCamera(dt) {
+  resizeView();
+  const t = cameraTarget();
+  if (!View.snapped) {
+    View.x = t.x;
+    View.y = t.y;
+    View.scale = t.scale;
+    View.snapped = true;
+    return;
+  }
+  const k = 1 - Math.exp(-(dt > 0 ? dt : 0.016) * 10);
+  View.x += (t.x - View.x) * k;
+  View.y += (t.y - View.y) * k;
+  View.scale += (t.scale - View.scale) * k;
 }
+
+function applyCameraTransform() {
+  const dpr = window.devicePixelRatio || 1;
+  const s = View.scale;
+  const tx = View.cssW / 2 - View.x * s;
+  const ty = View.cssH / 2 - View.y * s;
+  ctx.setTransform(dpr * s, 0, 0, dpr * s, dpr * tx, dpr * ty);
+}
+
+function syncCamZoomBtn() {
+  const btn = document.getElementById('btn-cam-zoom');
+  if (!btn) return;
+  const inHole = hud && !hud.classList.contains('hidden');
+  const useful = !followZoomShowsWholeHole();
+  if (!useful && View.overview) View.overview = false;
+  btn.classList.toggle('hidden', !inHole || !useful);
+  btn.setAttribute('aria-pressed', View.overview ? 'true' : 'false');
+  btn.textContent = View.overview ? 'Follow ball' : 'Zoom out';
+}
+
+function followChromeActive() {
+  return hud && !hud.classList.contains('hidden') && !View.overview && !followZoomShowsWholeHole();
+}
+
+function viewCamState() {
+  return { x: View.x, y: View.y, scale: View.scale, viewW: View.cssW, viewH: View.cssH };
+}
+
+function minimapRect() {
+  const w = 120, h = 75, pad = 10;
+  return { x: View.cssW - w - pad, y: 48, w, h };
+}
+
+function minimapContainsCss(sx, sy) {
+  if (!followChromeActive()) return false;
+  const mm = minimapRect();
+  return sx >= mm.x && sx <= mm.x + mm.w && sy >= mm.y && sy <= mm.y + mm.h;
+}
+
+function canvasCssPos(clientX, clientY) {
+  const rect = canvas.getBoundingClientRect();
+  return { x: clientX - rect.left, y: clientY - rect.top };
+}
+
+function fillMinimapZone(z, sx, sy) {
+  if (!z) return;
+  if (z.shape === 'circle' && z.r > 0) {
+    ctx.beginPath();
+    ctx.arc(z.cx * sx, z.cy * sy, z.r * sx, 0, Math.PI * 2);
+    ctx.fill();
+    return;
+  }
+  if (z.x1 == null) return;
+  ctx.fillRect(z.x1 * sx, z.y1 * sy, (z.x2 - z.x1) * sx, (z.y2 - z.y1) * sy);
+}
+
+function drawFollowMinimap(hole) {
+  const mm = minimapRect();
+  const sx = mm.w / LOGICAL_W;
+  const sy = mm.h / LOGICAL_H;
+  const space = !!(hole && hole.gravityBodies && hole.gravityBodies.length);
+  ctx.save();
+  ctx.globalAlpha = 0.7;
+  ctx.translate(mm.x, mm.y);
+  if (Draw && typeof Draw.roundRectPath === 'function') Draw.roundRectPath(ctx, 0, 0, mm.w, mm.h, 8);
+  else { ctx.beginPath(); ctx.rect(0, 0, mm.w, mm.h); }
+  ctx.fillStyle = space ? 'rgba(8, 10, 16, 0.55)' : 'rgba(12, 18, 14, 0.5)';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.32)';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  ctx.save();
+  ctx.clip();
+  ctx.fillStyle = space ? 'rgba(8, 10, 16, 0.45)' : 'rgba(58, 125, 68, 0.55)';
+  ctx.fillRect(0, 0, mm.w, mm.h);
+  ctx.fillStyle = 'rgba(210, 180, 90, 0.5)';
+  for (const z of (hole && hole.sand) || []) fillMinimapZone(z, sx, sy);
+  ctx.fillStyle = 'rgba(70, 140, 210, 0.45)';
+  for (const z of (hole && hole.water) || []) fillMinimapZone(z, sx, sy);
+  for (const b of (hole && hole.gravityBodies) || []) {
+    const r = Math.max(2, (b.radius || 8) * sx);
+    ctx.fillStyle = b.kind === 'blackHole' ? 'rgba(0,0,0,0.55)' : 'rgba(200, 170, 120, 0.5)';
+    ctx.beginPath();
+    ctx.arc(b.x * sx, b.y * sy, r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.strokeStyle = 'rgba(0,0,0,0.4)';
+  ctx.lineWidth = 1;
+  ctx.lineCap = 'round';
+  for (const w of (hole && hole.walls) || []) {
+    ctx.beginPath();
+    ctx.moveTo(w.x1 * sx, w.y1 * sy);
+    ctx.lineTo(w.x2 * sx, w.y2 * sy);
+    ctx.stroke();
+  }
+  const visW = View.cssW / View.scale;
+  const visH = View.cssH / View.scale;
+  ctx.strokeStyle = 'rgba(255,255,255,0.75)';
+  ctx.lineWidth = 1.2;
+  ctx.strokeRect((View.x - visW / 2) * sx, (View.y - visH / 2) * sy, visW * sx, visH * sy);
+  if (hole && hole.cup) {
+    ctx.fillStyle = 'rgba(230, 72, 63, 0.9)';
+    ctx.beginPath();
+    ctx.arc(hole.cup.x * sx, hole.cup.y * sy, 3, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  const drawDot = (wx, wy, color, r) => {
+    if (!Number.isFinite(wx) || !Number.isFinite(wy)) return;
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(wx * sx, wy * sy, r, 0, Math.PI * 2);
+    ctx.fill();
+  };
+  if (MULTIPLAYER && Game.players.size) {
+    for (const [id, b] of Game.players) {
+      const px = b.rx != null ? b.rx : b.x;
+      const py = b.ry != null ? b.ry : b.y;
+      const self = id === mpPlayerId;
+      drawDot(px, py, self ? 'rgba(255,255,255,0.95)' : `hsla(${b.hue || 0}, 90%, 60%, 0.85)`, self ? 3.2 : 2.6);
+    }
+  } else if (Game.ball) {
+    drawDot(Game.ball.x, Game.ball.y, 'rgba(255,255,255,0.95)', 3.2);
+  }
+  ctx.restore();
+  ctx.restore();
+}
+
+function pushOutOfAabb(px, py, r, margin) {
+  const x0 = r.x - margin, y0 = r.y - margin, x1 = r.x + r.w + margin, y1 = r.y + r.h + margin;
+  if (px < x0 || px > x1 || py < y0 || py > y1) return { x: px, y: py };
+  const left = px - x0, right = x1 - px, top = py - y0, bot = y1 - py;
+  const m = Math.min(left, right, top, bot);
+  if (m === left) return { x: x0, y: py };
+  if (m === right) return { x: x1, y: py };
+  if (m === top) return { x: px, y: y0 };
+  return { x: px, y: y1 };
+}
+
+function drawEdgeChevron() {
+  ctx.beginPath();
+  ctx.moveTo(11, 0);
+  ctx.lineTo(2, -6);
+  ctx.lineTo(2, 6);
+  ctx.closePath();
+  ctx.fill();
+}
+
+function drawEdgeBadge(x, y, outAng, drawGlyph) {
+  const ix = x - Math.cos(outAng) * 10;
+  const iy = y - Math.sin(outAng) * 10;
+  ctx.save();
+  ctx.globalAlpha = 0.78;
+  ctx.fillStyle = 'rgba(8, 12, 10, 0.45)';
+  ctx.beginPath();
+  ctx.arc(ix, iy, 13, 0, Math.PI * 2);
+  ctx.fill();
+  drawGlyph(ix, iy);
+  ctx.translate(x, y);
+  ctx.rotate(outAng);
+  ctx.fillStyle = 'rgba(255,255,255,0.82)';
+  drawEdgeChevron();
+  ctx.restore();
+}
+
+function drawCupEdgeIcon(x, y, outAng) {
+  drawEdgeBadge(x, y, outAng, (ix, iy) => {
+    ctx.fillStyle = 'rgba(17, 17, 17, 0.85)';
+    ctx.beginPath();
+    ctx.arc(ix, iy + 4, 4.2, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(238, 238, 238, 0.92)';
+    ctx.lineWidth = 1.4;
+    ctx.beginPath();
+    ctx.moveTo(ix, iy + 4);
+    ctx.lineTo(ix, iy - 8);
+    ctx.stroke();
+    ctx.fillStyle = 'rgba(230, 72, 63, 0.9)';
+    ctx.beginPath();
+    ctx.moveTo(ix + 0.6, iy - 8);
+    ctx.lineTo(ix + 9, iy - 4.5);
+    ctx.lineTo(ix + 0.6, iy - 1);
+    ctx.closePath();
+    ctx.fill();
+  });
+}
+
+function drawPlayerEdgeIcon(x, y, hue, outAng) {
+  drawEdgeBadge(x, y, outAng, (ix, iy) => {
+    ctx.fillStyle = `hsla(${hue || 0}, 90%, 60%, 0.92)`;
+    ctx.beginPath();
+    ctx.arc(ix, iy, 6, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.9)';
+    ctx.lineWidth = 1.4;
+    ctx.stroke();
+  });
+}
+
+function drawOffscreenMarkers(hole) {
+  const cam = viewCamState();
+  const mm = minimapRect();
+  const zoom = { x: 6, y: View.cssH - 52, w: 118, h: 44 };
+  const x0 = 18, y0 = 40, x1 = View.cssW - 18, y1 = View.cssH - 18;
+  const cx = View.cssW / 2, cy = View.cssH / 2;
+  const onScreen = (wx, wy) => {
+    const s = viewWorldToScreen(wx, wy, cam);
+    return s.x >= 32 && s.x <= View.cssW - 32 && s.y >= 32 && s.y <= View.cssH - 32;
+  };
+  const placed = [];
+  const place = (wx, wy) => {
+    const s = viewWorldToScreen(wx, wy, cam);
+    let p = viewClampToRectEdge(s.x, s.y, x0, y0, x1, y1, cx, cy);
+    if (!p) return null;
+    p = pushOutOfAabb(p.x, p.y, mm, 14);
+    p = pushOutOfAabb(p.x, p.y, zoom, 10);
+    p.x = Math.min(x1, Math.max(x0, p.x));
+    p.y = Math.min(y1, Math.max(y0, p.y));
+    const outAng = Math.atan2(s.y - cy, s.x - cx);
+    for (const q of placed) {
+      if (Math.hypot(p.x - q.x, p.y - q.y) < 24) {
+        const tx = -Math.sin(outAng), ty = Math.cos(outAng);
+        p.x = Math.min(x1, Math.max(x0, p.x + tx * 24));
+        p.y = Math.min(y1, Math.max(y0, p.y + ty * 24));
+      }
+    }
+    const marker = { x: p.x, y: p.y, outAng };
+    placed.push(marker);
+    return marker;
+  };
+  if (hole && hole.cup && !onScreen(hole.cup.x, hole.cup.y)) {
+    const p = place(hole.cup.x, hole.cup.y);
+    if (p) drawCupEdgeIcon(p.x, p.y, p.outAng);
+  }
+  for (const [id, b] of Game.players) {
+    if (id === mpPlayerId) continue;
+    const wx = b.rx != null ? b.rx : b.x;
+    const wy = b.ry != null ? b.ry : b.y;
+    if (!Number.isFinite(wx) || !Number.isFinite(wy)) continue;
+    if (onScreen(wx, wy)) continue;
+    const p = place(wx, wy);
+    if (p) drawPlayerEdgeIcon(p.x, p.y, b.hue, p.outAng);
+  }
+}
+
 function getCanvasPos(clientX, clientY) {
   const rect = canvas.getBoundingClientRect();
-  return { x: (clientX - rect.left) * (LOGICAL_W / rect.width), y: (clientY - rect.top) * (LOGICAL_H / rect.height) };
+  const sx = clientX - rect.left;
+  const sy = clientY - rect.top;
+  return viewScreenToWorld(sx, sy, {
+    x: View.x,
+    y: View.y,
+    scale: View.scale,
+    viewW: rect.width,
+    viewH: rect.height,
+  });
 }
 
 // ---- Audio (Web Audio API oscillators only, no sound files) ----
@@ -650,8 +991,11 @@ function drawAimLine() {
     return;
   }
   powerLabelEl.classList.remove('hidden');
-  powerLabelEl.style.left = (ballPos.x / LOGICAL_W) * 100 + '%';
-  powerLabelEl.style.top = (ballPos.y / LOGICAL_H) * 100 + '%';
+  const scr = viewWorldToScreen(ballPos.x, ballPos.y, {
+    x: View.x, y: View.y, scale: View.scale, viewW: View.cssW, viewH: View.cssH,
+  });
+  powerLabelEl.style.left = scr.x + 'px';
+  powerLabelEl.style.top = scr.y + 'px';
   powerLabelEl.style.color = overlay.color;
   powerLabelEl.textContent = powerLabelText(overlay.power);
 }
@@ -1094,6 +1438,7 @@ async function loadHole(i) {
   Game.ball = createBallState(hole.tee);
   Game.trail = [];
   Game.drag.active = false;
+  View.snapped = false;
   resetAchvHoleCounters();
   resetHoleObstacles(hole);
   hud.classList.remove('hidden');
@@ -1222,7 +1567,13 @@ function handlePointerUp(x, y) {
   }
 }
 
-canvas.addEventListener('mousedown', (e) => { unlockAudio(); const p = getCanvasPos(e.clientX, e.clientY); handlePointerDown(p.x, p.y); });
+canvas.addEventListener('mousedown', (e) => {
+  unlockAudio();
+  const css = canvasCssPos(e.clientX, e.clientY);
+  if (minimapContainsCss(css.x, css.y)) return;
+  const p = getCanvasPos(e.clientX, e.clientY);
+  handlePointerDown(p.x, p.y);
+});
 window.addEventListener('mousemove', (e) => { const p = getCanvasPos(e.clientX, e.clientY); handlePointerMove(p.x, p.y); });
 window.addEventListener('mouseup', (e) => { const p = getCanvasPos(e.clientX, e.clientY); handlePointerUp(p.x, p.y); });
 
@@ -1230,6 +1581,8 @@ canvas.addEventListener('touchstart', (e) => {
   e.preventDefault();
   unlockAudio();
   const t = e.touches[0];
+  const css = canvasCssPos(t.clientX, t.clientY);
+  if (minimapContainsCss(css.x, css.y)) return;
   const p = getCanvasPos(t.clientX, t.clientY);
   handlePointerDown(p.x, p.y);
 }, { passive: false });
@@ -1353,14 +1706,27 @@ function update(dt) {
   updateParticles(dt);
 }
 function render() {
-  ctx.clearRect(0, 0, LOGICAL_W, LOGICAL_H);
-  drawWorld();
+  const dpr = window.devicePixelRatio || 1;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const hole = currentHoles()[Game.currentHoleIndex];
+  const space = !!(hole && hole.gravityBodies && hole.gravityBodies.length);
+  ctx.fillStyle = space ? '#05060a' : '#1b2a1f';
+  ctx.fillRect(0, 0, View.cssW, View.cssH);
+  applyCameraTransform();
+  drawHoleBoard(space);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  if (followChromeActive()) {
+    drawFollowMinimap(hole);
+    drawOffscreenMarkers(hole);
+  }
+  syncCamZoomBtn();
 }
 function loop(ts) {
   if (!Game.lastTime) Game.lastTime = ts;
   const dt = Math.min((ts - Game.lastTime) / 1000, 1 / 30);
   Game.lastTime = ts;
   update(dt);
+  updateCamera(dt);
   render();
   // Drive clientClock from the frame loop (not setInterval) so mobile throttle
   // is tied to actual rendering, not a bare timer the OS freely clamps.
@@ -2440,6 +2806,7 @@ async function mpBeginHole(msg) {
   }
   if (msg.courseIndex !== undefined && !Game.customHole) Game.courseIndex = msg.courseIndex;
   Game.currentHoleIndex = msg.holeIndex;
+  View.snapped = false;
   Game.players.clear();
   const hole = currentHoles()[msg.holeIndex];
   if (!hole) {
@@ -3713,9 +4080,20 @@ mpClearRoomCreds();
 if (window.ShareLevel && ShareLevel.resolveLvlShortFromLocation(MP_PARAMS)) {
   // Navigation in progress; skip rest of boot.
 } else {
-setupCanvasDPR();
-fitStage();
-window.addEventListener('resize', fitStage);
+resizeView();
+window.addEventListener('resize', resizeView);
+if (window.visualViewport) {
+  window.visualViewport.addEventListener('resize', resizeView);
+}
+const btnCamZoom = document.getElementById('btn-cam-zoom');
+if (btnCamZoom) {
+  btnCamZoom.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    View.overview = !View.overview;
+    syncCamZoomBtn();
+  });
+}
 populateCourseSelect(document.getElementById('solo-course-select'));
 populateCourseSelect(document.getElementById('course-select'));
 const soloCourse = document.getElementById('solo-course-select');
